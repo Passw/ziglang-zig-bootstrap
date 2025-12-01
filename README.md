@@ -24,6 +24,7 @@ For other versions, check the git tags of this repository.
  * Clang: Ignore the examples directory
  * Clang: Disable building of libclang-cpp.so.
  * Clang: remove `nvptx-arch` and `amdgpu-arch` symlinks
+ * Clang: remove broken scan-build manpage install logic
  * LLD: Added additional include directory to Zig's libunwind.
  * LLD: Respect `LLD_BUILD_TOOLS=OFF`
  * LLD: Skip building docs
