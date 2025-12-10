@@ -370,10 +370,6 @@ fn addFromDirInner(
             const resolved_target = b.resolveTargetQuery(target_query);
             const target = &resolved_target.result;
             for (backends) |backend| {
-                if (backend == .selfhosted and target.cpu.arch == .wasm32) {
-                    // https://github.com/ziglang/zig/issues/25684
-                    continue;
-                }
                 if (backend == .selfhosted and
                     target.cpu.arch != .aarch64 and target.cpu.arch != .wasm32 and target.cpu.arch != .x86_64 and target.cpu.arch != .spirv64)
                 {
@@ -444,10 +440,12 @@ pub const CaseTestOptions = struct {
     test_target_filters: []const []const u8,
     skip_compile_errors: bool,
     skip_non_native: bool,
+    skip_spirv: bool,
+    skip_wasm: bool,
     skip_freebsd: bool,
     skip_netbsd: bool,
     skip_windows: bool,
-    skip_macos: bool,
+    skip_darwin: bool,
     skip_linux: bool,
     skip_llvm: bool,
     skip_libc: bool,
@@ -472,10 +470,13 @@ pub fn lowerToBuildSteps(
         if (options.skip_non_native and !case.target.query.isNative())
             continue;
 
+        if (options.skip_spirv and case.target.query.cpu_arch != null and case.target.query.cpu_arch.?.isSpirV()) continue;
+        if (options.skip_wasm and case.target.query.cpu_arch != null and case.target.query.cpu_arch.?.isWasm()) continue;
+
         if (options.skip_freebsd and case.target.query.os_tag == .freebsd) continue;
         if (options.skip_netbsd and case.target.query.os_tag == .netbsd) continue;
         if (options.skip_windows and case.target.query.os_tag == .windows) continue;
-        if (options.skip_macos and case.target.query.os_tag == .macos) continue;
+        if (options.skip_darwin and case.target.query.os_tag != null and case.target.query.os_tag.?.isDarwin()) continue;
         if (options.skip_linux and case.target.query.os_tag == .linux) continue;
 
         const would_use_llvm = @import("../tests.zig").wouldUseLlvm(

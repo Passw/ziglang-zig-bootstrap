@@ -312,7 +312,7 @@ fn linkAsArchive(lld: *Lld, arena: Allocator) !void {
 
     const link_inputs = comp.link_inputs;
 
-    var object_files: std.ArrayListUnmanaged([*:0]const u8) = .empty;
+    var object_files: std.ArrayList([*:0]const u8) = .empty;
 
     try object_files.ensureUnusedCapacity(arena, link_inputs.len);
     for (link_inputs) |input| {
@@ -1190,8 +1190,12 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
                     }));
                 } else if (target.isFreeBSDLibC()) {
                     for (freebsd.libs) |lib| {
+                        if (lib.added_in) |add_in| {
+                            if (target.os.version_range.semver.min.order(add_in) == .lt) continue;
+                        }
+
                         const lib_path = try std.fmt.allocPrint(arena, "{f}{c}lib{s}.so.{d}", .{
-                            comp.freebsd_so_files.?.dir_path, fs.path.sep, lib.name, lib.sover,
+                            comp.freebsd_so_files.?.dir_path, fs.path.sep, lib.name, lib.getSoVersion(&target.os),
                         });
                         try argv.append(lib_path);
                     }

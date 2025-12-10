@@ -317,7 +317,7 @@ pub fn print(ty: Type, writer: *std.Io.Writer, pt: Zcu.PerThread, ctx: ?*Compari
             .undefined,
             => try writer.print("@TypeOf({s})", .{@tagName(s)}),
 
-            .enum_literal => try writer.writeAll("@Type(.enum_literal)"),
+            .enum_literal => try writer.writeAll("@EnumLiteral()"),
 
             .generic_poison => unreachable,
         },
@@ -3445,13 +3445,22 @@ pub fn optEuBaseType(ty: Type, zcu: *const Zcu) Type {
 
 pub fn toUnsigned(ty: Type, pt: Zcu.PerThread) !Type {
     const zcu = pt.zcu;
-    return switch (ty.zigTypeTag(zcu)) {
-        .int => pt.intType(.unsigned, ty.intInfo(zcu).bits),
-        .vector => try pt.vectorType(.{
-            .len = ty.vectorLen(zcu),
-            .child = (try ty.childType(zcu).toUnsigned(pt)).toIntern(),
-        }),
-        else => unreachable,
+    return switch (ty.toIntern()) {
+        // zig fmt: off
+        .usize_type,       .isize_type      => .usize,
+        .c_ushort_type,    .c_short_type    => .c_ushort,
+        .c_uint_type,      .c_int_type      => .c_uint,
+        .c_ulong_type,     .c_long_type     => .c_ulong,
+        .c_ulonglong_type, .c_longlong_type => .c_ulonglong,
+        // zig fmt: on
+        else => switch (ty.zigTypeTag(zcu)) {
+            .int => pt.intType(.unsigned, ty.intInfo(zcu).bits),
+            .vector => try pt.vectorType(.{
+                .len = ty.vectorLen(zcu),
+                .child = (try ty.childType(zcu).toUnsigned(pt)).toIntern(),
+            }),
+            else => unreachable,
+        },
     };
 }
 
@@ -3509,7 +3518,9 @@ pub fn typeDeclSrcLine(ty: Type, zcu: *Zcu) ?u32 {
             .union_decl => zir.extraData(Zir.Inst.UnionDecl, inst.data.extended.operand).data.src_line,
             .enum_decl => zir.extraData(Zir.Inst.EnumDecl, inst.data.extended.operand).data.src_line,
             .opaque_decl => zir.extraData(Zir.Inst.OpaqueDecl, inst.data.extended.operand).data.src_line,
-            .reify => zir.extraData(Zir.Inst.Reify, inst.data.extended.operand).data.src_line,
+            .reify_enum => zir.extraData(Zir.Inst.ReifyEnum, inst.data.extended.operand).data.src_line,
+            .reify_struct => zir.extraData(Zir.Inst.ReifyStruct, inst.data.extended.operand).data.src_line,
+            .reify_union => zir.extraData(Zir.Inst.ReifyUnion, inst.data.extended.operand).data.src_line,
             else => unreachable,
         },
         else => unreachable,
@@ -3835,7 +3846,7 @@ fn resolveStructInner(
             }
             return error.AnalysisFail;
         },
-        error.OutOfMemory => |e| return e,
+        error.OutOfMemory, error.Canceled => |e| return e,
     };
 }
 
@@ -3894,6 +3905,7 @@ fn resolveUnionInner(
             return error.AnalysisFail;
         },
         error.OutOfMemory => |e| return e,
+        error.Canceled => |e| return e,
     };
 }
 
@@ -4280,6 +4292,10 @@ pub const manyptr_const_u8: Type = .{ .ip_index = .manyptr_const_u8_type };
 pub const manyptr_const_u8_sentinel_0: Type = .{ .ip_index = .manyptr_const_u8_sentinel_0_type };
 pub const slice_const_u8: Type = .{ .ip_index = .slice_const_u8_type };
 pub const slice_const_u8_sentinel_0: Type = .{ .ip_index = .slice_const_u8_sentinel_0_type };
+pub const slice_const_slice_const_u8: Type = .{ .ip_index = .slice_const_slice_const_u8_type };
+pub const slice_const_type: Type = .{ .ip_index = .slice_const_type_type };
+pub const optional_type: Type = .{ .ip_index = .optional_type_type };
+pub const optional_noreturn: Type = .{ .ip_index = .optional_noreturn_type };
 
 pub const vector_8_i8: Type = .{ .ip_index = .vector_8_i8_type };
 pub const vector_16_i8: Type = .{ .ip_index = .vector_16_i8_type };

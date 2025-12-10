@@ -568,9 +568,8 @@ fn splitValue64(val: i64) [2]u32 {
     }
 }
 
-/// Get the errno from a syscall return value, or 0 for no error.
-/// The public API is exposed via the `E` namespace.
-fn errnoFromSyscall(r: usize) E {
+/// Get the errno from a syscall return value. SUCCESS means no error.
+pub fn errno(r: usize) E {
     const signed_r: isize = @bitCast(r);
     const int = if (signed_r > -4096 and signed_r < 0) -signed_r else 0;
     return @enumFromInt(int);
@@ -1749,9 +1748,7 @@ pub fn settimeofday(tv: *const timeval, tz: *const timezone) usize {
 }
 
 pub fn nanosleep(req: *const timespec, rem: ?*timespec) usize {
-    if (native_arch == .riscv32) {
-        @compileError("No nanosleep syscall on this architecture.");
-    } else return syscall2(.nanosleep, @intFromPtr(req), @intFromPtr(rem));
+    return syscall2(.nanosleep, @intFromPtr(req), @intFromPtr(rem));
 }
 
 pub fn pause() usize {
@@ -1961,7 +1958,7 @@ pub fn sigaction(sig: SIG, noalias act: ?*const Sigaction, noalias oact: ?*Sigac
         .sparc, .sparc64 => syscall5(.rt_sigaction, @intFromEnum(sig), ksa_arg, oldksa_arg, @intFromPtr(ksa.restorer), mask_size),
         else => syscall4(.rt_sigaction, @intFromEnum(sig), ksa_arg, oldksa_arg, mask_size),
     };
-    if (E.init(result) != .SUCCESS) return result;
+    if (errno(result) != .SUCCESS) return result;
 
     if (oact) |old| {
         old.handler.handler = oldksa.handler;
@@ -2402,7 +2399,7 @@ pub fn sched_setaffinity(pid: pid_t, set: *const cpu_set_t) !void {
     const size = @sizeOf(cpu_set_t);
     const rc = syscall3(.sched_setaffinity, @as(usize, @bitCast(@as(isize, pid))), size, @intFromPtr(set));
 
-    switch (E.init(rc)) {
+    switch (errno(rc)) {
         .SUCCESS => return,
         else => |err| return std.posix.unexpectedErrno(err),
     }
@@ -3003,8 +3000,6 @@ pub const E = switch (native_arch) {
         HWPOISON = 168,
         DQUOT = 1133,
         _,
-
-        pub const init = errnoFromSyscall;
     },
     .sparc, .sparc64 => enum(u16) {
         /// No error occurred.
@@ -3148,8 +3143,6 @@ pub const E = switch (native_arch) {
         RFKILL = 134,
         HWPOISON = 135,
         _,
-
-        pub const init = errnoFromSyscall;
     },
     else => enum(u16) {
         /// No error occurred.
@@ -3459,8 +3452,6 @@ pub const E = switch (native_arch) {
         NSRCNAMELOOP = 177,
 
         _,
-
-        pub const init = errnoFromSyscall;
     },
 };
 
@@ -3780,6 +3771,7 @@ pub const SIG = if (is_mips) enum(u32) {
     PROF = 29,
     XCPU = 30,
     XFZ = 31,
+    _,
 } else if (is_sparc) enum(u32) {
     pub const BLOCK = 1;
     pub const UNBLOCK = 2;
@@ -3825,6 +3817,7 @@ pub const SIG = if (is_mips) enum(u32) {
     LOST = 29,
     USR1 = 30,
     USR2 = 31,
+    _,
 } else enum(u32) {
     pub const BLOCK = 0;
     pub const UNBLOCK = 1;
@@ -3868,6 +3861,7 @@ pub const SIG = if (is_mips) enum(u32) {
     IO = 29,
     PWR = 30,
     SYS = 31,
+    _,
 };
 
 pub const kernel_rwf = u32;
@@ -9892,7 +9886,7 @@ pub const wrapped = struct {
         const adjusted_len = @min(in_len, 0x7ffff000); // Prevents EOVERFLOW.
         const sendfileSymbol = if (lfs64_abi) system.sendfile64 else system.sendfile;
         const rc = sendfileSymbol(out_fd, in_fd, in_offset, adjusted_len);
-        switch (errno(rc)) {
+        switch (system.errno(rc)) {
             .SUCCESS => return @intCast(rc),
             .BADF => return invalidApiUsage(), // Always a race condition.
             .FAULT => return invalidApiUsage(), // Segmentation fault.
@@ -9958,7 +9952,7 @@ pub const wrapped = struct {
         const use_c = std.c.versionCheck(if (builtin.abi.isAndroid()) .{ .major = 34, .minor = 0, .patch = 0 } else .{ .major = 2, .minor = 27, .patch = 0 });
         const sys = if (use_c) std.c else std.os.linux;
         const rc = sys.copy_file_range(fd_in, off_in, fd_out, off_out, len, flags);
-        switch (errno(rc)) {
+        switch (sys.errno(rc)) {
             .SUCCESS => return @intCast(rc),
             .BADF => return error.BadFileFlags,
             .FBIG => return error.FileTooBig,
@@ -9981,13 +9975,5 @@ pub const wrapped = struct {
     fn invalidApiUsage() error{Unexpected} {
         if (builtin.mode == .Debug) @panic("invalid API usage");
         return error.Unexpected;
-    }
-
-    fn errno(rc: anytype) E {
-        if (builtin.link_libc) {
-            return if (rc == -1) @enumFromInt(std.c._errno().*) else .SUCCESS;
-        } else {
-            return errnoFromSyscall(rc);
-        }
     }
 };

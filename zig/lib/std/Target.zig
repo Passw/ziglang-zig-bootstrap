@@ -510,7 +510,7 @@ pub const Os = struct {
 
                             break :blk default_min;
                         },
-                        .max = .{ .major = 14, .minor = 3, .patch = 0 },
+                        .max = .{ .major = 15, .minor = 0, .patch = 0 },
                     },
                 },
                 .netbsd => .{
@@ -746,7 +746,6 @@ pub const Abi = enum {
     gnuf32,
     gnusf,
     gnux32,
-    code16,
     eabi,
     eabihf,
     ilp32,
@@ -866,7 +865,6 @@ pub const Abi = enum {
             },
             .freebsd => switch (arch) {
                 .arm,
-                .powerpc,
                 => .eabihf,
                 else => .none,
             },

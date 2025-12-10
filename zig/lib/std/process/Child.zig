@@ -122,7 +122,7 @@ pub const ResourceUsageStatistics = struct {
     /// if available.
     pub inline fn getMaxRss(rus: ResourceUsageStatistics) ?usize {
         switch (native_os) {
-            .linux => {
+            .dragonfly, .freebsd, .netbsd, .openbsd, .illumos, .linux, .serenity => {
                 if (rus.rusage) |ru| {
                     return @as(usize, @intCast(ru.maxrss)) * 1024;
                 } else {
@@ -149,7 +149,21 @@ pub const ResourceUsageStatistics = struct {
     }
 
     const rusage_init = switch (native_os) {
-        .linux, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => @as(?posix.rusage, null),
+        .dragonfly,
+        .freebsd,
+        .netbsd,
+        .openbsd,
+        .illumos,
+        .linux,
+        .serenity,
+        .driverkit,
+        .ios,
+        .maccatalyst,
+        .macos,
+        .tvos,
+        .visionos,
+        .watchos,
+        => @as(?posix.rusage, null),
         .windows => @as(?windows.VM_COUNTERS, null),
         else => {},
     };
@@ -486,7 +500,21 @@ fn waitUnwrappedPosix(self: *ChildProcess) void {
     const res: posix.WaitPidResult = res: {
         if (self.request_resource_usage_statistics) {
             switch (native_os) {
-                .linux, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => {
+                .dragonfly,
+                .freebsd,
+                .netbsd,
+                .openbsd,
+                .illumos,
+                .linux,
+                .serenity,
+                .driverkit,
+                .ios,
+                .maccatalyst,
+                .macos,
+                .tvos,
+                .visionos,
+                .watchos,
+                => {
                     var ru: posix.rusage = undefined;
                     const res = posix.wait4(self.id, 0, &ru);
                     self.resource_usage_statistics.rusage = ru;
@@ -1227,7 +1255,7 @@ fn windowsCreateProcessPathExt(
                     const app_name = app_buf.items[0..app_name_len];
                     const ext_start = std.mem.lastIndexOfScalar(u16, app_name, '.') orelse break :unappended err;
                     const ext = app_name[ext_start..];
-                    if (windows.eqlIgnoreCaseWTF16(ext, unicode.utf8ToUtf16LeStringLiteral(".EXE"))) {
+                    if (windows.eqlIgnoreCaseWtf16(ext, unicode.utf8ToUtf16LeStringLiteral(".EXE"))) {
                         return error.UnrecoverableInvalidExe;
                     }
                     break :unappended err;
@@ -1278,7 +1306,7 @@ fn windowsCreateProcessPathExt(
                 // On InvalidExe, if the extension of the app name is .exe then
                 // it's treated as an unrecoverable error. Otherwise, it'll be
                 // skipped as normal.
-                if (windows.eqlIgnoreCaseWTF16(ext, unicode.utf8ToUtf16LeStringLiteral(".EXE"))) {
+                if (windows.eqlIgnoreCaseWtf16(ext, unicode.utf8ToUtf16LeStringLiteral(".EXE"))) {
                     return error.UnrecoverableInvalidExe;
                 }
                 continue;

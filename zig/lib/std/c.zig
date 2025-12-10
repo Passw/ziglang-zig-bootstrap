@@ -72,6 +72,11 @@ pub inline fn versionCheck(comptime version: std.SemanticVersion) bool {
     };
 }
 
+/// Get the errno if rc is -1 and SUCCESS if rc is not -1.
+pub fn errno(rc: anytype) E {
+    return if (rc == -1) @enumFromInt(_errno().*) else .SUCCESS;
+}
+
 pub const ino_t = switch (native_os) {
     .linux => linux.ino_t,
     .emscripten => emscripten.ino_t,
@@ -4466,7 +4471,7 @@ pub const rusage = switch (native_os) {
         pub const SELF = 1;
         pub const CHILDREN = 2;
     },
-    .freebsd => extern struct {
+    .freebsd, .openbsd => extern struct {
         utime: timeval,
         stime: timeval,
         maxrss: c_long,
@@ -4487,6 +4492,27 @@ pub const rusage = switch (native_os) {
         pub const SELF = 0;
         pub const CHILDREN = -1;
         pub const THREAD = 1;
+    },
+    .dragonfly, .netbsd => extern struct {
+        utime: timeval,
+        stime: timeval,
+        maxrss: c_long,
+        ixrss: c_long,
+        idrss: c_long,
+        isrss: c_long,
+        minflt: c_long,
+        majflt: c_long,
+        nswap: c_long,
+        inblock: c_long,
+        oublock: c_long,
+        msgsnd: c_long,
+        msgrcv: c_long,
+        nsignals: c_long,
+        nvcsw: c_long,
+        nivcsw: c_long,
+
+        pub const SELF = 0;
+        pub const CHILDREN = -1;
     },
     else => void,
 };
@@ -7269,7 +7295,8 @@ pub const AI = if (builtin.abi.isAndroid()) packed struct(u32) {
         NUMERICSERV: bool = false,
         _4: u6 = 0,
         ADDRCONFIG: bool = false,
-        _: u21 = 0,
+        SRV: bool = false,
+        _: u20 = 0,
     },
     .illumos => packed struct(u32) {
         V4MAPPED: bool = false,
@@ -7285,9 +7312,9 @@ pub const AI = if (builtin.abi.isAndroid()) packed struct(u32) {
         PASSIVE: bool = false,
         CANONNAME: bool = false,
         NUMERICHOST: bool = false,
-        _3: u1 = 0,
+        EXT: bool = false,
         NUMERICSERV: bool = false,
-        _5: u1 = 0,
+        FQDN: bool = false,
         ADDRCONFIG: bool = false,
         _: u25 = 0,
     },
@@ -7347,6 +7374,43 @@ pub const NI = switch (native_os) {
         NOFQDN: bool = false,
         DGRAM: bool = false,
         _: std.meta.Int(.unsigned, @bitSizeOf(c_int) - 5) = 0,
+    },
+    .freebsd, .haiku => packed struct(u32) {
+        NOFQDN: bool = false,
+        NUMERICHOST: bool = false,
+        NAMEREQD: bool = false,
+        NUMERICSERV: bool = false,
+        DGRAM: bool = false,
+        NUMERICSCOPE: bool = false,
+        _: u26 = 0,
+    },
+    .dragonfly, .netbsd => packed struct(u32) {
+        NOFQDN: bool = false,
+        NUMERICHOST: bool = false,
+        NAMEREQD: bool = false,
+        NUMERICSERV: bool = false,
+        DGRAM: bool = false,
+        _5: u1 = 0,
+        NUMERICSCOPE: bool = false,
+        _: u25 = 0,
+    },
+    .openbsd => packed struct(u32) {
+        NUMERICHOST: bool = false,
+        NUMERICSERV: bool = false,
+        NOFQDN: bool = false,
+        NAMEREQD: bool = false,
+        DGRAM: bool = false,
+        _: u27 = 0,
+    },
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => packed struct(u32) {
+        NOFQDN: bool = false,
+        NUMERICHOST: bool = false,
+        NAMEREQD: bool = false,
+        NUMERICSERV: bool = false,
+        DGRAM: bool = false,
+        _5: u3 = 0,
+        NUMERICSCOPE: bool = false,
+        _: u23 = 0,
     },
     else => void,
 };
@@ -10838,6 +10902,23 @@ pub extern "c" fn pthread_create(
     start_routine: *const fn (?*anyopaque) callconv(.c) ?*anyopaque,
     noalias arg: ?*anyopaque,
 ) E;
+pub const pthread_cancelstate = switch (native_os) {
+    .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => enum(c_int) {
+        ENABLE = 1,
+        DISABLE = 0,
+    },
+    .linux => if (native_abi.isMusl()) enum(c_int) {
+        ENABLE = 0,
+        DISABLE = 1,
+        MASKED = 2,
+    } else if (native_abi.isGnu()) enum(c_int) {
+        ENABLE = 0,
+        DISABLE = 1,
+    },
+    else => void,
+};
+pub extern "c" fn pthread_setcancelstate(pthread_cancelstate, ?*pthread_cancelstate) E;
+pub extern "c" fn pthread_cancel(pthread_t) E;
 pub extern "c" fn pthread_attr_init(attr: *pthread_attr_t) E;
 pub extern "c" fn pthread_attr_setstack(attr: *pthread_attr_t, stackaddr: *anyopaque, stacksize: usize) E;
 pub extern "c" fn pthread_attr_setstacksize(attr: *pthread_attr_t, stacksize: usize) E;
@@ -11243,6 +11324,8 @@ pub const _dyld_get_image_header = darwin._dyld_get_image_header;
 pub const _dyld_get_image_name = darwin._dyld_get_image_name;
 pub const _dyld_get_image_vmaddr_slide = darwin._dyld_get_image_vmaddr_slide;
 pub const _dyld_image_count = darwin._dyld_image_count;
+pub const _dyld_get_image_header_containing_address = darwin._dyld_get_image_header_containing_address;
+pub const dyld_image_path_containing_address = darwin.dyld_image_path_containing_address;
 pub const _host_page_size = darwin._host_page_size;
 pub const boolean_t = darwin.boolean_t;
 pub const clock_get_time = darwin.clock_get_time;
@@ -11542,6 +11625,6 @@ const private = struct {
     extern threadlocal var errno: c_int;
 
     fn errnoFromThreadLocal() *c_int {
-        return &errno;
+        return &private.errno;
     }
 };
