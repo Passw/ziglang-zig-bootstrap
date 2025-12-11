@@ -21,6 +21,7 @@ For other versions, check the git tags of this repository.
  * LLVM: Support .lib extension for static zstd.
  * LLVM: Portable handling of .def linker flag
  * LLVM: Don't pass -static when building executables.
+ * LLVM: work around broken powerpc bl relocation logic
  * Clang: Ignore the examples directory
  * Clang: Disable building of libclang-cpp.so.
  * Clang: remove `nvptx-arch` and `amdgpu-arch` symlinks
