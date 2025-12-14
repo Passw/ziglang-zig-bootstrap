@@ -113,7 +113,12 @@ public:
       // resolution of the final target address to the linker.
       if (const auto *A = Target.getAddSym()) {
         if (const auto *S = dyn_cast<MCSymbolELF>(A)) {
-          return true;
+          // The "other" values are stored in the last 6 bits of the second
+          // byte. The traditional defines for STO values assume the full byte
+          // and thus the shift to pack it.
+          unsigned Other = S->getOther() << 2;
+          if ((Other & ELF::STO_PPC64_LOCAL_MASK) != 0)
+            return true;
         } else if (const auto *S = dyn_cast<MCSymbolXCOFF>(A)) {
           return !Target.isAbsolute() && S->isExternal() &&
                  S->getStorageClass() == XCOFF::C_WEAKEXT;

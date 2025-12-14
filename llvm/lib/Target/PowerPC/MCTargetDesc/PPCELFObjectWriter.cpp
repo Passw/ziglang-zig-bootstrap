@@ -494,7 +494,13 @@ bool PPCELFObjectWriter::needsRelocateWithSymbol(const MCValue &V,
 
     case ELF::R_PPC_REL24:
     case ELF::R_PPC64_REL24_NOTOC: {
-      return true;
+      // If the target symbol has a local entry point, we must keep the
+      // target symbol to preserve that information for the linker.
+      // The "other" values are stored in the last 6 bits of the second byte.
+      // The traditional defines for STO values assume the full byte and thus
+      // the shift to pack it.
+      unsigned Other = cast<MCSymbolELF>(V.getAddSym())->getOther() << 2;
+      return (Other & ELF::STO_PPC64_LOCAL_MASK) != 0;
     }
 
     case ELF::R_PPC64_GOT16:
