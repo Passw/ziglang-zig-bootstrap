@@ -54,6 +54,20 @@ pub fn init(file: std.Io.File, gpa: std.mem.Allocator) !MappedFile {
                 },
             };
         }
+        if (is_linux) {
+            const statx = try linux.wrapped.statx(
+                mf.file.handle,
+                "",
+                std.posix.AT.EMPTY_PATH,
+                .{ .TYPE = true, .SIZE = true, .BLOCKS = true },
+            );
+            assert(statx.mask.TYPE);
+            assert(statx.mask.SIZE);
+            assert(statx.mask.BLOCKS);
+
+            if (!std.posix.S.ISREG(statx.mode)) return error.PathAlreadyExists;
+            break :stat .{ statx.size, @max(std.heap.pageSize(), statx.blksize) };
+        }
         const stat = try std.posix.fstat(mf.file.handle);
         if (!std.posix.S.ISREG(stat.mode)) return error.PathAlreadyExists;
         break :stat .{ @bitCast(stat.size), @max(std.heap.pageSize(), stat.blksize) };
@@ -953,12 +967,19 @@ pub fn ensureTotalCapacityPrecise(mf: *MappedFile, new_capacity: usize) !void {
     if (is_windows) {
         if (mf.section == windows.INVALID_HANDLE_VALUE) switch (windows.ntdll.NtCreateSection(
             &mf.section,
-            windows.STANDARD_RIGHTS_REQUIRED | windows.SECTION_QUERY |
-                windows.SECTION_MAP_WRITE | windows.SECTION_MAP_READ | windows.SECTION_EXTEND_SIZE,
+            .{
+                .SPECIFIC = .{ .SECTION = .{
+                    .QUERY = true,
+                    .MAP_WRITE = true,
+                    .MAP_READ = true,
+                    .EXTEND_SIZE = true,
+                } },
+                .STANDARD = .{ .RIGHTS = .REQUIRED },
+            },
             null,
             @constCast(&@as(i64, @intCast(aligned_capacity))),
-            windows.PAGE_READWRITE,
-            windows.SEC_COMMIT,
+            .{ .READWRITE = true },
+            .{ .COMMIT = true },
             mf.file.handle,
         )) {
             .SUCCESS => {},
@@ -974,9 +995,9 @@ pub fn ensureTotalCapacityPrecise(mf: *MappedFile, new_capacity: usize) !void {
             0,
             null,
             &contents_len,
-            .ViewUnmap,
-            0,
-            windows.PAGE_READWRITE,
+            .Unmap,
+            .{},
+            .{ .READWRITE = true },
         )) {
             .SUCCESS => mf.contents = contents_ptr.?[0..contents_len],
             else => return error.MemoryMappingNotSupported,

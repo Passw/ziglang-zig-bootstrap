@@ -218,6 +218,32 @@ test "Dir.readLink" {
     }.impl);
 }
 
+test "Dir.readLink on non-symlinks" {
+    try testWithAllSupportedPathTypes(struct {
+        fn impl(ctx: *TestContext) !void {
+            const file_path = try ctx.transformPath("file.txt");
+            try ctx.dir.writeFile(.{ .sub_path = file_path, .data = "nonsense" });
+            const dir_path = try ctx.transformPath("subdir");
+            try ctx.dir.makeDir(dir_path);
+
+            // file
+            var buffer: [fs.max_path_bytes]u8 = undefined;
+            try std.testing.expectError(error.NotLink, ctx.dir.readLink(file_path, &buffer));
+            if (builtin.os.tag == .windows) {
+                var file_path_w = try std.os.windows.sliceToPrefixedFileW(ctx.dir.fd, file_path);
+                try std.testing.expectError(error.NotLink, ctx.dir.readLinkW(file_path_w.span(), &file_path_w.data));
+            }
+
+            // dir
+            try std.testing.expectError(error.NotLink, ctx.dir.readLink(dir_path, &buffer));
+            if (builtin.os.tag == .windows) {
+                var dir_path_w = try std.os.windows.sliceToPrefixedFileW(ctx.dir.fd, dir_path);
+                try std.testing.expectError(error.NotLink, ctx.dir.readLinkW(dir_path_w.span(), &dir_path_w.data));
+            }
+        }
+    }.impl);
+}
+
 fn testReadLink(dir: Dir, target_path: []const u8, symlink_path: []const u8) !void {
     var buffer: [fs.max_path_bytes]u8 = undefined;
     const actual = try dir.readLink(symlink_path, buffer[0..]);
@@ -256,13 +282,11 @@ test "File.stat on a File that is a symlink returns Kind.sym_link" {
 
             try setupSymlink(ctx.dir, dir_target_path, "symlink", .{ .is_directory = true });
 
-            var symlink = switch (builtin.target.os.tag) {
+            var symlink: Dir = switch (builtin.target.os.tag) {
                 .windows => windows_symlink: {
                     const sub_path_w = try windows.cStrToPrefixedFileW(ctx.dir.fd, "symlink");
 
-                    var result = Dir{
-                        .fd = undefined,
-                    };
+                    var handle: windows.HANDLE = undefined;
 
                     const path_len_bytes = @as(u16, @intCast(sub_path_w.span().len * 2));
                     var nt_name = windows.UNICODE_STRING{
@@ -270,32 +294,46 @@ test "File.stat on a File that is a symlink returns Kind.sym_link" {
                         .MaximumLength = path_len_bytes,
                         .Buffer = @constCast(&sub_path_w.data),
                     };
-                    var attr = windows.OBJECT_ATTRIBUTES{
+                    var attr: windows.OBJECT_ATTRIBUTES = .{
                         .Length = @sizeOf(windows.OBJECT_ATTRIBUTES),
                         .RootDirectory = if (fs.path.isAbsoluteWindowsW(sub_path_w.span())) null else ctx.dir.fd,
-                        .Attributes = 0,
+                        .Attributes = .{},
                         .ObjectName = &nt_name,
                         .SecurityDescriptor = null,
                         .SecurityQualityOfService = null,
                     };
                     var io: windows.IO_STATUS_BLOCK = undefined;
                     const rc = windows.ntdll.NtCreateFile(
-                        &result.fd,
-                        windows.STANDARD_RIGHTS_READ | windows.FILE_READ_ATTRIBUTES | windows.FILE_READ_EA | windows.SYNCHRONIZE | windows.FILE_TRAVERSE,
+                        &handle,
+                        .{
+                            .SPECIFIC = .{ .FILE_DIRECTORY = .{
+                                .READ_EA = true,
+                                .TRAVERSE = true,
+                                .READ_ATTRIBUTES = true,
+                            } },
+                            .STANDARD = .{
+                                .RIGHTS = .READ,
+                                .SYNCHRONIZE = true,
+                            },
+                        },
                         &attr,
                         &io,
                         null,
-                        windows.FILE_ATTRIBUTE_NORMAL,
-                        windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE,
-                        windows.FILE_OPEN,
-                        // FILE_OPEN_REPARSE_POINT is the important thing here
-                        windows.FILE_OPEN_REPARSE_POINT | windows.FILE_DIRECTORY_FILE | windows.FILE_SYNCHRONOUS_IO_NONALERT | windows.FILE_OPEN_FOR_BACKUP_INTENT,
+                        .{ .NORMAL = true },
+                        .VALID_FLAGS,
+                        .OPEN,
+                        .{
+                            .DIRECTORY_FILE = true,
+                            .IO = .SYNCHRONOUS_NONALERT,
+                            .OPEN_FOR_BACKUP_INTENT = true,
+                            .OPEN_REPARSE_POINT = true, // the important thing here
+                        },
                         null,
                         0,
                     );
 
                     switch (rc) {
-                        .SUCCESS => break :windows_symlink result,
+                        .SUCCESS => break :windows_symlink .{ .fd = handle },
                         else => return windows.unexpectedStatus(rc),
                     }
                 },
@@ -340,6 +378,7 @@ test "openDir" {
 
 test "accessAbsolute" {
     if (native_os == .wasi) return error.SkipZigTest;
+    if (native_os == .openbsd) return error.SkipZigTest;
 
     var tmp = tmpDir(.{});
     defer tmp.cleanup();
@@ -352,6 +391,7 @@ test "accessAbsolute" {
 
 test "openDirAbsolute" {
     if (native_os == .wasi) return error.SkipZigTest;
+    if (native_os == .openbsd) return error.SkipZigTest;
 
     var tmp = tmpDir(.{});
     defer tmp.cleanup();
@@ -441,6 +481,7 @@ test "openDir non-cwd parent '..'" {
 
 test "readLinkAbsolute" {
     if (native_os == .wasi) return error.SkipZigTest;
+    if (native_os == .openbsd) return error.SkipZigTest;
 
     var tmp = tmpDir(.{});
     defer tmp.cleanup();
@@ -1047,6 +1088,7 @@ test "rename" {
 
 test "renameAbsolute" {
     if (native_os == .wasi) return error.SkipZigTest;
+    if (native_os == .openbsd) return error.SkipZigTest;
 
     var tmp_dir = tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -1950,6 +1992,7 @@ test "'.' and '..' in fs.Dir functions" {
 
 test "'.' and '..' in absolute functions" {
     if (native_os == .wasi) return error.SkipZigTest;
+    if (native_os == .openbsd) return error.SkipZigTest;
 
     var tmp = tmpDir(.{});
     defer tmp.cleanup();

@@ -1023,6 +1023,7 @@ fn cancel(
 fn mutexLock(userdata: ?*anyopaque, prev_state: Io.Mutex.State, mutex: *Io.Mutex) Io.Cancelable!void {
     if (builtin.single_threaded) unreachable; // Interface should have prevented this.
     if (native_os == .netbsd) @panic("TODO");
+    if (native_os == .openbsd) @panic("TODO");
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     const current_thread = Thread.getCurrent(t);
     if (prev_state == .contended) {
@@ -1036,6 +1037,7 @@ fn mutexLock(userdata: ?*anyopaque, prev_state: Io.Mutex.State, mutex: *Io.Mutex
 fn mutexLockUncancelable(userdata: ?*anyopaque, prev_state: Io.Mutex.State, mutex: *Io.Mutex) void {
     if (builtin.single_threaded) unreachable; // Interface should have prevented this.
     if (native_os == .netbsd) @panic("TODO");
+    if (native_os == .openbsd) @panic("TODO");
     _ = userdata;
     if (prev_state == .contended) {
         futexWaitUncancelable(@ptrCast(&mutex.state), @intFromEnum(Io.Mutex.State.contended));
@@ -1048,6 +1050,7 @@ fn mutexLockUncancelable(userdata: ?*anyopaque, prev_state: Io.Mutex.State, mute
 fn mutexUnlock(userdata: ?*anyopaque, prev_state: Io.Mutex.State, mutex: *Io.Mutex) void {
     if (builtin.single_threaded) unreachable; // Interface should have prevented this.
     if (native_os == .netbsd) @panic("TODO");
+    if (native_os == .openbsd) @panic("TODO");
     _ = userdata;
     _ = prev_state;
     if (@atomicRmw(Io.Mutex.State, &mutex.state, .Xchg, .unlocked, .release) == .contended) {
@@ -1058,6 +1061,7 @@ fn mutexUnlock(userdata: ?*anyopaque, prev_state: Io.Mutex.State, mutex: *Io.Mut
 fn conditionWaitUncancelable(userdata: ?*anyopaque, cond: *Io.Condition, mutex: *Io.Mutex) void {
     if (builtin.single_threaded) unreachable; // Deadlock.
     if (native_os == .netbsd) @panic("TODO");
+    if (native_os == .openbsd) @panic("TODO");
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     const t_io = ioBasic(t);
     comptime assert(@TypeOf(cond.state) == u64);
@@ -1090,6 +1094,7 @@ fn conditionWaitUncancelable(userdata: ?*anyopaque, cond: *Io.Condition, mutex: 
 fn conditionWait(userdata: ?*anyopaque, cond: *Io.Condition, mutex: *Io.Mutex) Io.Cancelable!void {
     if (builtin.single_threaded) unreachable; // Deadlock.
     if (native_os == .netbsd) @panic("TODO");
+    if (native_os == .openbsd) @panic("TODO");
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     const current_thread = Thread.getCurrent(t);
     const t_io = ioBasic(t);
@@ -1192,6 +1197,7 @@ fn conditionWake(userdata: ?*anyopaque, cond: *Io.Condition, wake: Io.Condition.
             // - T1: s & signals == 0 -> FUTEX_WAIT(&epoch, e) (missed both epoch change and state change)
             _ = cond_epoch.fetchAdd(1, .release);
             if (native_os == .netbsd) @panic("TODO");
+            if (native_os == .openbsd) @panic("TODO");
             futexWake(cond_epoch, to_wake);
             return;
         };
@@ -1301,8 +1307,11 @@ fn dirMakeWindows(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, mode
     _ = mode;
     const sub_dir_handle = windows.OpenFile(sub_path_w.span(), .{
         .dir = dir.handle,
-        .access_mask = windows.GENERIC_READ | windows.SYNCHRONIZE,
-        .creation = windows.FILE_CREATE,
+        .access_mask = .{
+            .GENERIC = .{ .READ = true },
+            .STANDARD = .{ .SYNCHRONIZE = true },
+        },
+        .creation = .CREATE,
         .filter = .dir_only,
     }) catch |err| switch (err) {
         error.IsDir => return error.Unexpected,
@@ -1370,9 +1379,6 @@ fn dirMakeOpenPathWindows(
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     const current_thread = Thread.getCurrent(t);
     const w = windows;
-    const access_mask = w.STANDARD_RIGHTS_READ | w.FILE_READ_ATTRIBUTES | w.FILE_READ_EA |
-        w.SYNCHRONIZE | w.FILE_TRAVERSE |
-        (if (options.iterate) w.FILE_LIST_DIRECTORY else @as(u32, 0));
 
     var it = std.fs.path.componentIterator(sub_path);
     // If there are no components in the path, then create a dummy component with the full path.
@@ -1387,7 +1393,7 @@ fn dirMakeOpenPathWindows(
         const sub_path_w_array = try w.sliceToPrefixedFileW(dir.handle, component.path);
         const sub_path_w = sub_path_w_array.span();
         const is_last = it.peekNext() == null;
-        const create_disposition: u32 = if (is_last) w.FILE_OPEN_IF else w.FILE_CREATE;
+        const create_disposition: w.FILE.CREATE_DISPOSITION = if (is_last) .OPEN_IF else .CREATE;
 
         var result: Io.Dir = .{ .handle = undefined };
 
@@ -1397,26 +1403,40 @@ fn dirMakeOpenPathWindows(
             .MaximumLength = path_len_bytes,
             .Buffer = @constCast(sub_path_w.ptr),
         };
-        var attr: w.OBJECT_ATTRIBUTES = .{
-            .Length = @sizeOf(w.OBJECT_ATTRIBUTES),
-            .RootDirectory = if (std.fs.path.isAbsoluteWindowsWtf16(sub_path_w)) null else dir.handle,
-            .Attributes = 0, // Note we do not use OBJ_CASE_INSENSITIVE here.
-            .ObjectName = &nt_name,
-            .SecurityDescriptor = null,
-            .SecurityQualityOfService = null,
-        };
-        const open_reparse_point: w.DWORD = if (!options.follow_symlinks) w.FILE_OPEN_REPARSE_POINT else 0x0;
         var io_status_block: w.IO_STATUS_BLOCK = undefined;
         const rc = w.ntdll.NtCreateFile(
             &result.handle,
-            access_mask,
-            &attr,
+            .{
+                .SPECIFIC = .{ .FILE_DIRECTORY = .{
+                    .LIST = options.iterate,
+                    .READ_EA = true,
+                    .READ_ATTRIBUTES = true,
+                    .TRAVERSE = true,
+                } },
+                .STANDARD = .{
+                    .RIGHTS = .READ,
+                    .SYNCHRONIZE = true,
+                },
+            },
+            &.{
+                .Length = @sizeOf(w.OBJECT_ATTRIBUTES),
+                .RootDirectory = if (std.fs.path.isAbsoluteWindowsWtf16(sub_path_w)) null else dir.handle,
+                .Attributes = .{},
+                .ObjectName = &nt_name,
+                .SecurityDescriptor = null,
+                .SecurityQualityOfService = null,
+            },
             &io_status_block,
             null,
-            w.FILE_ATTRIBUTE_NORMAL,
-            w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE,
+            .{ .NORMAL = true },
+            .VALID_FLAGS,
             create_disposition,
-            w.FILE_DIRECTORY_FILE | w.FILE_SYNCHRONOUS_IO_NONALERT | w.FILE_OPEN_FOR_BACKUP_INTENT | open_reparse_point,
+            .{
+                .DIRECTORY_FILE = true,
+                .IO = .SYNCHRONOUS_NONALERT,
+                .OPEN_FOR_BACKUP_INTENT = true,
+                .OPEN_REPARSE_POINT = !options.follow_symlinks,
+            },
             null,
             0,
         );
@@ -1519,12 +1539,19 @@ fn dirStatPathLinux(
             dir.handle,
             sub_path_posix,
             flags,
-            linux.STATX_INO | linux.STATX_SIZE | linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_ATIME | linux.STATX_MTIME | linux.STATX_CTIME,
+            .{ .TYPE = true, .MODE = true, .ATIME = true, .MTIME = true, .CTIME = true, .INO = true, .SIZE = true },
             &statx,
         );
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 current_thread.endSyscall();
+                assert(statx.mask.TYPE);
+                assert(statx.mask.MODE);
+                assert(statx.mask.ATIME);
+                assert(statx.mask.MTIME);
+                assert(statx.mask.CTIME);
+                assert(statx.mask.INO);
+                assert(statx.mask.SIZE);
                 return statFromLinux(&statx);
             },
             .INTR => {
@@ -1711,12 +1738,19 @@ fn fileStatLinux(userdata: ?*anyopaque, file: Io.File) Io.File.StatError!Io.File
             file.handle,
             "",
             linux.AT.EMPTY_PATH,
-            linux.STATX_INO | linux.STATX_SIZE | linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_ATIME | linux.STATX_MTIME | linux.STATX_CTIME,
+            .{ .TYPE = true, .MODE = true, .ATIME = true, .MTIME = true, .CTIME = true, .INO = true, .SIZE = true },
             &statx,
         );
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 current_thread.endSyscall();
+                assert(statx.mask.TYPE);
+                assert(statx.mask.MODE);
+                assert(statx.mask.ATIME);
+                assert(statx.mask.MTIME);
+                assert(statx.mask.CTIME);
+                assert(statx.mask.INO);
+                assert(statx.mask.SIZE);
                 return statFromLinux(&statx);
             },
             .INTR => {
@@ -1749,8 +1783,8 @@ fn fileStatWindows(userdata: ?*anyopaque, file: Io.File) Io.File.StatError!Io.Fi
     try current_thread.checkCancel();
 
     var io_status_block: windows.IO_STATUS_BLOCK = undefined;
-    var info: windows.FILE_ALL_INFORMATION = undefined;
-    const rc = windows.ntdll.NtQueryInformationFile(file.handle, &io_status_block, &info, @sizeOf(windows.FILE_ALL_INFORMATION), .FileAllInformation);
+    var info: windows.FILE.ALL_INFORMATION = undefined;
+    const rc = windows.ntdll.NtQueryInformationFile(file.handle, &io_status_block, &info, @sizeOf(windows.FILE.ALL_INFORMATION), .All);
     switch (rc) {
         .SUCCESS => {},
         // Buffer overflow here indicates that there is more information available than was able to be stored in the buffer
@@ -1765,9 +1799,9 @@ fn fileStatWindows(userdata: ?*anyopaque, file: Io.File) Io.File.StatError!Io.Fi
         .inode = info.InternalInformation.IndexNumber,
         .size = @as(u64, @bitCast(info.StandardInformation.EndOfFile)),
         .mode = 0,
-        .kind = if (info.BasicInformation.FileAttributes & windows.FILE_ATTRIBUTE_REPARSE_POINT != 0) reparse_point: {
-            var tag_info: windows.FILE_ATTRIBUTE_TAG_INFO = undefined;
-            const tag_rc = windows.ntdll.NtQueryInformationFile(file.handle, &io_status_block, &tag_info, @sizeOf(windows.FILE_ATTRIBUTE_TAG_INFO), .FileAttributeTagInformation);
+        .kind = if (info.BasicInformation.FileAttributes.REPARSE_POINT) reparse_point: {
+            var tag_info: windows.FILE.ATTRIBUTE_TAG_INFO = undefined;
+            const tag_rc = windows.ntdll.NtQueryInformationFile(file.handle, &io_status_block, &tag_info, @sizeOf(windows.FILE.ATTRIBUTE_TAG_INFO), .AttributeTag);
             switch (tag_rc) {
                 .SUCCESS => {},
                 // INFO_LENGTH_MISMATCH and ACCESS_DENIED are the only documented possible errors
@@ -1776,12 +1810,10 @@ fn fileStatWindows(userdata: ?*anyopaque, file: Io.File) Io.File.StatError!Io.Fi
                 .ACCESS_DENIED => return error.AccessDenied,
                 else => return windows.unexpectedStatus(rc),
             }
-            if (tag_info.ReparseTag & windows.reparse_tag_name_surrogate_bit != 0) {
-                break :reparse_point .sym_link;
-            }
+            if (tag_info.ReparseTag.IsSurrogate) break :reparse_point .sym_link;
             // Unknown reparse point
             break :reparse_point .unknown;
-        } else if (info.BasicInformation.FileAttributes & windows.FILE_ATTRIBUTE_DIRECTORY != 0)
+        } else if (info.BasicInformation.FileAttributes.DIRECTORY)
             .directory
         else
             .file,
@@ -1983,15 +2015,15 @@ fn dirAccessWindows(
         .MaximumLength = path_len_bytes,
         .Buffer = @constCast(sub_path_w.ptr),
     };
-    var attr = windows.OBJECT_ATTRIBUTES{
+    var attr: windows.OBJECT_ATTRIBUTES = .{
         .Length = @sizeOf(windows.OBJECT_ATTRIBUTES),
         .RootDirectory = if (std.fs.path.isAbsoluteWindowsWtf16(sub_path_w)) null else dir.handle,
-        .Attributes = 0, // Note we do not use OBJ_CASE_INSENSITIVE here.
+        .Attributes = .{},
         .ObjectName = &nt_name,
         .SecurityDescriptor = null,
         .SecurityQualityOfService = null,
     };
-    var basic_info: windows.FILE_BASIC_INFORMATION = undefined;
+    var basic_info: windows.FILE.BASIC_INFORMATION = undefined;
     switch (windows.ntdll.NtQueryAttributesFile(&attr, &basic_info)) {
         .SUCCESS => return,
         .OBJECT_NAME_NOT_FOUND => return error.FileNotFound,
@@ -2187,16 +2219,21 @@ fn dirCreateFileWindows(
     const sub_path_w_array = try w.sliceToPrefixedFileW(dir.handle, sub_path);
     const sub_path_w = sub_path_w_array.span();
 
-    const read_flag = if (flags.read) @as(u32, w.GENERIC_READ) else 0;
     const handle = try w.OpenFile(sub_path_w, .{
         .dir = dir.handle,
-        .access_mask = w.SYNCHRONIZE | w.GENERIC_WRITE | read_flag,
+        .access_mask = .{
+            .STANDARD = .{ .SYNCHRONIZE = true },
+            .GENERIC = .{
+                .WRITE = true,
+                .READ = flags.read,
+            },
+        },
         .creation = if (flags.exclusive)
-            @as(u32, w.FILE_CREATE)
+            .CREATE
         else if (flags.truncate)
-            @as(u32, w.FILE_OVERWRITE_IF)
+            .OVERWRITE_IF
         else
-            @as(u32, w.FILE_OPEN_IF),
+            .OPEN_IF,
     });
     errdefer w.CloseHandle(handle);
     var io_status_block: w.IO_STATUS_BLOCK = undefined;
@@ -2511,18 +2548,12 @@ pub fn dirOpenFileWtf16(
     var attr: w.OBJECT_ATTRIBUTES = .{
         .Length = @sizeOf(w.OBJECT_ATTRIBUTES),
         .RootDirectory = dir_handle,
-        .Attributes = 0,
+        .Attributes = .{},
         .ObjectName = &nt_name,
         .SecurityDescriptor = null,
         .SecurityQualityOfService = null,
     };
     var io_status_block: w.IO_STATUS_BLOCK = undefined;
-    const blocking_flag: w.ULONG = w.FILE_SYNCHRONOUS_IO_NONALERT;
-    const file_or_dir_flag: w.ULONG = w.FILE_NON_DIRECTORY_FILE;
-    // If we're not following symlinks, we need to ensure we don't pass in any
-    // synchronization flags such as FILE_SYNCHRONOUS_IO_NONALERT.
-    const create_file_flags: w.ULONG = file_or_dir_flag |
-        if (flags.follow_symlinks) blocking_flag else w.FILE_OPEN_REPARSE_POINT;
 
     // There are multiple kernel bugs being worked around with retries.
     const max_attempts = 13;
@@ -2534,16 +2565,24 @@ pub fn dirOpenFileWtf16(
         var result: w.HANDLE = undefined;
         const rc = w.ntdll.NtCreateFile(
             &result,
-            w.SYNCHRONIZE |
-                (if (flags.isRead()) @as(u32, w.GENERIC_READ) else 0) |
-                (if (flags.isWrite()) @as(u32, w.GENERIC_WRITE) else 0),
+            .{
+                .STANDARD = .{ .SYNCHRONIZE = true },
+                .GENERIC = .{
+                    .READ = flags.isRead(),
+                    .WRITE = flags.isWrite(),
+                },
+            },
             &attr,
             &io_status_block,
             null,
-            w.FILE_ATTRIBUTE_NORMAL,
-            w.FILE_SHARE_WRITE | w.FILE_SHARE_READ | w.FILE_SHARE_DELETE,
-            w.FILE_OPEN,
-            create_file_flags,
+            .{ .NORMAL = true },
+            .VALID_FLAGS,
+            .OPEN,
+            .{
+                .IO = if (flags.follow_symlinks) .SYNCHRONOUS_NONALERT else .ASYNCHRONOUS,
+                .NON_DIRECTORY_FILE = true,
+                .OPEN_REPARSE_POINT = !flags.follow_symlinks,
+            },
             null,
             0,
         );
@@ -2835,10 +2874,6 @@ pub fn dirOpenDirWindows(
 ) Io.Dir.OpenError!Io.Dir {
     const current_thread = Thread.getCurrent(t);
     const w = windows;
-    // TODO remove some of these flags if options.access_sub_paths is false
-    const base_flags = w.STANDARD_RIGHTS_READ | w.FILE_READ_ATTRIBUTES | w.FILE_READ_EA |
-        w.SYNCHRONIZE | w.FILE_TRAVERSE;
-    const access_mask: u32 = if (options.iterate) base_flags | w.FILE_LIST_DIRECTORY else base_flags;
 
     const path_len_bytes: u16 = @intCast(sub_path_w.len * 2);
     var nt_name: w.UNICODE_STRING = .{
@@ -2846,28 +2881,43 @@ pub fn dirOpenDirWindows(
         .MaximumLength = path_len_bytes,
         .Buffer = @constCast(sub_path_w.ptr),
     };
-    var attr: w.OBJECT_ATTRIBUTES = .{
-        .Length = @sizeOf(w.OBJECT_ATTRIBUTES),
-        .RootDirectory = if (std.fs.path.isAbsoluteWindowsWtf16(sub_path_w)) null else dir.handle,
-        .Attributes = 0, // Note we do not use OBJ_CASE_INSENSITIVE here.
-        .ObjectName = &nt_name,
-        .SecurityDescriptor = null,
-        .SecurityQualityOfService = null,
-    };
-    const open_reparse_point: w.DWORD = if (!options.follow_symlinks) w.FILE_OPEN_REPARSE_POINT else 0x0;
     var io_status_block: w.IO_STATUS_BLOCK = undefined;
     var result: Io.Dir = .{ .handle = undefined };
     try current_thread.checkCancel();
     const rc = w.ntdll.NtCreateFile(
         &result.handle,
-        access_mask,
-        &attr,
+        // TODO remove some of these flags if options.access_sub_paths is false
+        .{
+            .SPECIFIC = .{ .FILE_DIRECTORY = .{
+                .LIST = options.iterate,
+                .READ_EA = true,
+                .TRAVERSE = true,
+                .READ_ATTRIBUTES = true,
+            } },
+            .STANDARD = .{
+                .RIGHTS = .READ,
+                .SYNCHRONIZE = true,
+            },
+        },
+        &.{
+            .Length = @sizeOf(w.OBJECT_ATTRIBUTES),
+            .RootDirectory = if (std.fs.path.isAbsoluteWindowsWtf16(sub_path_w)) null else dir.handle,
+            .Attributes = .{},
+            .ObjectName = &nt_name,
+            .SecurityDescriptor = null,
+            .SecurityQualityOfService = null,
+        },
         &io_status_block,
         null,
-        w.FILE_ATTRIBUTE_NORMAL,
-        w.FILE_SHARE_READ | w.FILE_SHARE_WRITE | w.FILE_SHARE_DELETE,
-        w.FILE_OPEN,
-        w.FILE_DIRECTORY_FILE | w.FILE_SYNCHRONOUS_IO_NONALERT | w.FILE_OPEN_FOR_BACKUP_INTENT | open_reparse_point,
+        .{ .NORMAL = true },
+        .VALID_FLAGS,
+        .OPEN,
+        .{
+            .DIRECTORY_FILE = true,
+            .IO = .SYNCHRONOUS_NONALERT,
+            .OPEN_FOR_BACKUP_INTENT = true,
+            .OPEN_REPARSE_POINT = !options.follow_symlinks,
+        },
         null,
         0,
     );
@@ -6818,7 +6868,7 @@ pub fn futexWake(ptr: *const std.atomic.Value(u32), max_waiters: u32) void {
 /// It can also block threads until the value is set with cancelation via timed
 /// waits. Statically initializable; four bytes on all targets.
 pub const ResetEvent = switch (native_os) {
-    .illumos, .netbsd => ResetEventPosix,
+    .illumos, .netbsd, .openbsd => ResetEventPosix,
     else => ResetEventFutex,
 };
 
