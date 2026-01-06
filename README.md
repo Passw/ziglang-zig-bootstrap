@@ -213,7 +213,7 @@ is more portable across Linux distributions.
 | `powerpc-openbsd-eabihf`  | OK     |
 | `powerpc64-openbsd-none`  | OK     |
 | `riscv64-openbsd-none`    | OK     |
-| `sparc64-openbsd-none`    | [#231](https://codeberg.org/ziglang/zig-bootstrap/issues/231) |
+| `sparc64-openbsd-none`    | [#251](https://codeberg.org/ziglang/zig-bootstrap/issues/251) |
 | `x86-openbsd-none`        | OK     |
 | `x86_64-openbsd-none`     | OK     |
 
