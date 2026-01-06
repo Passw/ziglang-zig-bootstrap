@@ -215,6 +215,10 @@ pub const FILE = struct {
         AccessFlags: ACCESS_MASK,
     };
 
+    /// This is not separated into RENAME_INFORMATION and RENAME_INFORMATION_EX because
+    /// the only difference is the `Flags` type (BOOLEAN before _EX, ULONG in the _EX),
+    /// which doesn't affect the struct layout--the offset of RootDirectory is the same
+    /// regardless.
     pub const RENAME_INFORMATION = extern struct {
         Flags: FLAGS,
         RootDirectory: ?HANDLE,
@@ -1076,6 +1080,9 @@ pub const CTL_CODE = packed struct(ULONG) {
 };
 
 pub const IOCTL = struct {
+    pub const KSEC = struct {
+        pub const GEN_RANDOM: CTL_CODE = .{ .DeviceType = .KSEC, .Function = 2, .Method = .BUFFERED, .Access = .ANY };
+    };
     pub const MOUNTMGR = struct {
         pub const QUERY_POINTS: CTL_CODE = .{ .DeviceType = .MOUNTMGRCONTROLTYPE, .Function = 2, .Method = .BUFFERED, .Access = .ANY };
         pub const QUERY_DOS_VOLUME_PATH: CTL_CODE = .{ .DeviceType = .MOUNTMGRCONTROLTYPE, .Function = 12, .Method = .BUFFERED, .Access = .ANY };
@@ -2249,7 +2256,7 @@ pub fn GetProcessHeap() ?*HEAP {
 pub const OBJECT_ATTRIBUTES = extern struct {
     Length: ULONG,
     RootDirectory: ?HANDLE,
-    ObjectName: *UNICODE_STRING,
+    ObjectName: ?*UNICODE_STRING,
     Attributes: ATTRIBUTES,
     SecurityDescriptor: ?*anyopaque,
     SecurityQualityOfService: ?*anyopaque,
@@ -2302,6 +2309,7 @@ pub const OpenError = error{
     NetworkNotFound,
     AntivirusInterference,
     BadPathName,
+    OperationCanceled,
 };
 
 pub const OpenFileOptions = struct {
@@ -2310,17 +2318,15 @@ pub const OpenFileOptions = struct {
     sa: ?*SECURITY_ATTRIBUTES = null,
     share_access: FILE.SHARE = .VALID_FLAGS,
     creation: FILE.CREATE_DISPOSITION,
-    /// If true, tries to open path as a directory.
-    /// Defaults to false.
-    filter: Filter = .file_only,
+    filter: Filter = .non_directory_only,
     /// If false, tries to open path as a reparse point without dereferencing it.
     /// Defaults to true.
     follow_symlinks: bool = true,
 
     pub const Filter = enum {
         /// Causes `OpenFile` to return `error.IsDir` if the opened handle would be a directory.
-        file_only,
-        /// Causes `OpenFile` to return `error.NotDir` if the opened handle would be a file.
+        non_directory_only,
+        /// Causes `OpenFile` to return `error.NotDir` if the opened handle is not a directory.
         dir_only,
         /// `OpenFile` does not discriminate between opening files and directories.
         any,
@@ -2328,10 +2334,10 @@ pub const OpenFileOptions = struct {
 };
 
 pub fn OpenFile(sub_path_w: []const u16, options: OpenFileOptions) OpenError!HANDLE {
-    if (mem.eql(u16, sub_path_w, &[_]u16{'.'}) and options.filter == .file_only) {
+    if (mem.eql(u16, sub_path_w, &[_]u16{'.'}) and options.filter == .non_directory_only) {
         return error.IsDir;
     }
-    if (mem.eql(u16, sub_path_w, &[_]u16{ '.', '.' }) and options.filter == .file_only) {
+    if (mem.eql(u16, sub_path_w, &[_]u16{ '.', '.' }) and options.filter == .non_directory_only) {
         return error.IsDir;
     }
 
@@ -2366,7 +2372,7 @@ pub fn OpenFile(sub_path_w: []const u16, options: OpenFileOptions) OpenError!HAN
             options.creation,
             .{
                 .DIRECTORY_FILE = options.filter == .dir_only,
-                .NON_DIRECTORY_FILE = options.filter == .file_only,
+                .NON_DIRECTORY_FILE = options.filter == .non_directory_only,
                 .IO = if (options.follow_symlinks) .SYNCHRONOUS_NONALERT else .ASYNCHRONOUS,
                 .OPEN_REPARSE_POINT = !options.follow_symlinks,
             },
@@ -2403,6 +2409,7 @@ pub fn OpenFile(sub_path_w: []const u16, options: OpenFileOptions) OpenError!HAN
                 continue;
             },
             .VIRUS_INFECTED, .VIRUS_DELETED => return error.AntivirusInterference,
+            .CANCELLED => return error.OperationCanceled,
             else => return unexpectedStatus(rc),
         }
     }
@@ -2640,30 +2647,59 @@ pub fn SetHandleInformation(h: HANDLE, mask: DWORD, flags: DWORD) SetHandleInfor
     }
 }
 
-pub const RtlGenRandomError = error{
-    /// `RtlGenRandom` has been known to fail in situations where the system is under heavy load.
-    /// Unfortunately, it does not call `SetLastError`, so it is not possible to get more specific
-    /// error information; it could actually be due to an out-of-memory condition, for example.
-    SystemResources,
-};
-
-/// Call RtlGenRandom() instead of CryptGetRandom() on Windows
-/// https://github.com/rust-lang-nursery/rand/issues/111
-/// https://bugzilla.mozilla.org/show_bug.cgi?id=504270
-pub fn RtlGenRandom(output: []u8) RtlGenRandomError!void {
-    var total_read: usize = 0;
-    var buff: []u8 = output[0..];
-    const max_read_size: ULONG = maxInt(ULONG);
-
-    while (total_read < output.len) {
-        const to_read: ULONG = @min(buff.len, max_read_size);
-
-        if (advapi32.RtlGenRandom(buff.ptr, to_read) == 0) {
-            return error.SystemResources;
-        }
-
-        total_read += to_read;
-        buff = buff[to_read..];
+/// An alternate implementation of ProcessPrng from bcryptprimitives.dll
+/// This one has the following differences:
+/// * does not heap allocate `buffer`
+/// * does not introduce a dependency on bcryptprimitives.dll, which apparently
+///   runs a test suite every time it is loaded
+/// * reads buffer.len bytes from "\\Device\\CNG" rather than seeding a per-CPU
+///   AES csprng with 48 bytes.
+pub fn ProcessPrng(buffer: []u8) error{Unexpected}!void {
+    const device_path = [_]u16{ '\\', 'D', 'e', 'v', 'i', 'c', 'e', '\\', 'C', 'N', 'G' };
+    var nt_name: UNICODE_STRING = .{
+        .Length = device_path.len * 2,
+        .MaximumLength = 0,
+        .Buffer = @constCast(&device_path),
+    };
+    var cng_device: HANDLE = undefined;
+    var io_status_block: IO_STATUS_BLOCK = undefined;
+    switch (ntdll.NtOpenFile(
+        &cng_device,
+        .{
+            .STANDARD = .{ .SYNCHRONIZE = true },
+            .SPECIFIC = .{ .FILE = .{ .READ_DATA = true } },
+        },
+        &.{
+            .Length = @sizeOf(OBJECT_ATTRIBUTES),
+            .RootDirectory = null,
+            .ObjectName = &nt_name,
+            .Attributes = .{},
+            .SecurityDescriptor = null,
+            .SecurityQualityOfService = null,
+        },
+        &io_status_block,
+        .VALID_FLAGS,
+        .{ .IO = .SYNCHRONOUS_NONALERT },
+    )) {
+        .SUCCESS => {},
+        .OBJECT_NAME_NOT_FOUND => return error.Unexpected, // Observed on wine 10.0
+        else => |status| return unexpectedStatus(status),
+    }
+    defer _ = ntdll.NtClose(cng_device);
+    switch (ntdll.NtDeviceIoControlFile(
+        cng_device,
+        null,
+        null,
+        null,
+        &io_status_block,
+        IOCTL.KSEC.GEN_RANDOM,
+        null,
+        0,
+        buffer.ptr,
+        @intCast(buffer.len),
+    )) {
+        .SUCCESS => {},
+        else => |status| return unexpectedStatus(status),
     }
 }
 
@@ -2828,149 +2864,6 @@ pub fn CloseHandle(hObject: HANDLE) void {
     assert(ntdll.NtClose(hObject) == .SUCCESS);
 }
 
-pub const ReadFileError = error{
-    BrokenPipe,
-    /// The specified network name is no longer available.
-    ConnectionResetByPeer,
-    Canceled,
-    /// Unable to read file due to lock.
-    LockViolation,
-    /// Known to be possible when:
-    /// - Unable to read from disconnected virtual com port (Windows)
-    AccessDenied,
-    NotOpenForReading,
-    Unexpected,
-};
-
-/// If buffer's length exceeds what a Windows DWORD integer can hold, it will be broken into
-/// multiple non-atomic reads.
-pub fn ReadFile(in_hFile: HANDLE, buffer: []u8, offset: ?u64) ReadFileError!usize {
-    while (true) {
-        const want_read_count: DWORD = @min(@as(DWORD, maxInt(DWORD)), buffer.len);
-        var amt_read: DWORD = undefined;
-        var overlapped_data: OVERLAPPED = undefined;
-        const overlapped: ?*OVERLAPPED = if (offset) |off| blk: {
-            overlapped_data = .{
-                .Internal = 0,
-                .InternalHigh = 0,
-                .DUMMYUNIONNAME = .{
-                    .DUMMYSTRUCTNAME = .{
-                        .Offset = @as(u32, @truncate(off)),
-                        .OffsetHigh = @as(u32, @truncate(off >> 32)),
-                    },
-                },
-                .hEvent = null,
-            };
-            break :blk &overlapped_data;
-        } else null;
-        if (kernel32.ReadFile(in_hFile, buffer.ptr, want_read_count, &amt_read, overlapped) == 0) {
-            switch (GetLastError()) {
-                .IO_PENDING => unreachable,
-                .OPERATION_ABORTED => continue,
-                .BROKEN_PIPE => return 0,
-                .HANDLE_EOF => return 0,
-                .NETNAME_DELETED => return error.ConnectionResetByPeer,
-                .LOCK_VIOLATION => return error.LockViolation,
-                .ACCESS_DENIED => return error.AccessDenied,
-                .INVALID_HANDLE => return error.NotOpenForReading,
-                else => |err| return unexpectedError(err),
-            }
-        }
-        return amt_read;
-    }
-}
-
-pub const WriteFileError = error{
-    SystemResources,
-    Canceled,
-    BrokenPipe,
-    NotOpenForWriting,
-    /// The process cannot access the file because another process has locked
-    /// a portion of the file.
-    LockViolation,
-    /// The specified network name is no longer available.
-    ConnectionResetByPeer,
-    /// Known to be possible when:
-    /// - Unable to write to disconnected virtual com port (Windows)
-    AccessDenied,
-    Unexpected,
-};
-
-pub fn WriteFile(
-    handle: HANDLE,
-    bytes: []const u8,
-    offset: ?u64,
-) WriteFileError!usize {
-    var bytes_written: DWORD = undefined;
-    var overlapped_data: OVERLAPPED = undefined;
-    const overlapped: ?*OVERLAPPED = if (offset) |off| blk: {
-        overlapped_data = .{
-            .Internal = 0,
-            .InternalHigh = 0,
-            .DUMMYUNIONNAME = .{
-                .DUMMYSTRUCTNAME = .{
-                    .Offset = @truncate(off),
-                    .OffsetHigh = @truncate(off >> 32),
-                },
-            },
-            .hEvent = null,
-        };
-        break :blk &overlapped_data;
-    } else null;
-    const adjusted_len = math.cast(u32, bytes.len) orelse maxInt(u32);
-    if (kernel32.WriteFile(handle, bytes.ptr, adjusted_len, &bytes_written, overlapped) == 0) {
-        switch (GetLastError()) {
-            .INVALID_USER_BUFFER => return error.SystemResources,
-            .NOT_ENOUGH_MEMORY => return error.SystemResources,
-            .OPERATION_ABORTED => return error.Canceled,
-            .NOT_ENOUGH_QUOTA => return error.SystemResources,
-            .IO_PENDING => unreachable,
-            .NO_DATA => return error.BrokenPipe,
-            .INVALID_HANDLE => return error.NotOpenForWriting,
-            .LOCK_VIOLATION => return error.LockViolation,
-            .NETNAME_DELETED => return error.ConnectionResetByPeer,
-            .ACCESS_DENIED => return error.AccessDenied,
-            .WORKING_SET_QUOTA => return error.SystemResources,
-            else => |err| return unexpectedError(err),
-        }
-    }
-    return bytes_written;
-}
-
-pub const SetCurrentDirectoryError = error{
-    NameTooLong,
-    FileNotFound,
-    NotDir,
-    AccessDenied,
-    NoDevice,
-    BadPathName,
-    Unexpected,
-};
-
-pub fn SetCurrentDirectory(path_name: []const u16) SetCurrentDirectoryError!void {
-    const path_len_bytes = math.cast(u16, path_name.len * 2) orelse return error.NameTooLong;
-
-    var nt_name: UNICODE_STRING = .{
-        .Length = path_len_bytes,
-        .MaximumLength = path_len_bytes,
-        .Buffer = @constCast(path_name.ptr),
-    };
-
-    const rc = ntdll.RtlSetCurrentDirectory_U(&nt_name);
-    switch (rc) {
-        .SUCCESS => {},
-        .OBJECT_NAME_INVALID => return error.BadPathName,
-        .OBJECT_NAME_NOT_FOUND => return error.FileNotFound,
-        .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
-        .NO_MEDIA_IN_DEVICE => return error.NoDevice,
-        .INVALID_PARAMETER => unreachable,
-        .ACCESS_DENIED => return error.AccessDenied,
-        .OBJECT_PATH_SYNTAX_BAD => unreachable,
-        .NOT_A_DIRECTORY => return error.NotDir,
-        else => return unexpectedStatus(rc),
-    }
-}
-
 pub const GetCurrentDirectoryError = error{
     NameTooLong,
     Unexpected,
@@ -3040,7 +2933,7 @@ pub fn CreateSymbolicLink(
         },
         .dir = dir,
         .creation = .CREATE,
-        .filter = if (is_directory) .dir_only else .file_only,
+        .filter = if (is_directory) .dir_only else .non_directory_only,
     }) catch |err| switch (err) {
         error.IsDir => return error.PathAlreadyExists,
         error.NotDir => return error.Unexpected,
@@ -3066,7 +2959,7 @@ pub fn CreateSymbolicLink(
             // Already an NT path, no need to do anything to it
             break :target_path target_path;
         } else {
-            switch (getWin32PathType(u16, target_path)) {
+            switch (std.fs.path.getWin32PathType(u16, target_path)) {
                 // Rooted paths need to avoid getting put through wToPrefixedFileW
                 // (and they are treated as relative in this context)
                 // Note: It seems that rooted paths in symbolic links are relative to
@@ -3126,6 +3019,7 @@ pub const ReadLinkError = error{
     AntivirusInterference,
     UnsupportedReparsePointType,
     NotLink,
+    OperationCanceled,
 };
 
 /// `sub_path_w` will never be accessed after `out_buffer` has been written to, so it
@@ -3156,6 +3050,7 @@ pub fn ReadLink(dir: ?HANDLE, sub_path_w: []const u16, out_buffer: []u16) ReadLi
     const rc = DeviceIoControl(result_handle, FSCTL.GET_REPARSE_POINT, .{ .out = reparse_buf[0..] });
     switch (rc) {
         .SUCCESS => {},
+        .CANCELLED => return error.OperationCanceled,
         .NOT_A_REPARSE_POINT => return error.NotLink,
         else => return unexpectedStatus(rc),
     }
@@ -3480,71 +3375,6 @@ pub fn GetStdHandle(handle_id: DWORD) GetStdHandleError!HANDLE {
     return handle;
 }
 
-pub const SetFilePointerError = error{
-    Unseekable,
-    Unexpected,
-};
-
-/// The SetFilePointerEx function with the `dwMoveMethod` parameter set to `FILE_BEGIN`.
-pub fn SetFilePointerEx_BEGIN(handle: HANDLE, offset: u64) SetFilePointerError!void {
-    // "The starting point is zero or the beginning of the file. If [FILE_BEGIN]
-    // is specified, then the liDistanceToMove parameter is interpreted as an unsigned value."
-    // https://docs.microsoft.com/en-us/windows/desktop/api/fileapi/nf-fileapi-setfilepointerex
-    const ipos = @as(LARGE_INTEGER, @bitCast(offset));
-    if (kernel32.SetFilePointerEx(handle, ipos, null, FILE_BEGIN) == 0) {
-        switch (GetLastError()) {
-            .INVALID_FUNCTION => return error.Unseekable,
-            .NEGATIVE_SEEK => return error.Unseekable,
-            .INVALID_PARAMETER => unreachable,
-            .INVALID_HANDLE => unreachable,
-            else => |err| return unexpectedError(err),
-        }
-    }
-}
-
-/// The SetFilePointerEx function with the `dwMoveMethod` parameter set to `FILE_CURRENT`.
-pub fn SetFilePointerEx_CURRENT(handle: HANDLE, offset: i64) SetFilePointerError!void {
-    if (kernel32.SetFilePointerEx(handle, offset, null, FILE_CURRENT) == 0) {
-        switch (GetLastError()) {
-            .INVALID_FUNCTION => return error.Unseekable,
-            .NEGATIVE_SEEK => return error.Unseekable,
-            .INVALID_PARAMETER => unreachable,
-            .INVALID_HANDLE => unreachable,
-            else => |err| return unexpectedError(err),
-        }
-    }
-}
-
-/// The SetFilePointerEx function with the `dwMoveMethod` parameter set to `FILE_END`.
-pub fn SetFilePointerEx_END(handle: HANDLE, offset: i64) SetFilePointerError!void {
-    if (kernel32.SetFilePointerEx(handle, offset, null, FILE_END) == 0) {
-        switch (GetLastError()) {
-            .INVALID_FUNCTION => return error.Unseekable,
-            .NEGATIVE_SEEK => return error.Unseekable,
-            .INVALID_PARAMETER => unreachable,
-            .INVALID_HANDLE => unreachable,
-            else => |err| return unexpectedError(err),
-        }
-    }
-}
-
-/// The SetFilePointerEx function with parameters to get the current offset.
-pub fn SetFilePointerEx_CURRENT_get(handle: HANDLE) SetFilePointerError!u64 {
-    var result: LARGE_INTEGER = undefined;
-    if (kernel32.SetFilePointerEx(handle, 0, &result, FILE_CURRENT) == 0) {
-        switch (GetLastError()) {
-            .INVALID_FUNCTION => return error.Unseekable,
-            .NEGATIVE_SEEK => return error.Unseekable,
-            .INVALID_PARAMETER => unreachable,
-            .INVALID_HANDLE => unreachable,
-            else => |err| return unexpectedError(err),
-        }
-    }
-    // Based on the docs for FILE_BEGIN, it seems that the returned signed integer
-    // should be interpreted as an unsigned integer.
-    return @as(u64, @bitCast(result));
-}
-
 pub const QueryObjectNameError = error{
     AccessDenied,
     InvalidHandle,
@@ -3584,7 +3414,7 @@ test QueryObjectName {
     //any file will do; canonicalization works on NTFS junctions and symlinks, hardlinks remain separate paths.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const handle = tmp.dir.fd;
+    const handle = tmp.dir.handle;
     var out_buffer: [PATH_MAX_WIDE]u16 = undefined;
 
     const result_path = try QueryObjectName(handle, &out_buffer);
@@ -3597,7 +3427,6 @@ test QueryObjectName {
 
 pub const GetFinalPathNameByHandleError = error{
     AccessDenied,
-    BadPathName,
     FileNotFound,
     NameTooLong,
     /// The volume does not contain a recognized file system. File system
@@ -3622,6 +3451,8 @@ pub const GetFinalPathNameByHandleFormat = struct {
 /// NT or DOS volume name (e.g., `\Device\HarddiskVolume0\foo.txt` versus `C:\foo.txt`).
 /// If DOS volume name format is selected, note that this function does *not* prepend
 /// `\\?\` prefix to the resultant path.
+///
+/// TODO move this function into std.Io.Threaded and add cancelation checks
 pub fn GetFinalPathNameByHandle(
     hFile: HANDLE,
     fmt: GetFinalPathNameByHandleFormat,
@@ -3661,7 +3492,7 @@ pub fn GetFinalPathNameByHandle(
                 };
             }
 
-            const file_path_begin_index = mem.indexOfPos(u16, final_path, device_prefix.len, &[_]u16{'\\'}) orelse unreachable;
+            const file_path_begin_index = mem.findPos(u16, final_path, device_prefix.len, &[_]u16{'\\'}) orelse unreachable;
             const volume_name_u16 = final_path[0..file_path_begin_index];
             const device_name_u16 = volume_name_u16[device_prefix.len..];
             const file_name_u16 = final_path[file_path_begin_index..];
@@ -3701,6 +3532,8 @@ pub fn GetFinalPathNameByHandle(
                 error.WouldBlock => return error.Unexpected,
                 error.NetworkNotFound => return error.Unexpected,
                 error.AntivirusInterference => return error.Unexpected,
+                error.BadPathName => return error.Unexpected,
+                error.OperationCanceled => @panic("TODO: better integrate cancelation"),
                 else => |e| return e,
             };
             defer CloseHandle(mgmt_handle);
@@ -3746,9 +3579,7 @@ pub fn GetFinalPathNameByHandle(
                     const total_len = drive_letter.len + file_name_u16.len;
 
                     // Validate that DOS does not contain any spurious nul bytes.
-                    if (mem.indexOfScalar(u16, out_buffer[0..total_len], 0)) |_| {
-                        return error.BadPathName;
-                    }
+                    assert(mem.findScalar(u16, out_buffer[0..total_len], 0) == null);
 
                     return out_buffer[0..total_len];
                 } else if (mountmgrIsVolumeName(symlink)) {
@@ -3798,9 +3629,7 @@ pub fn GetFinalPathNameByHandle(
                     const total_len = volume_path.len + file_name_u16.len;
 
                     // Validate that DOS does not contain any spurious nul bytes.
-                    if (mem.indexOfScalar(u16, out_buffer[0..total_len], 0)) |_| {
-                        return error.BadPathName;
-                    }
+                    assert(mem.findScalar(u16, out_buffer[0..total_len], 0) == null);
 
                     return out_buffer[0..total_len];
                 }
@@ -3847,7 +3676,7 @@ test GetFinalPathNameByHandle {
     //any file will do
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const handle = tmp.dir.fd;
+    const handle = tmp.dir.handle;
     var buffer: [PATH_MAX_WIDE]u16 = undefined;
 
     //check with sufficient size
@@ -3957,17 +3786,6 @@ pub fn GetModuleFileNameW(hModule: ?HMODULE, buf_ptr: [*]u16, buf_len: DWORD) Ge
         }
     }
     return buf_ptr[0..rc :0];
-}
-
-pub const TerminateProcessError = error{ AccessDenied, Unexpected };
-
-pub fn TerminateProcess(hProcess: HANDLE, uExitCode: UINT) TerminateProcessError!void {
-    if (kernel32.TerminateProcess(hProcess, uExitCode) == 0) {
-        switch (GetLastError()) {
-            Win32Error.ACCESS_DENIED => return error.AccessDenied,
-            else => |err| return unexpectedError(err),
-        }
-    }
 }
 
 pub const NtAllocateVirtualMemoryError = error{
@@ -4122,7 +3940,7 @@ pub fn CreateProcessW(
     lpThreadAttributes: ?*SECURITY_ATTRIBUTES,
     bInheritHandles: BOOL,
     dwCreationFlags: CreateProcessFlags,
-    lpEnvironment: ?*anyopaque,
+    lpEnvironment: ?[*:0]u16,
     lpCurrentDirectory: ?LPCWSTR,
     lpStartupInfo: *STARTUPINFOW,
     lpProcessInformation: *PROCESS_INFORMATION,
@@ -4246,80 +4064,6 @@ pub fn QueryPerformanceCounter() u64 {
 
 pub fn InitOnceExecuteOnce(InitOnce: *INIT_ONCE, InitFn: INIT_ONCE_FN, Parameter: ?*anyopaque, Context: ?*anyopaque) void {
     assert(kernel32.InitOnceExecuteOnce(InitOnce, InitFn, Parameter, Context) != 0);
-}
-
-pub const SetFileTimeError = error{Unexpected};
-
-pub fn SetFileTime(
-    hFile: HANDLE,
-    lpCreationTime: ?*const FILETIME,
-    lpLastAccessTime: ?*const FILETIME,
-    lpLastWriteTime: ?*const FILETIME,
-) SetFileTimeError!void {
-    const rc = kernel32.SetFileTime(hFile, lpCreationTime, lpLastAccessTime, lpLastWriteTime);
-    if (rc == 0) {
-        switch (GetLastError()) {
-            else => |err| return unexpectedError(err),
-        }
-    }
-}
-
-pub const LockFileError = error{
-    SystemResources,
-    WouldBlock,
-} || UnexpectedError;
-
-pub fn LockFile(
-    FileHandle: HANDLE,
-    Event: ?HANDLE,
-    ApcRoutine: ?*const IO_APC_ROUTINE,
-    ApcContext: ?*anyopaque,
-    IoStatusBlock: *IO_STATUS_BLOCK,
-    ByteOffset: *const LARGE_INTEGER,
-    Length: *const LARGE_INTEGER,
-    Key: ?*ULONG,
-    FailImmediately: BOOLEAN,
-    ExclusiveLock: BOOLEAN,
-) !void {
-    const rc = ntdll.NtLockFile(
-        FileHandle,
-        Event,
-        ApcRoutine,
-        ApcContext,
-        IoStatusBlock,
-        ByteOffset,
-        Length,
-        Key,
-        FailImmediately,
-        ExclusiveLock,
-    );
-    switch (rc) {
-        .SUCCESS => return,
-        .INSUFFICIENT_RESOURCES => return error.SystemResources,
-        .LOCK_NOT_GRANTED => return error.WouldBlock,
-        .ACCESS_VIOLATION => unreachable, // bad io_status_block pointer
-        else => return unexpectedStatus(rc),
-    }
-}
-
-pub const UnlockFileError = error{
-    RangeNotLocked,
-} || UnexpectedError;
-
-pub fn UnlockFile(
-    FileHandle: HANDLE,
-    IoStatusBlock: *IO_STATUS_BLOCK,
-    ByteOffset: *const LARGE_INTEGER,
-    Length: *const LARGE_INTEGER,
-    Key: ULONG,
-) !void {
-    const rc = ntdll.NtUnlockFile(FileHandle, IoStatusBlock, ByteOffset, Length, Key);
-    switch (rc) {
-        .SUCCESS => return,
-        .RANGE_NOT_LOCKED => return error.RangeNotLocked,
-        .ACCESS_VIOLATION => unreachable, // bad io_status_block pointer
-        else => return unexpectedStatus(rc),
-    }
 }
 
 /// This is a workaround for the C backend until zig has the ability to put
@@ -4512,7 +4256,7 @@ pub const RemoveDotDirsError = error{TooManyParentDirs};
 ///    2) all repeating back slashes have been collapsed
 ///    3) the path is a relative one (does not start with a back slash)
 pub fn removeDotDirsSanitized(comptime T: type, path: []T) RemoveDotDirsError!usize {
-    std.debug.assert(path.len == 0 or path[0] != '\\');
+    assert(path.len == 0 or path[0] != '\\');
 
     var write_idx: usize = 0;
     var read_idx: usize = 0;
@@ -4528,7 +4272,7 @@ pub fn removeDotDirsSanitized(comptime T: type, path: []T) RemoveDotDirsError!us
             }
             if (after_dot == '.' and (read_idx + 2 == path.len or path[read_idx + 2] == '\\')) {
                 if (write_idx == 0) return error.TooManyParentDirs;
-                std.debug.assert(write_idx >= 2);
+                assert(write_idx >= 2);
                 write_idx -= 1;
                 while (true) {
                     write_idx -= 1;
@@ -4630,7 +4374,7 @@ pub fn wToPrefixedFileW(dir: ?HANDLE, path: [:0]const u16) Wtf16ToPrefixedFileWE
         path_space.data[path_space.len] = 0;
         return path_space;
     } else {
-        const path_type = getWin32PathType(u16, path);
+        const path_type = std.fs.path.getWin32PathType(u16, path);
         var path_space: PathSpace = undefined;
         if (path_type == .local_device) {
             switch (getLocalDevicePathType(u16, path)) {
@@ -4713,8 +4457,8 @@ pub fn wToPrefixedFileW(dir: ?HANDLE, path: [:0]const u16) Wtf16ToPrefixedFileWE
                 break :path_to_get path;
             }
             // We can also skip GetFinalPathNameByHandle if the handle matches
-            // the handle returned by fs.cwd()
-            if (dir.? == std.fs.cwd().fd) {
+            // the handle returned by Io.Dir.cwd()
+            if (dir.? == Io.Dir.cwd().handle) {
                 break :path_to_get path;
             }
             // At this point, we know we have a relative path that had too many
@@ -4768,134 +4512,13 @@ pub fn wToPrefixedFileW(dir: ?HANDLE, path: [:0]const u16) Wtf16ToPrefixedFileWE
         if (path_type == .unc_absolute) {
             // Now add in the UNC, the `C` should overwrite the first `\` of the
             // FullPathName, ultimately resulting in `\??\UNC\<the rest of the path>`
-            std.debug.assert(path_space.data[path_buf_offset] == '\\');
-            std.debug.assert(path_space.data[path_buf_offset + 1] == '\\');
+            assert(path_space.data[path_buf_offset] == '\\');
+            assert(path_space.data[path_buf_offset + 1] == '\\');
             const unc = [_]u16{ 'U', 'N', 'C' };
             path_space.data[nt_prefix.len..][0..unc.len].* = unc;
         }
         return path_space;
     }
-}
-
-/// Similar to `RTL_PATH_TYPE`, but without the `UNKNOWN` path type.
-pub const Win32PathType = enum {
-    /// `\\server\share\foo`
-    unc_absolute,
-    /// `C:\foo`
-    drive_absolute,
-    /// `C:foo`
-    drive_relative,
-    /// `\foo`
-    rooted,
-    /// `foo`
-    relative,
-    /// `\\.\foo`, `\\?\foo`
-    local_device,
-    /// `\\.`, `\\?`
-    root_local_device,
-};
-
-/// Get the path type of a Win32 namespace path.
-/// Similar to `RtlDetermineDosPathNameType_U`.
-/// If `T` is `u16`, then `path` should be encoded as WTF-16LE.
-pub fn getWin32PathType(comptime T: type, path: []const T) Win32PathType {
-    if (path.len < 1) return .relative;
-
-    const windows_path = std.fs.path.PathType.windows;
-    if (windows_path.isSep(T, path[0])) {
-        // \x
-        if (path.len < 2 or !windows_path.isSep(T, path[1])) return .rooted;
-        // \\. or \\?
-        if (path.len > 2 and (path[2] == mem.nativeToLittle(T, '.') or path[2] == mem.nativeToLittle(T, '?'))) {
-            // exactly \\. or \\? with nothing trailing
-            if (path.len == 3) return .root_local_device;
-            // \\.\x or \\?\x
-            if (windows_path.isSep(T, path[3])) return .local_device;
-        }
-        // \\x
-        return .unc_absolute;
-    } else {
-        // Some choice has to be made about how non-ASCII code points as drive-letters are handled, since
-        // path[0] is a different size for WTF-16 vs WTF-8, leading to a potential mismatch in classification
-        // for a WTF-8 path and its WTF-16 equivalent. For example, `€:\` encoded in WTF-16 is three code
-        // units `<0x20AC>:\` whereas `€:\` encoded as WTF-8 is 6 code units `<0xE2><0x82><0xAC>:\` so
-        // checking path[0], path[1] and path[2] would not behave the same between WTF-8/WTF-16.
-        //
-        // `RtlDetermineDosPathNameType_U` exclusively deals with WTF-16 and considers
-        // `€:\` a drive-absolute path, but code points that take two WTF-16 code units to encode get
-        // classified as a relative path (e.g. with U+20000 as the drive-letter that'd be encoded
-        // in WTF-16 as `<0xD840><0xDC00>:\` and be considered a relative path).
-        //
-        // The choice made here is to emulate the behavior of `RtlDetermineDosPathNameType_U` for both
-        // WTF-16 and WTF-8. This is because, while unlikely and not supported by the Disk Manager GUI,
-        // drive letters are not actually restricted to A-Z. Using `SetVolumeMountPointW` will allow you
-        // to set any byte value as a drive letter, and going through `IOCTL_MOUNTMGR_CREATE_POINT` will
-        // allow you to set any WTF-16 code unit as a drive letter.
-        //
-        // Non-A-Z drive letters don't interact well with most of Windows, but certain things do work, e.g.
-        // `cd /D €:\` will work, filesystem functions still work, etc.
-        //
-        // The unfortunate part of this is that this makes handling WTF-8 more complicated as we can't
-        // just check path[0], path[1], path[2].
-        const colon_i: usize = switch (T) {
-            u8 => i: {
-                const code_point_len = std.unicode.utf8ByteSequenceLength(path[0]) catch return .relative;
-                // Conveniently, 4-byte sequences in WTF-8 have the same starting code point
-                // as 2-code-unit sequences in WTF-16.
-                if (code_point_len > 3) return .relative;
-                break :i code_point_len;
-            },
-            u16 => 1,
-            else => @compileError("unsupported type: " ++ @typeName(T)),
-        };
-        // x
-        if (path.len < colon_i + 1 or path[colon_i] != mem.nativeToLittle(T, ':')) return .relative;
-        // x:\
-        if (path.len > colon_i + 1 and windows_path.isSep(T, path[colon_i + 1])) return .drive_absolute;
-        // x:
-        return .drive_relative;
-    }
-}
-
-test getWin32PathType {
-    try std.testing.expectEqual(.relative, getWin32PathType(u8, ""));
-    try std.testing.expectEqual(.relative, getWin32PathType(u8, "x"));
-    try std.testing.expectEqual(.relative, getWin32PathType(u8, "x\\"));
-
-    try std.testing.expectEqual(.root_local_device, getWin32PathType(u8, "//."));
-    try std.testing.expectEqual(.root_local_device, getWin32PathType(u8, "/\\?"));
-    try std.testing.expectEqual(.root_local_device, getWin32PathType(u8, "\\\\?"));
-
-    try std.testing.expectEqual(.local_device, getWin32PathType(u8, "//./x"));
-    try std.testing.expectEqual(.local_device, getWin32PathType(u8, "/\\?\\x"));
-    try std.testing.expectEqual(.local_device, getWin32PathType(u8, "\\\\?\\x"));
-    // local device paths require a path separator after the root, otherwise it is considered a UNC path
-    try std.testing.expectEqual(.unc_absolute, getWin32PathType(u8, "\\\\?x"));
-    try std.testing.expectEqual(.unc_absolute, getWin32PathType(u8, "//.x"));
-
-    try std.testing.expectEqual(.unc_absolute, getWin32PathType(u8, "//"));
-    try std.testing.expectEqual(.unc_absolute, getWin32PathType(u8, "\\\\x"));
-    try std.testing.expectEqual(.unc_absolute, getWin32PathType(u8, "//x"));
-
-    try std.testing.expectEqual(.rooted, getWin32PathType(u8, "\\x"));
-    try std.testing.expectEqual(.rooted, getWin32PathType(u8, "/"));
-
-    try std.testing.expectEqual(.drive_relative, getWin32PathType(u8, "x:"));
-    try std.testing.expectEqual(.drive_relative, getWin32PathType(u8, "x:abc"));
-    try std.testing.expectEqual(.drive_relative, getWin32PathType(u8, "x:a/b/c"));
-
-    try std.testing.expectEqual(.drive_absolute, getWin32PathType(u8, "x:\\"));
-    try std.testing.expectEqual(.drive_absolute, getWin32PathType(u8, "x:\\abc"));
-    try std.testing.expectEqual(.drive_absolute, getWin32PathType(u8, "x:/a/b/c"));
-
-    // Non-ASCII code point that is encoded as one WTF-16 code unit is considered a valid drive letter
-    try std.testing.expectEqual(.drive_absolute, getWin32PathType(u8, "€:\\"));
-    try std.testing.expectEqual(.drive_absolute, getWin32PathType(u16, std.unicode.wtf8ToWtf16LeStringLiteral("€:\\")));
-    try std.testing.expectEqual(.drive_relative, getWin32PathType(u8, "€:"));
-    try std.testing.expectEqual(.drive_relative, getWin32PathType(u16, std.unicode.wtf8ToWtf16LeStringLiteral("€:")));
-    // But code points that are encoded as two WTF-16 code units are not
-    try std.testing.expectEqual(.relative, getWin32PathType(u8, "\u{10000}:\\"));
-    try std.testing.expectEqual(.relative, getWin32PathType(u16, std.unicode.wtf8ToWtf16LeStringLiteral("\u{10000}:\\")));
 }
 
 /// Returns true if the path starts with `\??\`, which is indicative of an NT path
@@ -4937,10 +4560,10 @@ const LocalDevicePathType = enum {
 };
 
 /// Only relevant for Win32 -> NT path conversion.
-/// Asserts `path` is of type `Win32PathType.local_device`.
+/// Asserts `path` is of type `std.fs.path.Win32PathType.local_device`.
 fn getLocalDevicePathType(comptime T: type, path: []const T) LocalDevicePathType {
     if (std.debug.runtime_safety) {
-        std.debug.assert(getWin32PathType(T, path) == .local_device);
+        assert(std.fs.path.getWin32PathType(T, path) == .local_device);
     }
 
     const backslash = mem.nativeToLittle(T, '\\');

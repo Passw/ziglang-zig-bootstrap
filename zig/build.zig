@@ -1,17 +1,19 @@
 const std = @import("std");
 const builtin = std.builtin;
-const tests = @import("test/tests.zig");
 const BufMap = std.BufMap;
 const mem = std.mem;
-const io = std.io;
 const fs = std.fs;
 const InstallDirectoryOptions = std.Build.InstallDirectoryOptions;
 const assert = std.debug.assert;
+const Io = std.Io;
+
+const tests = @import("test/tests.zig");
 const DevEnv = @import("src/dev.zig").Env;
-const ValueInterpretMode = enum { direct, by_name };
 
 const zig_version: std.SemanticVersion = .{ .major = 0, .minor = 16, .patch = 0 };
 const stack_size = 46 * 1024 * 1024;
+
+const ValueInterpretMode = enum { direct, by_name };
 
 pub fn build(b: *std.Build) !void {
     const only_c = b.option(bool, "only-c", "Translate the Zig compiler to C code, with only the C backend enabled") orelse false;
@@ -95,6 +97,7 @@ pub fn build(b: *std.Build) !void {
     const skip_wasm = b.option(bool, "skip-wasm", "Main test suite skips targets with wasm32/wasm64 architecture") orelse false;
     const skip_freebsd = b.option(bool, "skip-freebsd", "Main test suite skips targets with freebsd OS") orelse false;
     const skip_netbsd = b.option(bool, "skip-netbsd", "Main test suite skips targets with netbsd OS") orelse false;
+    const skip_openbsd = b.option(bool, "skip-openbsd", "Main test suite skips targets with openbsd OS") orelse false;
     const skip_windows = b.option(bool, "skip-windows", "Main test suite skips targets with windows OS") orelse false;
     const skip_darwin = b.option(bool, "skip-darwin", "Main test suite skips targets with darwin OSs") orelse false;
     const skip_linux = b.option(bool, "skip-linux", "Main test suite skips targets with linux OS") orelse false;
@@ -259,7 +262,7 @@ pub fn build(b: *std.Build) !void {
             "--git-dir", ".git", // affected by the -C argument
             "describe", "--match",    "*.*.*", //
             "--tags",   "--abbrev=9",
-        }, &code, .Ignore) catch {
+        }, &code, .ignore) catch {
             break :v version_string;
         };
         const git_describe = mem.trim(u8, git_describe_untrimmed, " \n\r");
@@ -306,8 +309,10 @@ pub fn build(b: *std.Build) !void {
 
     if (enable_llvm) {
         const cmake_cfg = if (static_llvm) null else blk: {
+            const io = b.graph.io;
+            const cwd: Io.Dir = .cwd();
             if (findConfigH(b, config_h_path_option)) |config_h_path| {
-                const file_contents = fs.cwd().readFileAlloc(config_h_path, b.allocator, .limited(max_config_h_bytes)) catch unreachable;
+                const file_contents = cwd.readFileAlloc(io, config_h_path, b.allocator, .limited(max_config_h_bytes)) catch unreachable;
                 break :blk parseConfigH(b, file_contents);
             } else {
                 std.log.warn("config.h could not be located automatically. Consider providing it explicitly via \"-Dconfig_h\"", .{});
@@ -427,6 +432,7 @@ pub fn build(b: *std.Build) !void {
         .skip_wasm = skip_wasm,
         .skip_freebsd = skip_freebsd,
         .skip_netbsd = skip_netbsd,
+        .skip_openbsd = skip_openbsd,
         .skip_windows = skip_windows,
         .skip_darwin = skip_darwin,
         .skip_linux = skip_linux,
@@ -460,21 +466,19 @@ pub fn build(b: *std.Build) !void {
         .skip_wasm = skip_wasm,
         .skip_freebsd = skip_freebsd,
         .skip_netbsd = skip_netbsd,
+        .skip_openbsd = skip_openbsd,
         .skip_windows = skip_windows,
         .skip_darwin = skip_darwin,
         .skip_linux = skip_linux,
         .skip_llvm = skip_llvm,
         .skip_libc = skip_libc,
         .max_rss = switch (b.graph.host.result.os.tag) {
-            .freebsd => switch (b.graph.host.result.cpu.arch) {
-                .x86_64 => 1_060_217_241,
-                else => 1_100_000_000,
-            },
+            .freebsd => 2_000_000_000,
             .linux => switch (b.graph.host.result.cpu.arch) {
                 .aarch64 => 659_809_075,
                 .loongarch64 => 598_902_374,
-                .powerpc64le => 550_656_409,
-                .riscv64 => 731_258_880,
+                .powerpc64le => 627_431_833,
+                .riscv64 => 827_043_430,
                 .s390x => 580_596_121,
                 .x86_64 => 3_290_894_745,
                 else => 3_300_000_000,
@@ -507,6 +511,7 @@ pub fn build(b: *std.Build) !void {
         .skip_wasm = skip_wasm,
         .skip_freebsd = skip_freebsd,
         .skip_netbsd = skip_netbsd,
+        .skip_openbsd = skip_openbsd,
         .skip_windows = skip_windows,
         .skip_darwin = skip_darwin,
         .skip_linux = skip_linux,
@@ -531,10 +536,6 @@ pub fn build(b: *std.Build) !void {
                 .aarch64 => 701_413_785,
                 else => 800_000_000,
             },
-            .windows => switch (b.graph.host.result.cpu.arch) {
-                .x86_64 => 536_414_208,
-                else => 600_000_000,
-            },
             else => 900_000_000,
         },
     }));
@@ -555,36 +556,14 @@ pub fn build(b: *std.Build) !void {
         .skip_wasm = skip_wasm,
         .skip_freebsd = skip_freebsd,
         .skip_netbsd = skip_netbsd,
+        .skip_openbsd = skip_openbsd,
         .skip_windows = skip_windows,
         .skip_darwin = skip_darwin,
         .skip_linux = skip_linux,
         .skip_llvm = skip_llvm,
         .skip_libc = true,
         .no_builtin = true,
-        .max_rss = switch (b.graph.host.result.os.tag) {
-            .freebsd => switch (b.graph.host.result.cpu.arch) {
-                .x86_64 => 557_892_403,
-                else => 600_000_000,
-            },
-            .linux => switch (b.graph.host.result.cpu.arch) {
-                .aarch64 => 615_302_758,
-                .loongarch64 => 598_974_464,
-                .powerpc64le => 587_845_632,
-                .riscv64 => 382_786_764,
-                .s390x => 395_555_635,
-                .x86_64 => 871_883_161,
-                else => 900_000_000,
-            },
-            .macos => switch (b.graph.host.result.cpu.arch) {
-                .aarch64 => 451_389_030,
-                else => 500_000_000,
-            },
-            .windows => switch (b.graph.host.result.cpu.arch) {
-                .x86_64 => 367_747_072,
-                else => 400_000_000,
-            },
-            else => 900_000_000,
-        },
+        .max_rss = 900_000_000,
     }));
 
     test_modules_step.dependOn(tests.addModuleTests(b, .{
@@ -603,6 +582,7 @@ pub fn build(b: *std.Build) !void {
         .skip_wasm = skip_wasm,
         .skip_freebsd = skip_freebsd,
         .skip_netbsd = skip_netbsd,
+        .skip_openbsd = skip_openbsd,
         .skip_windows = skip_windows,
         .skip_darwin = skip_darwin,
         .skip_linux = skip_linux,
@@ -617,7 +597,7 @@ pub fn build(b: *std.Build) !void {
                 .aarch64 => 6_732_817_203,
                 .loongarch64 => 3_216_349_593,
                 .powerpc64le => 3_090_179_276,
-                .riscv64 => 3_570_899_763,
+                .riscv64 => 4_052_670_054,
                 .s390x => 3_652_514_201,
                 .x86_64 => 3_249_546_854,
                 else => 6_800_000_000,
@@ -647,30 +627,7 @@ pub fn build(b: *std.Build) !void {
         .use_llvm = use_llvm,
         .use_lld = use_llvm,
         .zig_lib_dir = b.path("lib"),
-        .max_rss = switch (b.graph.host.result.os.tag) {
-            .freebsd => switch (b.graph.host.result.cpu.arch) {
-                .x86_64 => 2_188_099_584,
-                else => 2_200_000_000,
-            },
-            .linux => switch (b.graph.host.result.cpu.arch) {
-                .aarch64 => 1_991_934_771,
-                .loongarch64 => 1_844_538_572,
-                .powerpc64le => 1_793_035_059,
-                .riscv64 => 2_459_003_289,
-                .s390x => 1_781_248_409,
-                .x86_64 => 977_192_550,
-                else => 2_500_000_000,
-            },
-            .macos => switch (b.graph.host.result.cpu.arch) {
-                .aarch64 => 2_062_393_344,
-                else => 2_100_000_000,
-            },
-            .windows => switch (b.graph.host.result.cpu.arch) {
-                .x86_64 => 1_953_087_488,
-                else => 2_000_000_000,
-            },
-            else => 2_500_000_000,
-        },
+        .max_rss = 2_500_000_000,
     });
     if (link_libc) {
         unit_tests.root_module.link_libc = true;
@@ -691,6 +648,7 @@ pub fn build(b: *std.Build) !void {
         .skip_wasm = skip_wasm,
         .skip_freebsd = skip_freebsd,
         .skip_netbsd = skip_netbsd,
+        .skip_openbsd = skip_openbsd,
         .skip_windows = skip_windows,
         .skip_darwin = skip_darwin,
         .skip_linux = skip_linux,
@@ -762,7 +720,7 @@ pub fn build(b: *std.Build) !void {
     }
 
     const test_incremental_step = b.step("test-incremental", "Run the incremental compilation test cases");
-    try tests.addIncrementalTests(b, test_incremental_step);
+    try tests.addIncrementalTests(b, test_incremental_step, test_filters);
     if (!skip_test_incremental) test_step.dependOn(test_incremental_step);
 
     if (tests.addLibcTests(b, .{
@@ -875,33 +833,16 @@ fn addCompilerMod(b: *std.Build, options: AddCompilerModOptions) *std.Build.Modu
 fn addCompilerStep(b: *std.Build, options: AddCompilerModOptions) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = "zig",
-        .max_rss = switch (b.graph.host.result.os.tag) {
-            .freebsd => switch (b.graph.host.result.cpu.arch) {
-                .x86_64 => 6_044_158_771,
-                else => 6_100_000_000,
-            },
-            .linux => switch (b.graph.host.result.cpu.arch) {
-                .aarch64 => 6_240_805_683,
-                .loongarch64 => 5_024_158_515,
-                .powerpc64le => 5_224_914_534,
-                .riscv64 => 6_996_309_196,
-                .s390x => 4_997_174_476,
-                .x86_64 => 6_664_025_702,
-                else => 7_000_000_000,
-            },
-            .macos => switch (b.graph.host.result.cpu.arch) {
-                .aarch64 => 6_639_145_779,
-                else => 6_700_000_000,
-            },
-            .windows => switch (b.graph.host.result.cpu.arch) {
-                .x86_64 => 5_770_394_009,
-                else => 5_800_000_000,
-            },
-            else => 7_000_000_000,
-        },
+        .max_rss = 7_900_000_000,
         .root_module = addCompilerMod(b, options),
     });
     exe.stack_size = stack_size;
+
+    // Must match the condition in CMakeLists.txt.
+    const function_data_sections = options.target.result.cpu.arch.isPowerPC();
+
+    exe.link_function_sections = function_data_sections;
+    exe.link_data_sections = function_data_sections;
 
     return exe;
 }
@@ -1153,10 +1094,13 @@ const CMakeConfig = struct {
 const max_config_h_bytes = 1 * 1024 * 1024;
 
 fn findConfigH(b: *std.Build, config_h_path_option: ?[]const u8) ?[]const u8 {
+    const io = b.graph.io;
+    const cwd: Io.Dir = .cwd();
+
     if (config_h_path_option) |path| {
-        var config_h_or_err = fs.cwd().openFile(path, .{});
+        var config_h_or_err = cwd.openFile(io, path, .{});
         if (config_h_or_err) |*file| {
-            file.close();
+            file.close(io);
             return path;
         } else |_| {
             std.log.err("Could not open provided config.h: \"{s}\"", .{path});
@@ -1166,13 +1110,13 @@ fn findConfigH(b: *std.Build, config_h_path_option: ?[]const u8) ?[]const u8 {
 
     var check_dir = fs.path.dirname(b.graph.zig_exe).?;
     while (true) {
-        var dir = fs.cwd().openDir(check_dir, .{}) catch unreachable;
-        defer dir.close();
+        var dir = cwd.openDir(io, check_dir, .{}) catch unreachable;
+        defer dir.close(io);
 
         // Check if config.h is present in dir
-        var config_h_or_err = dir.openFile("config.h", .{});
+        var config_h_or_err = dir.openFile(io, "config.h", .{});
         if (config_h_or_err) |*file| {
-            file.close();
+            file.close(io);
             return fs.path.join(
                 b.allocator,
                 &[_][]const u8{ check_dir, "config.h" },
@@ -1183,9 +1127,9 @@ fn findConfigH(b: *std.Build, config_h_path_option: ?[]const u8) ?[]const u8 {
         }
 
         // Check if we reached the source root by looking for .git, and bail if so
-        var git_dir_or_err = dir.openDir(".git", .{});
+        var git_dir_or_err = dir.openDir(io, ".git", .{});
         if (git_dir_or_err) |*git_dir| {
-            git_dir.close();
+            git_dir.close(io);
             return null;
         } else |_| {}
 
@@ -1581,6 +1525,8 @@ const llvm_libs_xtensa = [_][]const u8{
 };
 
 fn generateLangRef(b: *std.Build) std.Build.LazyPath {
+    const io = b.graph.io;
+
     const doctest_exe = b.addExecutable(.{
         .name = "doctest",
         .root_module = b.createModule(.{
@@ -1590,17 +1536,17 @@ fn generateLangRef(b: *std.Build) std.Build.LazyPath {
         }),
     });
 
-    var dir = b.build_root.handle.openDir("doc/langref", .{ .iterate = true }) catch |err| {
+    var dir = b.build_root.handle.openDir(io, "doc/langref", .{ .iterate = true }) catch |err| {
         std.debug.panic("unable to open '{f}doc/langref' directory: {s}", .{
             b.build_root, @errorName(err),
         });
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var wf = b.addWriteFiles();
 
     var it = dir.iterateAssumeFirstIteration();
-    while (it.next() catch @panic("failed to read dir")) |entry| {
+    while (it.next(io) catch @panic("failed to read dir")) |entry| {
         if (std.mem.startsWith(u8, entry.name, ".") or entry.kind != .file)
             continue;
 
