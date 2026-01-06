@@ -202,6 +202,21 @@ is more portable across Linux distributions.
 | `x86-netbsd-none`        | OK     |
 | `x86_64-netbsd-none`     | OK     |
 
+#### OpenBSD
+
+| Target                    | Status |
+|---------------------------|--------|
+| `aarch64-openbsd-none`    | OK     |
+| `arm-openbsd-eabi`        | OK     |
+| `mips64-openbsd-none`     | OK     |
+| `mips64el-openbsd-none`   | OK     |
+| `powerpc-openbsd-eabihf`  | OK     |
+| `powerpc64-openbsd-none`  | OK     |
+| `riscv64-openbsd-none`    | OK     |
+| `sparc64-openbsd-none`    | [#231](https://codeberg.org/ziglang/zig-bootstrap/issues/231) |
+| `x86-openbsd-none`        | OK     |
+| `x86_64-openbsd-none`     | OK     |
+
 #### Windows
 
 | Target                | Status |
