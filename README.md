@@ -21,6 +21,7 @@ For other versions, check the git tags of this repository.
  * LLVM: Support .lib extension for static zstd.
  * LLVM: Portable handling of .def linker flag
  * LLVM: Don't pass -static when building executables.
+ * LLVM: OpenBSD `llvm-config` logic
  * Clang: Ignore the examples directory
  * Clang: Disable building of libclang-cpp.so.
  * Clang: remove `nvptx-arch` and `amdgpu-arch` symlinks
@@ -28,6 +29,7 @@ For other versions, check the git tags of this repository.
  * LLD: Added additional include directory to Zig's libunwind.
  * LLD: Respect `LLD_BUILD_TOOLS=OFF`
  * LLD: Skip building docs
+ * LLD: OpenBSD `findMajMinShlib()` logic
  * zlib: Delete the ability to build a shared library.
 
 ## Host System Dependencies
