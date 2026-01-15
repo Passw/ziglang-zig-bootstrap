@@ -65,6 +65,22 @@ argv0: Argv0,
 environ: Environ,
 
 null_file: NullFile = .{},
+random_file: RandomFile = .{},
+
+csprng: Csprng = .{},
+
+pub const Csprng = struct {
+    rng: std.Random.DefaultCsprng = .{
+        .state = undefined,
+        .offset = std.math.maxInt(usize),
+    },
+
+    pub const seed_len = std.Random.DefaultCsprng.secret_seed_length;
+
+    pub fn isInitialized(c: *const Csprng) bool {
+        return c.rng.offset != std.math.maxInt(usize);
+    }
+};
 
 pub const Argv0 = switch (native_os) {
     .openbsd, .haiku => struct {
@@ -147,6 +163,15 @@ pub const NullFile = switch (native_os) {
                 posix.close(this.fd);
                 this.fd = -1;
             }
+        }
+    },
+};
+
+pub const RandomFile = switch (native_os) {
+    .windows => NullFile,
+    else => if (use_dev_urandom) NullFile else struct {
+        fn deinit(this: @This()) void {
+            _ = this;
         }
     },
 };
@@ -584,6 +609,8 @@ const Thread = struct {
     cancel_protection: Io.CancelProtection,
     /// Always released when `Status.cancelation` is set to `.parked`.
     futex_waiter: if (use_parking_futex) ?*parking_futex.Waiter else ?noreturn,
+
+    csprng: Csprng,
 
     const Handle = Handle: {
         if (std.Thread.use_pthreads) break :Handle std.c.pthread_t;
@@ -1202,7 +1229,19 @@ pub fn init(
     gpa: Allocator,
     options: InitOptions,
 ) Threaded {
-    if (builtin.single_threaded) return .init_single_threaded;
+    if (builtin.single_threaded) return .{
+        .allocator = gpa,
+        .stack_size = options.stack_size,
+        .async_limit = options.async_limit orelse init_single_threaded.async_limit,
+        .cpu_count_error = init_single_threaded.cpu_count_error,
+        .concurrent_limit = options.concurrent_limit,
+        .old_sig_io = undefined,
+        .old_sig_pipe = undefined,
+        .have_signal_handler = init_single_threaded.have_signal_handler,
+        .argv0 = options.argv0,
+        .environ = .{ .process_environ = options.environ },
+        .worker_threads = init_single_threaded.worker_threads,
+    };
 
     const cpu_count = std.Thread.getCpuCount();
 
@@ -1216,8 +1255,8 @@ pub fn init(
         .old_sig_pipe = undefined,
         .have_signal_handler = false,
         .argv0 = options.argv0,
-        .worker_threads = .init(null),
         .environ = .{ .process_environ = options.environ },
+        .worker_threads = .init(null),
     };
 
     if (posix.Sigaction != void) {
@@ -1285,6 +1324,7 @@ pub fn deinit(t: *Threaded) void {
         if (have_sig_pipe) posix.sigaction(.PIPE, &t.old_sig_pipe, null);
     }
     t.null_file.deinit();
+    t.random_file.deinit();
     t.* = undefined;
 }
 
@@ -1313,6 +1353,7 @@ fn worker(t: *Threaded) void {
         }),
         .cancel_protection = .unblocked,
         .futex_waiter = undefined,
+        .csprng = .{},
     };
     Thread.current = &thread;
 
@@ -1413,6 +1454,7 @@ pub fn io(t: *Threaded) Io {
             .dirDeleteFile = dirDeleteFile,
             .dirDeleteDir = dirDeleteDir,
             .dirRename = dirRename,
+            .dirRenamePreserve = dirRenamePreserve,
             .dirSymLink = dirSymLink,
             .dirReadLink = dirReadLink,
             .dirSetOwner = dirSetOwner,
@@ -1465,6 +1507,9 @@ pub fn io(t: *Threaded) Io {
 
             .now = now,
             .sleep = sleep,
+
+            .random = random,
+            .randomSecure = randomSecure,
 
             .netListenIp = switch (native_os) {
                 .windows => netListenIpWindows,
@@ -1561,6 +1606,7 @@ pub fn ioBasic(t: *Threaded) Io {
             .dirDeleteFile = dirDeleteFile,
             .dirDeleteDir = dirDeleteDir,
             .dirRename = dirRename,
+            .dirRenamePreserve = dirRenamePreserve,
             .dirSymLink = dirSymLink,
             .dirReadLink = dirReadLink,
             .dirSetOwner = dirSetOwner,
@@ -1613,6 +1659,9 @@ pub fn ioBasic(t: *Threaded) Io {
 
             .now = now,
             .sleep = sleep,
+
+            .random = random,
+            .randomSecure = randomSecure,
 
             .netListenIp = netListenIpUnavailable,
             .netListenUnix = netListenUnixUnavailable,
@@ -1703,6 +1752,23 @@ const linux_copy_file_range_use_c = std.c.versionCheck(if (builtin.abi.isAndroid
     .patch = 0,
 });
 const linux_copy_file_range_sys = if (linux_copy_file_range_use_c) std.c else std.os.linux;
+
+const statx_use_c = std.c.versionCheck(if (builtin.abi.isAndroid())
+    .{ .major = 30, .minor = 0, .patch = 0 }
+else
+    .{ .major = 2, .minor = 28, .patch = 0 });
+
+const use_libc_getrandom = std.c.versionCheck(if (builtin.abi.isAndroid()) .{
+    .major = 28,
+    .minor = 0,
+    .patch = 0,
+} else .{
+    .major = 2,
+    .minor = 25,
+    .patch = 0,
+});
+
+const use_dev_urandom = @TypeOf(posix.system.getrandom) == void and native_os == .linux;
 
 fn async(
     userdata: ?*anyopaque,
@@ -1958,6 +2024,7 @@ fn groupConcurrent(
 
 fn groupAwait(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) Io.Cancelable!void {
     _ = initial_token; // we need to load `token` *after* the group finishes
+    if (builtin.single_threaded) unreachable; // nothing to await
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     const g: Group = .{ .ptr = type_erased };
 
@@ -2016,6 +2083,7 @@ fn groupAwait(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *any
 
 fn groupCancel(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) void {
     _ = initial_token;
+    if (builtin.single_threaded) unreachable; // nothing to cancel
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     const g: Group = .{ .ptr = type_erased };
 
@@ -2086,6 +2154,7 @@ fn await(
     result_alignment: Alignment,
 ) void {
     _ = result_alignment;
+    if (builtin.single_threaded) unreachable; // nothing to await
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     const future: *Future = @ptrCast(@alignCast(any_future));
 
@@ -2109,25 +2178,28 @@ fn await(
                     .tag = .pending_canceled,
                     .thread = .null,
                 }, .acq_rel); // acquire results if complete; release `future.awaiter`
-                switch (pre_cancel_status.tag) {
+                const done_status = switch (pre_cancel_status.tag) {
                     .pending => unreachable, // invalid state: we already awaited
-                    .pending_awaited => {
+                    .pending_awaited => done_status: {
                         const working_thread = pre_cancel_status.thread.unpack();
                         future.waitForCancelWithSignaling(t, &num_completed, @alignCast(working_thread));
+                        break :done_status future.status.load(.monotonic);
                     },
                     .pending_canceled => unreachable, // `await` raced with `cancel`
-                    .done => {
+                    .done => done_status: {
                         // The task just finished, but we still need to wait for the signal, because the
                         // task thread already figured out that they need to update `future.awaiter`.
                         future.waitForCancelWithSignaling(t, &num_completed, null);
+                        // Also, we have clobbered `future.status.tag` to `.pending_canceled`, but that's
+                        // not actually a problem for the logic below.
+                        break :done_status pre_cancel_status;
                     },
-                }
+                };
                 // If the future did not acknowledge the cancelation, we need to mark it outstanding
-                // for us. Because `future.status.tag == .done`, the information about whether there
-                // was an acknowledged cancelation is encoded in `future.status.thread`.
-                const final_status = future.status.load(.monotonic);
-                assert(final_status.tag == .done);
-                switch (final_status.thread) {
+                // for us. Because `done_status.tag == .done`, the information about whether there
+                // was an acknowledged cancelation is encoded in `done_status.thread`.
+                assert(done_status.tag == .done);
+                switch (done_status.thread) {
                     .null => recancelInner(), // cancelation was not acknowledged, so it's ours
                     .all_ones => {}, // cancelation was acknowledged, so it was this task's job to propagate it
                     _ => unreachable,
@@ -2149,6 +2221,7 @@ fn cancel(
     result_alignment: Alignment,
 ) void {
     _ = result_alignment;
+    if (builtin.single_threaded) unreachable; // nothing to cancel
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     const future: *Future = @ptrCast(@alignCast(any_future));
 
@@ -2339,11 +2412,11 @@ fn dirCreateDirPath(
             status = .created;
         } else |err| switch (err) {
             error.PathAlreadyExists => {
-                // stat the file and return an error if it's not a directory
-                // this is important because otherwise a dangling symlink
-                // could cause an infinite loop
-                const fstat = try dirStatFile(t, dir, component.path, .{});
-                if (fstat.kind != .directory) return error.NotDir;
+                // It is important to return an error if it's not a directory
+                // because otherwise a dangling symlink could cause an infinite
+                // loop.
+                const kind = try filePathKind(t, dir, component.path);
+                if (kind != .directory) return error.NotDir;
             },
             error.FileNotFound => |e| {
                 component = it.previous() orelse return e;
@@ -2535,11 +2608,7 @@ fn dirStatFileLinux(
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
     const linux = std.os.linux;
-    const use_c = std.c.versionCheck(if (builtin.abi.isAndroid())
-        .{ .major = 30, .minor = 0, .patch = 0 }
-    else
-        .{ .major = 2, .minor = 28, .patch = 0 });
-    const sys = if (use_c) std.c else std.os.linux;
+    const sys = if (statx_use_c) std.c else std.os.linux;
 
     var path_buffer: [posix.PATH_MAX]u8 = undefined;
     const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
@@ -2688,6 +2757,35 @@ fn dirStatFileWasi(
     }
 }
 
+fn filePathKind(t: *Threaded, dir: Dir, sub_path: []const u8) !File.Kind {
+    if (native_os == .linux) {
+        var path_buffer: [posix.PATH_MAX]u8 = undefined;
+        const sub_path_posix = try pathToPosix(sub_path, &path_buffer);
+
+        const linux = std.os.linux;
+        const syscall: Syscall = try .start();
+        while (true) {
+            var statx = std.mem.zeroes(linux.Statx);
+            switch (linux.errno(linux.statx(dir.handle, sub_path_posix, 0, .{ .TYPE = true }, &statx))) {
+                .SUCCESS => {
+                    syscall.finish();
+                    if (!statx.mask.TYPE) return error.Unexpected;
+                    return statxKind(statx.mode);
+                },
+                .INTR => {
+                    try syscall.checkCancel();
+                    continue;
+                },
+                .NOMEM => return syscall.fail(error.SystemResources),
+                else => |err| return syscall.unexpectedErrno(err),
+            }
+        }
+    }
+
+    const stat = try dirStatFile(t, dir, sub_path, .{});
+    return stat.kind;
+}
+
 fn fileLength(userdata: ?*anyopaque, file: File) File.LengthError!u64 {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
 
@@ -2775,11 +2873,7 @@ fn fileStatLinux(userdata: ?*anyopaque, file: File) File.StatError!File.Stat {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
     const linux = std.os.linux;
-    const use_c = std.c.versionCheck(if (builtin.abi.isAndroid())
-        .{ .major = 30, .minor = 0, .patch = 0 }
-    else
-        .{ .major = 2, .minor = 28, .patch = 0 });
-    const sys = if (use_c) std.c else std.os.linux;
+    const sys = if (statx_use_c) std.c else std.os.linux;
 
     const syscall: Syscall = try .start();
     while (true) {
@@ -3447,7 +3541,7 @@ fn dirCreateFileAtomic(
         if (dest_dirname) |dirname| {
             // This has a nice side effect of preemptively triggering EISDIR or
             // ENOENT, avoiding the ambiguity below.
-            dir.createDirPath(t_io, dirname) catch |err| switch (err) {
+            if (options.make_path) dir.createDirPath(t_io, dirname) catch |err| switch (err) {
                 // None of these make sense in this context.
                 error.IsDir,
                 error.Streaming,
@@ -3550,8 +3644,9 @@ fn atomicFileInit(
     dir: Dir,
     close_dir_on_deinit: bool,
 ) Dir.CreateFileAtomicError!File.Atomic {
+    var random_integer: u64 = undefined;
     while (true) {
-        const random_integer = std.crypto.random.int(u64);
+        t_io.random(@ptrCast(&random_integer));
         const tmp_sub_path = std.fmt.hex(random_integer);
         const file = dir.createFile(t_io, &tmp_sub_path, .{
             .permissions = permissions,
@@ -3633,10 +3728,12 @@ fn dirOpenFilePosix(
         },
     };
 
+    const mode: posix.mode_t = 0;
+
     const fd: posix.fd_t = fd: {
         const syscall: Syscall = try .start();
         while (true) {
-            const rc = openat_sym(dir.handle, sub_path_posix, os_flags, @as(posix.mode_t, 0));
+            const rc = openat_sym(dir.handle, sub_path_posix, os_flags, mode);
             switch (posix.errno(rc)) {
                 .SUCCESS => {
                     syscall.finish();
@@ -3866,10 +3963,7 @@ pub fn dirOpenFileWtf16(
                 // kernel bug with retry attempts.
                 syscall.finish();
                 if (max_attempts - attempt == 0) return error.SharingViolation;
-                try parking_sleep.sleep(.{ .duration = .{
-                    .raw = .fromMilliseconds((@as(u32, 1) << attempt) >> 1),
-                    .clock = .awake,
-                } });
+                try parking_sleep.windowsRetrySleep((@as(u32, 1) << attempt) >> 1);
                 attempt += 1;
                 syscall = try .start();
                 continue;
@@ -3891,10 +3985,7 @@ pub fn dirOpenFileWtf16(
                 // fixed by sleeping and retrying until the error goes away.
                 syscall.finish();
                 if (max_attempts - attempt == 0) return error.SharingViolation;
-                try parking_sleep.sleep(.{ .duration = .{
-                    .raw = .fromMilliseconds((@as(u32, 1) << attempt) >> 1),
-                    .clock = .awake,
-                } });
+                try parking_sleep.windowsRetrySleep((@as(u32, 1) << attempt) >> 1);
                 attempt += 1;
                 syscall = try .start();
                 continue;
@@ -4065,9 +4156,11 @@ fn dirOpenDirPosix(
     if (@hasField(posix.O, "PATH") and !options.iterate)
         flags.PATH = true;
 
+    const mode: posix.mode_t = 0;
+
     const syscall: Syscall = try .start();
     while (true) {
-        const rc = openat_sym(dir.handle, sub_path_posix, flags, @as(usize, 0));
+        const rc = openat_sym(dir.handle, sub_path_posix, flags, mode);
         switch (posix.errno(rc)) {
             .SUCCESS => {
                 syscall.finish();
@@ -4864,7 +4957,7 @@ fn dirReadUnimplemented(userdata: ?*anyopaque, dir_reader: *Dir.Reader, buffer: 
     _ = userdata;
     _ = dir_reader;
     _ = buffer;
-    return error.Unimplemented;
+    return error.Unexpected;
 }
 
 const dirRealPathFile = switch (native_os) {
@@ -5166,12 +5259,21 @@ fn fileHardLink(
     var new_path_buffer: [posix.PATH_MAX]u8 = undefined;
     const new_sub_path_posix = try pathToPosix(new_sub_path, &new_path_buffer);
 
-    const flags: u32 = if (!options.follow_symlinks)
-        posix.AT.SYMLINK_NOFOLLOW | posix.AT.EMPTY_PATH
+    const flags: u32 = if (options.follow_symlinks)
+        posix.AT.SYMLINK_FOLLOW | posix.AT.EMPTY_PATH
     else
         posix.AT.EMPTY_PATH;
 
-    return linkat(file.handle, "", new_dir.handle, new_sub_path_posix, flags);
+    return linkat(file.handle, "", new_dir.handle, new_sub_path_posix, flags) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (options.follow_symlinks) return error.FileNotFound;
+            var proc_buf: ["/proc/self/fd/-2147483648\x00".len]u8 = undefined;
+            const proc_path = std.fmt.bufPrintSentinel(&proc_buf, "/proc/self/fd/{d}", .{file.handle}, 0) catch
+                unreachable;
+            return linkat(posix.AT.FDCWD, proc_path, new_dir.handle, new_sub_path_posix, posix.AT.SYMLINK_FOLLOW);
+        },
+        else => |e| return e,
+    };
 }
 
 fn linkat(
@@ -5202,7 +5304,7 @@ fn linkat(
             .NOTDIR => return syscall.fail(error.NotDir),
             .PERM => return syscall.fail(error.PermissionDenied),
             .ROFS => return syscall.fail(error.ReadOnlyFileSystem),
-            .XDEV => return syscall.fail(error.NotSameFileSystem),
+            .XDEV => return syscall.fail(error.CrossDevice),
             .ILSEQ => return syscall.fail(error.BadPathName),
             .FAULT => |err| return syscall.errnoBug(err),
             .INVAL => |err| return syscall.errnoBug(err),
@@ -5442,7 +5544,7 @@ fn dirDeleteWindows(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, remov
     // FileDispositionInformation if the return value lets us know that some aspect of it is not supported.
     const rc = rc: {
         // Deletion with posix semantics if the filesystem supports it.
-        const info: w.FILE.DISPOSITION.INFORMATION.EX = .{ .Flags = .{
+        var info: w.FILE.DISPOSITION.INFORMATION.EX = .{ .Flags = .{
             .DELETE = true,
             .POSIX_SEMANTICS = true,
             .IGNORE_READONLY_ATTRIBUTE = true,
@@ -5477,7 +5579,7 @@ fn dirDeleteWindows(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, remov
 
         // Deletion with file pending semantics, which requires waiting or moving
         // files to get them removed (from here).
-        const file_dispo: w.FILE.DISPOSITION.INFORMATION = .{
+        var file_dispo: w.FILE.DISPOSITION.INFORMATION = .{
             .DeleteFile = w.TRUE,
         };
 
@@ -5611,15 +5713,44 @@ fn dirRenameWindows(
     new_dir: Dir,
     new_sub_path: []const u8,
 ) Dir.RenameError!void {
-    const w = windows;
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
+    return dirRenameWindowsInner(old_dir, old_sub_path, new_dir, new_sub_path, true) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.Unexpected,
+        error.OperationUnsupported => return error.Unexpected,
+        else => |e| return e,
+    };
+}
 
+fn dirRenamePreserve(
+    userdata: ?*anyopaque,
+    old_dir: Dir,
+    old_sub_path: []const u8,
+    new_dir: Dir,
+    new_sub_path: []const u8,
+) Dir.RenamePreserveError!void {
+    const t: *Threaded = @ptrCast(@alignCast(userdata));
+    if (is_windows) return dirRenameWindowsInner(old_dir, old_sub_path, new_dir, new_sub_path, false);
+    if (native_os == .linux) return dirRenamePreserveLinux(old_dir, old_sub_path, new_dir, new_sub_path);
+    // Make a hard link then delete the original.
+    try dirHardLink(t, old_dir, old_sub_path, new_dir, new_sub_path, .{ .follow_symlinks = false });
+    const prev = swapCancelProtection(t, .blocked);
+    defer _ = swapCancelProtection(t, prev);
+    dirDeleteFile(t, old_dir, old_sub_path) catch {};
+}
+
+fn dirRenameWindowsInner(
+    old_dir: Dir,
+    old_sub_path: []const u8,
+    new_dir: Dir,
+    new_sub_path: []const u8,
+    replace_if_exists: bool,
+) Dir.RenamePreserveError!void {
+    const w = windows;
     const old_path_w_buf = try windows.sliceToPrefixedFileW(old_dir.handle, old_sub_path);
     const old_path_w = old_path_w_buf.span();
     const new_path_w_buf = try windows.sliceToPrefixedFileW(new_dir.handle, new_sub_path);
     const new_path_w = new_path_w_buf.span();
-    const replace_if_exists = true;
 
     const src_fd = src_fd: {
         const syscall: Syscall = try .start();
@@ -5664,7 +5795,7 @@ fn dirRenameWindows(
     // The strategy here is just to try using FileRenameInformationEx and fall back to
     // FileRenameInformation if the return value lets us know that some aspect of it is not supported.
     const need_fallback = need_fallback: {
-        const rename_info: w.FILE.RENAME_INFORMATION = .init(.{
+        var rename_info: w.FILE.RENAME_INFORMATION = .init(.{
             .Flags = .{
                 .REPLACE_IF_EXISTS = replace_if_exists,
                 .POSIX_SEMANTICS = true,
@@ -5697,7 +5828,7 @@ fn dirRenameWindows(
     };
 
     if (need_fallback) {
-        const rename_info: w.FILE.RENAME_INFORMATION = .init(.{
+        var rename_info: w.FILE.RENAME_INFORMATION = .init(.{
             .Flags = .{ .REPLACE_IF_EXISTS = replace_if_exists },
             .RootDirectory = if (Dir.path.isAbsoluteWindowsWtf16(new_path_w)) null else new_dir.handle,
             .FileName = new_path_w,
@@ -5721,9 +5852,9 @@ fn dirRenameWindows(
         .ACCESS_DENIED => return error.AccessDenied,
         .OBJECT_NAME_NOT_FOUND => return error.FileNotFound,
         .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
-        .NOT_SAME_DEVICE => return error.RenameAcrossMountPoints,
+        .NOT_SAME_DEVICE => return error.CrossDevice,
         .OBJECT_NAME_COLLISION => return error.PathAlreadyExists,
-        .DIRECTORY_NOT_EMPTY => return error.PathAlreadyExists,
+        .DIRECTORY_NOT_EMPTY => return error.DirNotEmpty,
         .FILE_IS_A_DIRECTORY => return error.IsDir,
         .NOT_A_DIRECTORY => return error.NotDir,
         else => return w.unexpectedStatus(rc),
@@ -5767,10 +5898,10 @@ fn dirRenameWasi(
                     .NOTDIR => return error.NotDir,
                     .NOMEM => return error.SystemResources,
                     .NOSPC => return error.NoSpaceLeft,
-                    .EXIST => return error.PathAlreadyExists,
-                    .NOTEMPTY => return error.PathAlreadyExists,
+                    .EXIST => return error.DirNotEmpty,
+                    .NOTEMPTY => return error.DirNotEmpty,
                     .ROFS => return error.ReadOnlyFileSystem,
-                    .XDEV => return error.RenameAcrossMountPoints,
+                    .XDEV => return error.CrossDevice,
                     .NOTCAPABLE => return error.AccessDenied,
                     .ILSEQ => return error.BadPathName,
                     else => |err| return posix.unexpectedErrno(err),
@@ -5796,9 +5927,105 @@ fn dirRenamePosix(
     const old_sub_path_posix = try pathToPosix(old_sub_path, &old_path_buffer);
     const new_sub_path_posix = try pathToPosix(new_sub_path, &new_path_buffer);
 
+    return renameat(old_dir.handle, old_sub_path_posix, new_dir.handle, new_sub_path_posix);
+}
+
+fn dirRenamePreserveLinux(
+    old_dir: Dir,
+    old_sub_path: []const u8,
+    new_dir: Dir,
+    new_sub_path: []const u8,
+) Dir.RenamePreserveError!void {
+    const linux = std.os.linux;
+
+    var old_path_buffer: [linux.PATH_MAX]u8 = undefined;
+    var new_path_buffer: [linux.PATH_MAX]u8 = undefined;
+
+    const old_sub_path_posix = try pathToPosix(old_sub_path, &old_path_buffer);
+    const new_sub_path_posix = try pathToPosix(new_sub_path, &new_path_buffer);
+
+    const syscall: Syscall = try .start();
+    while (true) switch (linux.errno(linux.renameat2(
+        old_dir.handle,
+        old_sub_path_posix,
+        new_dir.handle,
+        new_sub_path_posix,
+        .{ .NOREPLACE = true },
+    ))) {
+        .SUCCESS => return syscall.finish(),
+        .INTR => {
+            try syscall.checkCancel();
+            continue;
+        },
+        .ACCES => return syscall.fail(error.AccessDenied),
+        .PERM => return syscall.fail(error.PermissionDenied),
+        .BUSY => return syscall.fail(error.FileBusy),
+        .DQUOT => return syscall.fail(error.DiskQuota),
+        .ISDIR => return syscall.fail(error.IsDir),
+        .LOOP => return syscall.fail(error.SymLinkLoop),
+        .MLINK => return syscall.fail(error.LinkQuotaExceeded),
+        .NAMETOOLONG => return syscall.fail(error.NameTooLong),
+        .NOENT => return syscall.fail(error.FileNotFound),
+        .NOTDIR => return syscall.fail(error.NotDir),
+        .NOMEM => return syscall.fail(error.SystemResources),
+        .NOSPC => return syscall.fail(error.NoSpaceLeft),
+        .EXIST => return syscall.fail(error.PathAlreadyExists),
+        .NOTEMPTY => return syscall.fail(error.DirNotEmpty),
+        .ROFS => return syscall.fail(error.ReadOnlyFileSystem),
+        .XDEV => return syscall.fail(error.CrossDevice),
+        .ILSEQ => return syscall.fail(error.BadPathName),
+        .FAULT => |err| return syscall.errnoBug(err),
+        .INVAL => |err| return syscall.errnoBug(err),
+        else => |err| return syscall.unexpectedErrno(err),
+    };
+}
+
+fn renameat(
+    old_dir: posix.fd_t,
+    old_sub_path: [*:0]const u8,
+    new_dir: posix.fd_t,
+    new_sub_path: [*:0]const u8,
+) Dir.RenameError!void {
+    const syscall: Syscall = try .start();
+    while (true) switch (posix.errno(posix.system.renameat(old_dir, old_sub_path, new_dir, new_sub_path))) {
+        .SUCCESS => return syscall.finish(),
+        .INTR => {
+            try syscall.checkCancel();
+            continue;
+        },
+        .ACCES => return syscall.fail(error.AccessDenied),
+        .PERM => return syscall.fail(error.PermissionDenied),
+        .BUSY => return syscall.fail(error.FileBusy),
+        .DQUOT => return syscall.fail(error.DiskQuota),
+        .ISDIR => return syscall.fail(error.IsDir),
+        .IO => return syscall.fail(error.HardwareFailure),
+        .LOOP => return syscall.fail(error.SymLinkLoop),
+        .MLINK => return syscall.fail(error.LinkQuotaExceeded),
+        .NAMETOOLONG => return syscall.fail(error.NameTooLong),
+        .NOENT => return syscall.fail(error.FileNotFound),
+        .NOTDIR => return syscall.fail(error.NotDir),
+        .NOMEM => return syscall.fail(error.SystemResources),
+        .NOSPC => return syscall.fail(error.NoSpaceLeft),
+        .EXIST => return syscall.fail(error.DirNotEmpty),
+        .NOTEMPTY => return syscall.fail(error.DirNotEmpty),
+        .ROFS => return syscall.fail(error.ReadOnlyFileSystem),
+        .XDEV => return syscall.fail(error.CrossDevice),
+        .ILSEQ => return syscall.fail(error.BadPathName),
+        .FAULT => |err| return syscall.errnoBug(err),
+        .INVAL => |err| return syscall.errnoBug(err),
+        else => |err| return syscall.unexpectedErrno(err),
+    };
+}
+
+fn renameatPreserve(
+    old_dir: posix.fd_t,
+    old_sub_path: [*:0]const u8,
+    new_dir: posix.fd_t,
+    new_sub_path: [*:0]const u8,
+) Dir.RenameError!void {
     const syscall: Syscall = try .start();
     while (true) {
-        switch (posix.errno(posix.system.renameat(old_dir.handle, old_sub_path_posix, new_dir.handle, new_sub_path_posix))) {
+        switch (posix.errno(posix.system.renameat(old_dir, old_sub_path, new_dir, new_sub_path))) {
             .SUCCESS => return syscall.finish(),
             .INTR => {
                 try syscall.checkCancel();
@@ -5824,7 +6051,7 @@ fn dirRenamePosix(
                     .EXIST => return error.PathAlreadyExists,
                     .NOTEMPTY => return error.PathAlreadyExists,
                     .ROFS => return error.ReadOnlyFileSystem,
-                    .XDEV => return error.RenameAcrossMountPoints,
+                    .XDEV => return error.CrossDevice,
                     .ILSEQ => return error.BadPathName,
                     else => |err| return posix.unexpectedErrno(err),
                 }
@@ -6315,11 +6542,6 @@ fn fchmodatFallback(
     mode: posix.mode_t,
 ) Dir.SetFilePermissionsError!void {
     comptime assert(native_os == .linux);
-    const use_c = std.c.versionCheck(if (builtin.abi.isAndroid())
-        .{ .major = 30, .minor = 0, .patch = 0 }
-    else
-        .{ .major = 2, .minor = 28, .patch = 0 });
-    const sys = if (use_c) std.c else std.os.linux;
 
     // Fallback to changing permissions using procfs:
     //
@@ -6366,6 +6588,7 @@ fn fchmodatFallback(
     defer posix.close(path_fd);
 
     const path_mode = mode: {
+        const sys = if (statx_use_c) std.c else std.os.linux;
         const syscall: Syscall = try .start();
         while (true) {
             var statx = std.mem.zeroes(std.os.linux.Statx);
@@ -6875,7 +7098,7 @@ fn fileSetLength(userdata: ?*anyopaque, file: File, length: u64) File.SetLengthE
 
     if (is_windows) {
         var io_status_block: windows.IO_STATUS_BLOCK = undefined;
-        const eof_info: windows.FILE.END_OF_FILE_INFORMATION = .{
+        var eof_info: windows.FILE.END_OF_FILE_INFORMATION = .{
             .EndOfFile = signed_len,
         };
 
@@ -6966,7 +7189,7 @@ fn fileSetPermissions(userdata: ?*anyopaque, file: File, permissions: File.Permi
     switch (native_os) {
         .windows => {
             var io_status_block: windows.IO_STATUS_BLOCK = undefined;
-            const info: windows.FILE.BASIC_INFORMATION = .{
+            var info: windows.FILE.BASIC_INFORMATION = .{
                 .CreationTime = 0,
                 .LastAccessTime = 0,
                 .LastWriteTime = 0,
@@ -7609,7 +7832,7 @@ fn dirHardLink(
                         .NOTDIR => return error.NotDir,
                         .PERM => return error.PermissionDenied,
                         .ROFS => return error.ReadOnlyFileSystem,
-                        .XDEV => return error.NotSameFileSystem,
+                        .XDEV => return error.CrossDevice,
                         .INVAL => |err| return errnoBug(err),
                         .ILSEQ => return error.BadPathName,
                         else => |err| return posix.unexpectedErrno(err),
@@ -7625,7 +7848,7 @@ fn dirHardLink(
     const old_sub_path_posix = try pathToPosix(old_sub_path, &old_path_buffer);
     const new_sub_path_posix = try pathToPosix(new_sub_path, &new_path_buffer);
 
-    const flags: u32 = if (!options.follow_symlinks) posix.AT.SYMLINK_NOFOLLOW else 0;
+    const flags: u32 = if (options.follow_symlinks) posix.AT.SYMLINK_FOLLOW else 0;
     return linkat(old_dir.handle, old_sub_path_posix, new_dir.handle, new_sub_path_posix, flags);
 }
 
@@ -7762,6 +7985,9 @@ fn fileReadStreamingWindows(userdata: ?*anyopaque, file: File, data: []const []u
             .LOCK_VIOLATION => return syscall.fail(error.LockViolation),
             .ACCESS_DENIED => return syscall.fail(error.AccessDenied),
             .INVALID_HANDLE => return syscall.fail(error.NotOpenForReading),
+            // TODO: Determine if INVALID_FUNCTION is possible in more scenarios than just passing
+            // a handle to a directory.
+            .INVALID_FUNCTION => return syscall.fail(error.IsDir),
             else => |err| {
                 syscall.finish();
                 return windows.unexpectedError(err);
@@ -7919,6 +8145,9 @@ fn fileReadPositionalWindows(userdata: ?*anyopaque, file: File, data: []const []
             .LOCK_VIOLATION => return syscall.fail(error.LockViolation),
             .ACCESS_DENIED => return syscall.fail(error.AccessDenied),
             .INVALID_HANDLE => return syscall.fail(error.NotOpenForReading),
+            // TODO: Determine if INVALID_FUNCTION is possible in more scenarios than just passing
+            // a handle to a directory.
+            .INVALID_FUNCTION => return syscall.fail(error.IsDir),
             else => |err| {
                 syscall.finish();
                 return windows.unexpectedError(err);
@@ -8462,14 +8691,15 @@ fn fileWritePositional(
     addBuf(&iovecs, &iovlen, header);
     for (data[0 .. data.len - 1]) |bytes| addBuf(&iovecs, &iovlen, bytes);
     const pattern = data[data.len - 1];
+
+    var splat_backup_buffer: [splat_buffer_size]u8 = undefined;
     if (iovecs.len - iovlen != 0) switch (splat) {
         0 => {},
         1 => addBuf(&iovecs, &iovlen, pattern),
         else => switch (pattern.len) {
             0 => {},
             1 => {
-                var backup_buffer: [splat_buffer_size]u8 = undefined;
-                const splat_buffer = &backup_buffer;
+                const splat_buffer = &splat_backup_buffer;
                 const memset_len = @min(splat_buffer.len, splat);
                 const buf = splat_buffer[0..memset_len];
                 @memset(buf, pattern[0]);
@@ -8640,14 +8870,15 @@ fn fileWriteStreaming(
     addBuf(&iovecs, &iovlen, header);
     for (data[0 .. data.len - 1]) |bytes| addBuf(&iovecs, &iovlen, bytes);
     const pattern = data[data.len - 1];
+
+    var splat_backup_buffer: [splat_buffer_size]u8 = undefined;
     if (iovecs.len - iovlen != 0) switch (splat) {
         0 => {},
         1 => addBuf(&iovecs, &iovlen, pattern),
         else => switch (pattern.len) {
             0 => {},
             1 => {
-                var backup_buffer: [splat_buffer_size]u8 = undefined;
-                const splat_buffer = &backup_buffer;
+                const splat_buffer = &splat_backup_buffer;
                 const memset_len = @min(splat_buffer.len, splat);
                 const buf = splat_buffer[0..memset_len];
                 @memset(buf, pattern[0]);
@@ -9401,6 +9632,9 @@ fn nowPosix(clock: Io.Clock) Io.Clock.Error!Io.Timestamp {
 fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Clock.Error!Io.Timestamp {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     _ = t;
+    return nowInner(clock);
+}
+fn nowInner(clock: Io.Clock) Io.Clock.Error!Io.Timestamp {
     return switch (native_os) {
         .windows => nowWindows(clock),
         .wasi => nowWasi(clock),
@@ -9450,15 +9684,13 @@ fn nowWasi(clock: Io.Clock) Io.Clock.Error!Io.Timestamp {
 
 fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.SleepError!void {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
-    if (use_parking_sleep) return parking_sleep.sleep(timeout);
-    switch (native_os) {
-        .wasi => return sleepWasi(t, timeout),
-        .linux => return sleepLinux(timeout),
-        else => return sleepPosix(t, timeout),
-    }
+    if (use_parking_sleep) return parking_sleep.sleep(try timeout.toDeadline(ioBasic(t)));
+    if (native_os == .wasi) return sleepWasi(t, timeout);
+    if (@TypeOf(posix.system.clock_nanosleep) != void) return sleepPosix(timeout);
+    return sleepNanosleep(t, timeout);
 }
 
-fn sleepLinux(timeout: Io.Timeout) Io.SleepError!void {
+fn sleepPosix(timeout: Io.Timeout) Io.SleepError!void {
     const clock_id: posix.clockid_t = clockToPosix(switch (timeout) {
         .none => .awake,
         .duration => |d| d.clock,
@@ -9472,7 +9704,7 @@ fn sleepLinux(timeout: Io.Timeout) Io.SleepError!void {
     var timespec: posix.timespec = timestampToPosix(deadline_nanoseconds);
     const syscall: Syscall = try .start();
     while (true) {
-        switch (std.os.linux.errno(std.os.linux.clock_nanosleep(clock_id, .{ .ABSTIME = switch (timeout) {
+        switch (posix.errno(posix.system.clock_nanosleep(clock_id, .{ .ABSTIME = switch (timeout) {
             .none, .duration => false,
             .deadline => true,
         } }, &timespec, &timespec))) {
@@ -9484,13 +9716,8 @@ fn sleepLinux(timeout: Io.Timeout) Io.SleepError!void {
                 try syscall.checkCancel();
                 continue;
             },
-            else => |e| {
-                syscall.finish();
-                switch (e) {
-                    .INVAL => return error.UnsupportedClock,
-                    else => |err| return posix.unexpectedErrno(err),
-                }
-            },
+            .INVAL => return syscall.fail(error.UnsupportedClock),
+            else => |err| return syscall.unexpectedErrno(err),
         }
     }
 }
@@ -9524,7 +9751,7 @@ fn sleepWasi(t: *Threaded, timeout: Io.Timeout) Io.SleepError!void {
     syscall.finish();
 }
 
-fn sleepPosix(t: *Threaded, timeout: Io.Timeout) Io.SleepError!void {
+fn sleepNanosleep(t: *Threaded, timeout: Io.Timeout) Io.SleepError!void {
     const t_io = ioBasic(t);
     const sec_type = @typeInfo(posix.timespec).@"struct".fields[0].type;
     const nsec_type = @typeInfo(posix.timespec).@"struct".fields[1].type;
@@ -9653,14 +9880,9 @@ fn netListenIpPosix(
                 try syscall.checkCancel();
                 continue;
             },
-            else => |e| {
-                syscall.finish();
-                switch (e) {
-                    .ADDRINUSE => return error.AddressInUse,
-                    .BADF => |err| return errnoBug(err), // File descriptor used after closed.
-                    else => |err| return posix.unexpectedErrno(err),
-                }
-            },
+            .ADDRINUSE => return syscall.fail(error.AddressInUse),
+            .BADF => |err| return syscall.errnoBug(err), // File descriptor used after closed.
+            else => |err| return syscall.unexpectedErrno(err),
         }
     }
 
@@ -9815,14 +10037,9 @@ fn netListenUnixPosix(
                 try syscall.checkCancel();
                 continue;
             },
-            else => |e| {
-                syscall.finish();
-                switch (e) {
-                    .ADDRINUSE => return error.AddressInUse,
-                    .BADF => |err| return errnoBug(err), // File descriptor used after closed.
-                    else => |err| return posix.unexpectedErrno(err),
-                }
-            },
+            .ADDRINUSE => return syscall.fail(error.AddressInUse),
+            .BADF => |err| return syscall.errnoBug(err), // File descriptor used after closed.
+            else => |err| return syscall.unexpectedErrno(err),
         }
     }
 
@@ -10788,8 +11005,8 @@ fn netReadWindows(userdata: ?*anyopaque, handle: net.Socket.Handle, data: [][]u8
     if (!have_networking) return error.NetworkDown;
     const t: *Threaded = @ptrCast(@alignCast(userdata));
 
+    var iovec_buffer: [max_iovecs_len]ws2_32.WSABUF = undefined;
     const bufs = b: {
-        var iovec_buffer: [max_iovecs_len]ws2_32.WSABUF = undefined;
         var i: usize = 0;
         var n: usize = 0;
         for (data) |buf| {
@@ -11285,14 +11502,15 @@ fn netWritePosix(
     addBuf(&iovecs, &msg.iovlen, header);
     for (data[0 .. data.len - 1]) |bytes| addBuf(&iovecs, &msg.iovlen, bytes);
     const pattern = data[data.len - 1];
+
+    var splat_backup_buffer: [splat_buffer_size]u8 = undefined;
     if (iovecs.len - msg.iovlen != 0) switch (splat) {
         0 => {},
         1 => addBuf(&iovecs, &msg.iovlen, pattern),
         else => switch (pattern.len) {
             0 => {},
             1 => {
-                var backup_buffer: [splat_buffer_size]u8 = undefined;
-                const splat_buffer = &backup_buffer;
+                const splat_buffer = &splat_backup_buffer;
                 const memset_len = @min(splat_buffer.len, splat);
                 const buf = splat_buffer[0..memset_len];
                 @memset(buf, pattern[0]);
@@ -11784,8 +12002,7 @@ fn netLookupFallible(
         var canon_name: ?[*:0]const u16 = null;
         while (it) |info| : (it = info.next) {
             const addr = info.addr orelse continue;
-            const storage: WsaAddress = .{ .any = addr.* };
-            try resolved.putOne(t_io, .{ .address = addressFromWsa(&storage) });
+            try resolved.putOne(t_io, .{ .address = addressFromWsa(@alignCast(@fieldParentPtr("any", addr))) });
 
             if (info.canonname) |n| {
                 if (canon_name == null) {
@@ -11940,8 +12157,7 @@ fn netLookupFallible(
         var canon_name: ?[*:0]const u8 = null;
         while (it) |info| : (it = info.next) {
             const addr = info.addr orelse continue;
-            const storage: PosixAddress = .{ .any = addr.* };
-            try resolved.putOne(t_io, .{ .address = addressFromPosix(&storage) });
+            try resolved.putOne(t_io, .{ .address = addressFromPosix(@alignCast(@fieldParentPtr("any", addr))) });
 
             if (info.canonname) |n| {
                 if (canon_name == null) {
@@ -12265,21 +12481,25 @@ fn statFromLinux(stx: *const std.os.linux.Statx) Io.UnexpectedError!File.Stat {
         .nlink = stx.nlink,
         .size = stx.size,
         .permissions = .fromMode(stx.mode),
-        .kind = switch (stx.mode & std.os.linux.S.IFMT) {
-            std.os.linux.S.IFDIR => .directory,
-            std.os.linux.S.IFCHR => .character_device,
-            std.os.linux.S.IFBLK => .block_device,
-            std.os.linux.S.IFREG => .file,
-            std.os.linux.S.IFIFO => .named_pipe,
-            std.os.linux.S.IFLNK => .sym_link,
-            std.os.linux.S.IFSOCK => .unix_domain_socket,
-            else => .unknown,
-        },
+        .kind = statxKind(stx.mode),
         .atime = if (!stx.mask.ATIME) null else .{
             .nanoseconds = @intCast(@as(i128, stx.atime.sec) * std.time.ns_per_s + stx.atime.nsec),
         },
         .mtime = .{ .nanoseconds = @intCast(@as(i128, stx.mtime.sec) * std.time.ns_per_s + stx.mtime.nsec) },
         .ctime = .{ .nanoseconds = @intCast(@as(i128, stx.ctime.sec) * std.time.ns_per_s + stx.ctime.nsec) },
+    };
+}
+
+fn statxKind(stx_mode: u16) File.Kind {
+    return switch (stx_mode & std.os.linux.S.IFMT) {
+        std.os.linux.S.IFDIR => .directory,
+        std.os.linux.S.IFCHR => .character_device,
+        std.os.linux.S.IFBLK => .block_device,
+        std.os.linux.S.IFREG => .file,
+        std.os.linux.S.IFIFO => .named_pipe,
+        std.os.linux.S.IFLNK => .sym_link,
+        std.os.linux.S.IFSOCK => .unix_domain_socket,
+        else => .unknown,
     };
 }
 
@@ -12408,7 +12628,7 @@ fn lookupDnsSearch(
         if (lookupDns(t, lookup_canon_name, &rc, resolved, options)) |result| {
             return result;
         } else |err| switch (err) {
-            error.UnknownHostName => continue,
+            error.UnknownHostName, error.NoAddressReturned => continue,
             else => |e| return e,
         }
     }
@@ -12438,7 +12658,8 @@ fn lookupDns(
 
     for (family_records) |fr| {
         if (options.family != fr.af) {
-            const entropy = std.crypto.random.array(u8, 2);
+            var entropy: [2]u8 = undefined;
+            random(t, &entropy);
             const len = writeResolutionQuery(&query_buffers[nq], 0, lookup_canon_name, 1, fr.rr, entropy);
             queries_buffer[nq] = query_buffers[nq][0..len];
             nq += 1;
@@ -12602,7 +12823,7 @@ fn lookupDns(
     }
 
     try resolved.putOne(t_io, .{ .canonical_name = canonical_name orelse .{ .bytes = lookup_canon_name } });
-    if (addresses_len == 0) return error.NameServerFailure;
+    if (addresses_len == 0) return error.NoAddressReturned;
 }
 
 fn lookupHosts(
@@ -13004,7 +13225,7 @@ fn processSpawnPath(userdata: ?*anyopaque, dir: Dir, options: process.SpawnOptio
 }
 
 const processSpawn = switch (native_os) {
-    .wasi, .ios, .tvos, .visionos, .watchos => processSpawnUnsupported,
+    .wasi, .emscripten, .ios, .tvos, .visionos, .watchos => processSpawnUnsupported,
     .windows => processSpawnWindows,
     else => processSpawnPosix,
 };
@@ -13850,6 +14071,62 @@ fn processSpawnWindows(userdata: ?*anyopaque, options: process.SpawnOptions) pro
     };
 }
 
+fn getCngHandle(t: *Threaded) Io.RandomSecureError!windows.HANDLE {
+    {
+        t.mutex.lock();
+        defer t.mutex.unlock();
+        if (t.random_file.handle) |handle| return handle;
+    }
+
+    const device_path = [_]u16{ '\\', 'D', 'e', 'v', 'i', 'c', 'e', '\\', 'C', 'N', 'G' };
+
+    var nt_name: windows.UNICODE_STRING = .{
+        .Length = device_path.len * 2,
+        .MaximumLength = 0,
+        .Buffer = @constCast(&device_path),
+    };
+    var fresh_handle: windows.HANDLE = undefined;
+    var io_status_block: windows.IO_STATUS_BLOCK = undefined;
+    var syscall: Syscall = try .start();
+    while (true) switch (windows.ntdll.NtOpenFile(
+        &fresh_handle,
+        .{
+            .STANDARD = .{ .SYNCHRONIZE = true },
+            .SPECIFIC = .{ .FILE = .{ .READ_DATA = true } },
+        },
+        &.{
+            .Length = @sizeOf(windows.OBJECT_ATTRIBUTES),
+            .RootDirectory = null,
+            .ObjectName = &nt_name,
+            .Attributes = .{},
+            .SecurityDescriptor = null,
+            .SecurityQualityOfService = null,
+        },
+        &io_status_block,
+        .VALID_FLAGS,
+        .{ .IO = .SYNCHRONOUS_NONALERT },
+    )) {
+        .SUCCESS => {
+            syscall.finish();
+            t.mutex.lock(); // Another thread might have won the race.
+            defer t.mutex.unlock();
+            if (t.random_file.handle) |prev_handle| {
+                _ = windows.ntdll.NtClose(fresh_handle);
+                return prev_handle;
+            } else {
+                t.random_file.handle = fresh_handle;
+                return fresh_handle;
+            }
+        },
+        .CANCELLED => {
+            try syscall.checkCancel();
+            continue;
+        },
+        .OBJECT_NAME_NOT_FOUND => return syscall.fail(error.EntropyUnavailable), // Observed on wine 10.0
+        else => return syscall.fail(error.EntropyUnavailable),
+    };
+}
+
 fn getNulHandle(t: *Threaded) !windows.HANDLE {
     {
         t.mutex.lock();
@@ -13917,10 +14194,7 @@ fn getNulHandle(t: *Threaded) !windows.HANDLE {
             // this other than retrying the creation after the OS finishes
             // the deletion.
             syscall.finish();
-            try parking_sleep.sleep(.{ .duration = .{
-                .raw = .fromMilliseconds(1),
-                .clock = .awake,
-            } });
+            try parking_sleep.windowsRetrySleep(1);
             syscall = try .start();
             continue;
         },
@@ -14932,6 +15206,305 @@ pub fn environString(t: *Threaded, comptime name: []const u8) ?[:0]const u8 {
     return @field(t.environ.string, name);
 }
 
+fn random(userdata: ?*anyopaque, buffer: []u8) void {
+    const t: *Threaded = @ptrCast(@alignCast(userdata));
+    const thread = Thread.current orelse return randomMainThread(t, buffer);
+    if (!thread.csprng.isInitialized()) {
+        @branchHint(.unlikely);
+        var seed: [Csprng.seed_len]u8 = undefined;
+        randomMainThread(t, &seed);
+        thread.csprng.rng = .init(seed);
+    }
+    thread.csprng.rng.fill(buffer);
+}
+
+fn randomMainThread(t: *Threaded, buffer: []u8) void {
+    t.mutex.lock();
+    defer t.mutex.unlock();
+
+    if (!t.csprng.isInitialized()) {
+        @branchHint(.unlikely);
+        var seed: [Csprng.seed_len]u8 = undefined;
+        {
+            t.mutex.unlock();
+            defer t.mutex.lock();
+
+            const prev = swapCancelProtection(t, .blocked);
+            defer _ = swapCancelProtection(t, prev);
+
+            randomSecure(t, &seed) catch |err| switch (err) {
+                error.Canceled => unreachable,
+                error.EntropyUnavailable => {
+                    @memset(&seed, 0);
+                    const aslr_addr = @intFromPtr(t);
+                    std.mem.writeInt(usize, seed[seed.len - @sizeOf(usize) ..][0..@sizeOf(usize)], aslr_addr, .native);
+                    switch (native_os) {
+                        .windows => fallbackSeedWindows(&seed),
+                        .wasi => if (builtin.link_libc) fallbackSeedPosix(&seed) else fallbackSeedWasi(&seed),
+                        else => fallbackSeedPosix(&seed),
+                    }
+                },
+            };
+        }
+        t.csprng.rng = .init(seed);
+    }
+
+    t.csprng.rng.fill(buffer);
+}
+
+fn fallbackSeedPosix(seed: *[Csprng.seed_len]u8) void {
+    std.mem.writeInt(posix.pid_t, seed[0..@sizeOf(posix.pid_t)], posix.system.getpid(), .native);
+    const i_1 = @sizeOf(posix.pid_t);
+
+    var ts: posix.timespec = undefined;
+    const Sec = @TypeOf(ts.sec);
+    const Nsec = @TypeOf(ts.nsec);
+    const i_2 = i_1 + @sizeOf(Sec);
+    switch (posix.errno(posix.system.clock_gettime(.REALTIME, &ts))) {
+        .SUCCESS => {
+            std.mem.writeInt(Sec, seed[i_1..][0..@sizeOf(Sec)], ts.sec, .native);
+            std.mem.writeInt(Nsec, seed[i_2..][0..@sizeOf(Nsec)], ts.nsec, .native);
+        },
+        else => {},
+    }
+}
+
+fn fallbackSeedWindows(seed: *[Csprng.seed_len]u8) void {
+    var pc: windows.LARGE_INTEGER = undefined;
+    _ = windows.ntdll.RtlQueryPerformanceCounter(&pc);
+    std.mem.writeInt(windows.LARGE_INTEGER, seed[0..@sizeOf(windows.LARGE_INTEGER)], pc, .native);
+}
+
+fn fallbackSeedWasi(seed: *[Csprng.seed_len]u8) void {
+    var ts: std.os.wasi.timestamp_t = undefined;
+    if (std.os.wasi.clock_time_get(.REALTIME, 1, &ts) == .SUCCESS) {
+        std.mem.writeInt(std.os.wasi.timestamp_t, seed[0..@sizeOf(std.os.wasi.timestamp_t)], ts, .native);
+    }
+}
+
+fn randomSecure(userdata: ?*anyopaque, buffer: []u8) Io.RandomSecureError!void {
+    const t: *Threaded = @ptrCast(@alignCast(userdata));
+
+    if (is_windows) {
+        if (buffer.len == 0) return;
+        // ProcessPrng from bcryptprimitives.dll has the following properties:
+        // * introduces a dependency on bcryptprimitives.dll, which apparently
+        //   runs a test suite every time it is loaded
+        // * heap allocates a 48-byte buffer, handling failure by returning NO_MEMORY in a BOOL
+        //   despite the function being documented to always return TRUE
+        // * reads from "\\Device\\CNG" which then seeds a per-CPU AES CSPRNG
+        // Therefore, that function is avoided in favor of using the device directly.
+        const cng_device = try getCngHandle(t);
+        var io_status_block: windows.IO_STATUS_BLOCK = undefined;
+        var i: usize = 0;
+        const syscall: Syscall = try .start();
+        while (true) {
+            const remaining_len = std.math.lossyCast(u32, buffer.len - i);
+            switch (windows.ntdll.NtDeviceIoControlFile(
+                cng_device,
+                null,
+                null,
+                null,
+                &io_status_block,
+                windows.IOCTL.KSEC.GEN_RANDOM,
+                null,
+                0,
+                buffer[i..].ptr,
+                remaining_len,
+            )) {
+                .SUCCESS => {
+                    i += remaining_len;
+                    if (buffer.len - i == 0) {
+                        return syscall.finish();
+                    } else {
+                        try syscall.checkCancel();
+                        continue;
+                    }
+                },
+                .CANCELLED => {
+                    try syscall.checkCancel();
+                    continue;
+                },
+                else => return syscall.fail(error.EntropyUnavailable),
+            }
+        }
+    }
+
+    if (builtin.link_libc and @TypeOf(posix.system.arc4random_buf) != void) {
+        if (buffer.len == 0) return;
+        posix.system.arc4random_buf(buffer.ptr, buffer.len);
+        return;
+    }
+
+    if (native_os == .wasi) {
+        if (buffer.len == 0) return;
+        const syscall: Syscall = try .start();
+        while (true) switch (std.os.wasi.random_get(buffer.ptr, buffer.len)) {
+            .SUCCESS => return syscall.finish(),
+            .INTR => {
+                try syscall.checkCancel();
+                continue;
+            },
+            else => return syscall.fail(error.EntropyUnavailable),
+        };
+    }
+
+    if (@TypeOf(posix.system.getrandom) != void) {
+        const getrandom = if (use_libc_getrandom) std.c.getrandom else std.os.linux.getrandom;
+        var i: usize = 0;
+        const syscall: Syscall = try .start();
+        while (buffer.len - i != 0) {
+            const buf = buffer[i..];
+            const rc = getrandom(buf.ptr, buf.len, 0);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {
+                    syscall.finish();
+                    const n: usize = @intCast(rc);
+                    i += n;
+                    continue;
+                },
+                .INTR => {
+                    try syscall.checkCancel();
+                    continue;
+                },
+                else => return syscall.fail(error.EntropyUnavailable),
+            }
+        }
+        return;
+    }
+
+    if (native_os == .emscripten) {
+        if (buffer.len == 0) return;
+        const err = posix.errno(std.c.getentropy(buffer.ptr, buffer.len));
+        switch (err) {
+            .SUCCESS => return,
+            else => return error.EntropyUnavailable,
+        }
+    }
+
+    if (native_os == .linux) {
+        comptime assert(use_dev_urandom);
+        const urandom_fd = try getRandomFd(t);
+
+        var i: usize = 0;
+        while (buffer.len - i != 0) {
+            const syscall: Syscall = try .start();
+            const rc = posix.system.read(urandom_fd, buffer[i..].ptr, buffer.len - i);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {
+                    syscall.finish();
+                    const n: usize = @intCast(rc);
+                    if (n == 0) return error.EntropyUnavailable;
+                    i += n;
+                    continue;
+                },
+                .INTR => {
+                    try syscall.checkCancel();
+                    continue;
+                },
+                else => return syscall.fail(error.EntropyUnavailable),
+            }
+        }
+    }
+
+    return error.EntropyUnavailable;
+}
+
+fn getRandomFd(t: *Threaded) Io.RandomSecureError!posix.fd_t {
+    {
+        t.mutex.lock();
+        defer t.mutex.unlock();
+
+        if (t.random_file.fd == -2) return error.EntropyUnavailable;
+        if (t.random_file.fd != -1) return t.random_file.fd;
+    }
+
+    const mode: posix.mode_t = 0;
+
+    const fd: posix.fd_t = fd: {
+        const syscall: Syscall = try .start();
+        while (true) {
+            const rc = openat_sym(posix.AT.FDCWD, "/dev/urandom", .{
+                .ACCMODE = .RDONLY,
+                .CLOEXEC = true,
+            }, mode);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {
+                    syscall.finish();
+                    break :fd @intCast(rc);
+                },
+                .INTR => {
+                    try syscall.checkCancel();
+                    continue;
+                },
+                else => return syscall.fail(error.EntropyUnavailable),
+            }
+        }
+    };
+    errdefer posix.close(fd);
+
+    switch (native_os) {
+        .linux => {
+            const sys = if (statx_use_c) std.c else std.os.linux;
+            const syscall: Syscall = try .start();
+            while (true) {
+                var statx = std.mem.zeroes(std.os.linux.Statx);
+                switch (sys.errno(sys.statx(fd, "", std.os.linux.AT.EMPTY_PATH, .{ .TYPE = true }, &statx))) {
+                    .SUCCESS => {
+                        syscall.finish();
+                        if (!statx.mask.TYPE) return error.EntropyUnavailable;
+                        t.mutex.lock(); // Another thread might have won the race.
+                        defer t.mutex.unlock();
+                        if (t.random_file.fd >= 0) {
+                            posix.close(fd);
+                            return t.random_file.fd;
+                        } else if (!posix.S.ISCHR(statx.mode)) {
+                            t.random_file.fd = -2;
+                            return error.EntropyUnavailable;
+                        } else {
+                            t.random_file.fd = fd;
+                            return fd;
+                        }
+                    },
+                    .INTR => {
+                        try syscall.checkCancel();
+                        continue;
+                    },
+                    else => return syscall.fail(error.EntropyUnavailable),
+                }
+            }
+        },
+        else => {
+            const syscall: Syscall = try .start();
+            while (true) {
+                var stat = std.mem.zeroes(posix.Stat);
+                switch (posix.errno(fstat_sym(fd, &stat))) {
+                    .SUCCESS => {
+                        syscall.finish();
+                        t.mutex.lock(); // Another thread might have won the race.
+                        defer t.mutex.unlock();
+                        if (t.random_file.fd >= 0) {
+                            posix.close(fd);
+                            return t.random_file.fd;
+                        } else if (!posix.S.ISCHR(stat.mode)) {
+                            t.random_file.fd = -2;
+                            return error.EntropyUnavailable;
+                        } else {
+                            t.random_file.fd = fd;
+                            return fd;
+                        }
+                    },
+                    .INTR => {
+                        try syscall.checkCancel();
+                        continue;
+                    },
+                    else => return syscall.fail(error.EntropyUnavailable),
+                }
+            }
+        },
+    }
+}
+
 test {
     _ = @import("Threaded/test.zig");
 }
@@ -14991,9 +15564,13 @@ const parking_futex = struct {
         ///
         /// * Removing the `Waiter` from `Bucket.waiters`
         /// * Decrementing `Bucket.num_waiters`
-        /// * Unparking the thread (*after* the above, so that the `Waiter` does not go out of scope
-        ///   while it is still in the `Bucket`).
+        /// * Atomically setting `done` (after this, the `Waiter` may go out of scope at any time,
+        ///   so must not be referenced again)
+        /// * Unparking the thread (last, so that the unparked thread definitely sees `done`)
         thread_status: *std.atomic.Value(Thread.Status),
+        /// Initially `false`. Whoever updates `thread_status` to `.none`/`.canceling` will update
+        /// this to `true` once they are done with the `Waiter`, just before unparking `tid`.
+        done: std.atomic.Value(bool),
     };
 
     fn bucketForAddress(address: usize) *Bucket {
@@ -15032,6 +15609,7 @@ const parking_futex = struct {
             .address = @intFromPtr(ptr),
             .tid = self_tid,
             .thread_status = undefined, // populated in critical section
+            .done = .init(false),
         };
 
         var status_buf: std.atomic.Value(Thread.Status) = undefined;
@@ -15088,40 +15666,43 @@ const parking_futex = struct {
             bucket.waiters.append(&waiter.node);
         }
 
-        if (park(timeout, ptr)) {
-            // We were unparked by either `wake` or cancelation, so our current status is either
-            // `.none` or `.canceling`. In either case, they've already removed `waiter` from
-            // `bucket`, so we have nothing more to do!
+        const deadline: ?Io.Clock.Timestamp = switch (timeout) {
+            .none => null,
+            .duration => |d| .{
+                .raw = (nowInner(d.clock) catch unreachable).addDuration(d.raw),
+                .clock = d.clock,
+            },
+            .deadline => |d| d,
+        };
+        while (park(deadline, ptr)) {
+            if (waiter.done.load(.acquire)) return; // all done!
         } else |err| switch (err) {
-            error.Timeout => {
-                // We're not out of the woods yet: an unpark could race with the timeout.
-                const old_status = waiter.thread_status.fetchAnd(
-                    .{ .cancelation = @enumFromInt(0b110), .awaitable = .all_ones },
-                    .monotonic,
-                );
-                switch (old_status.cancelation) {
-                    .parked => {
-                        // No race. It is our responsibility to remove `waiter` from `bucket`.
-                        // New status is `.none`.
-                        bucket.mutex.lock();
-                        defer bucket.mutex.unlock();
-                        bucket.waiters.remove(&waiter.node);
-                        assert(bucket.num_waiters.fetchSub(1, .monotonic) > 0);
-                    },
-                    .none, .canceling => {
-                        // Race condition: the timeout was reached, then `wake` or a canceler tried
-                        // to unpark us. Whoever did that will remove us from `bucket`. Wait for
-                        // that (and drop the unpark request in doing so).
-                        // New status is `.none` or `.canceling` respectively.
-                        park(.none, ptr) catch |e| switch (e) {
+            error.Timeout => switch (waiter.thread_status.fetchAnd(
+                .{ .cancelation = @enumFromInt(0b110), .awaitable = .all_ones },
+                .monotonic,
+            ).cancelation) {
+                .parked => {
+                    // We saw a timeout and updated our own status from `.parked` to `.none`. It is
+                    // our responsibility to remove `waiter` from `bucket`.
+                    bucket.mutex.lock();
+                    defer bucket.mutex.unlock();
+                    bucket.waiters.remove(&waiter.node);
+                    assert(bucket.num_waiters.fetchSub(1, .monotonic) > 0);
+                },
+                .none, .canceling => {
+                    // Race condition: the timeout was reached, then `wake` or a cancelation tried
+                    // to update our status. They won the race, so wait for them to do the cleanup.
+                    // They'll tell us by setting `waiter.done` and unparking us.
+                    while (!waiter.done.load(.acquire)) {
+                        park(null, ptr) catch |e| switch (e) {
                             error.Timeout => unreachable,
                         };
-                    },
-                    .canceled => unreachable,
-                    .blocked => unreachable,
-                    .blocked_windows_dns => unreachable,
-                    .blocked_canceling => unreachable,
-                }
+                    }
+                },
+                .canceled => unreachable,
+                .blocked => unreachable,
+                .blocked_windows_dns => unreachable,
+                .blocked_canceling => unreachable,
             },
         }
     }
@@ -15169,9 +15750,6 @@ const parking_futex = struct {
                 waiter.node.next = waking_head;
                 waking_head = &waiter.node;
                 num_removed += 1;
-                // Signal to `waiter` that they're about to be unparked, in case we're racing with their
-                // timeout. See corresponding logic in `wake`.
-                waiter.address = 0;
             }
 
             _ = bucket.num_waiters.fetchSub(num_removed, .monotonic);
@@ -15186,6 +15764,8 @@ const parking_futex = struct {
             const waiter: *Waiter = @fieldParentPtr("node", node);
             unpark_buf[unpark_len] = waiter.tid;
             unpark_len += 1;
+            waiter.done.store(true, .release);
+            // `waiter.*` is now potentially invalid so must not be referenced again.
             if (unpark_len == unpark_buf.len) {
                 unpark(&unpark_buf, ptr);
                 unpark_len = 0;
@@ -15202,13 +15782,14 @@ const parking_futex = struct {
         defer bucket.mutex.unlock();
         bucket.waiters.remove(&waiter.node);
         assert(bucket.num_waiters.fetchSub(1, .monotonic) > 0);
+        waiter.done.store(true, .release); // potentially invalidates `waiter.*`
     }
 };
 const parking_sleep = struct {
     comptime {
         assert(use_parking_sleep);
     }
-    fn sleep(timeout: Io.Timeout) Io.Cancelable!void {
+    fn sleep(deadline: ?Io.Clock.Timestamp) Io.SleepError!void {
         const opt_thread = Thread.current;
         cancelable: {
             const thread = opt_thread orelse break :cancelable;
@@ -15217,85 +15798,90 @@ const parking_sleep = struct {
                 .unblocked => {},
             }
             thread.futex_waiter = null;
-            {
-                const old_status = thread.status.fetchOr(
-                    .{ .cancelation = @enumFromInt(0b001), .awaitable = .null },
-                    .release, // release `thread.futex_waiter`
-                );
-                switch (old_status.cancelation) {
-                    .none => {}, // status is now `.parked`
-                    .canceling => return error.Canceled, // status is now `.canceled`
-                    .canceled => break :cancelable, // status is still `.canceled`
-                    .parked => unreachable,
+            const orig_status = thread.status.fetchOr(
+                .{ .cancelation = @enumFromInt(0b001), .awaitable = .null },
+                .release, // release `thread.futex_waiter`
+            );
+            switch (orig_status.cancelation) {
+                .none => {}, // status is now `.parked`
+                .canceling => return error.Canceled, // status is now `.canceled`
+                .canceled => break :cancelable, // status is still `.canceled`
+                .parked => unreachable,
+                .blocked => unreachable,
+                .blocked_windows_dns => unreachable,
+                .blocked_canceling => unreachable,
+            }
+            while (park(deadline, null)) {
+                // Either a cancelation or a spurious unpark; let's see which!
+                switch (thread.status.load(.monotonic).cancelation) {
+                    .parked => continue, // spurious unpark; keep sleeping
+                    .canceling => {
+                        // We got canceled; update our state and return.
+                        thread.status.store(
+                            .{ .cancelation = .canceled, .awaitable = orig_status.awaitable },
+                            .monotonic,
+                        );
+                        return error.Canceled;
+                    },
+                    .none => unreachable,
+                    .canceled => unreachable,
                     .blocked => unreachable,
                     .blocked_windows_dns => unreachable,
                     .blocked_canceling => unreachable,
                 }
-            }
-            if (park(timeout, null)) {
-                // The only reason this could possibly happen is cancelation.
-                const old_status = thread.status.load(.monotonic);
-                assert(old_status.cancelation == .canceling);
-                thread.status.store(
-                    .{ .cancelation = .canceled, .awaitable = old_status.awaitable },
-                    .monotonic,
-                );
-                return error.Canceled;
             } else |err| switch (err) {
-                error.Timeout => {
-                    // We're not out of the woods yet: an unpark could race with the timeout.
-                    const old_status = thread.status.fetchAnd(
-                        .{ .cancelation = @enumFromInt(0b110), .awaitable = .all_ones },
-                        .monotonic,
-                    );
-                    switch (old_status.cancelation) {
-                        .parked => return, // No race; new status is `.none`
-                        .canceling => {
-                            // Race condition: the timeout was reached, then someone tried to unpark
-                            // us for a cancelation. Whoever did that will have called `unpark`, so
-                            // drop that unpark request by waiting for it.
-                            // Status is still `.canceling`.
-                            park(.none, null) catch |e| switch (e) {
-                                error.Timeout => unreachable,
-                            };
-                            return;
-                        },
-                        .none => unreachable,
-                        .canceled => unreachable,
-                        .blocked => unreachable,
-                        .blocked_windows_dns => unreachable,
-                        .blocked_canceling => unreachable,
-                    }
+                error.Timeout => switch (thread.status.fetchAnd(
+                    .{ .cancelation = @enumFromInt(0b110), .awaitable = .all_ones },
+                    .monotonic,
+                ).cancelation) {
+                    // We updated our own status from `.parked` to `.none`.
+                    .parked => return, // new status is `.none`
+                    .canceling => {
+                        // Timeout raced with a cancelation. We don't need to do anything, but
+                        // the next `park` on this thread will see a spurious unpark.
+                        // Status is still `.canceling`.
+                        return;
+                    },
+                    .none => unreachable,
+                    .canceled => unreachable,
+                    .blocked => unreachable,
+                    .blocked_windows_dns => unreachable,
+                    .blocked_canceling => unreachable,
                 },
             }
         }
-        // Uncancelable sleep; we expect not to be manually unparked.
-        if (park(timeout, null)) {
-            unreachable; // unexpected unpark
+        // Uncancelable sleep; this case is very simple.
+        while (park(deadline, null)) {
+            // Definitely spurious; nothing to do.
         } else |err| switch (err) {
             error.Timeout => return,
         }
     }
+    /// Sleep for approximately `ms` awake milliseconds in an attempt to work around Windows kernel bugs.
+    fn windowsRetrySleep(ms: u32) (Io.Cancelable || Io.UnexpectedError)!void {
+        const now_timestamp = nowWindows(.awake) catch unreachable; // '.awake' is supported on Windows
+        const deadline = now_timestamp.addDuration(.fromMilliseconds(ms));
+        parking_sleep.sleep(.{ .raw = deadline, .clock = .awake }) catch |err| switch (err) {
+            error.UnsupportedClock => unreachable,
+            else => |e| return e,
+        };
+    }
 };
 
+/// Spurious wakeups are possible.
+///
 /// `addr_hint` has no semantic effect, but may allow the OS to optimize this operation.
-fn park(timeout: Io.Timeout, addr_hint: ?*const anyopaque) error{Timeout}!void {
+fn park(opt_deadline: ?std.Io.Clock.Timestamp, addr_hint: ?*const anyopaque) error{Timeout}!void {
     comptime assert(use_parking_futex or use_parking_sleep);
     switch (builtin.target.os.tag) {
         .windows => {
             var timeout_buf: windows.LARGE_INTEGER = undefined;
-            const raw_timeout: ?*windows.LARGE_INTEGER = timeout: switch (timeout) {
-                .none => null,
-                .deadline => |timestamp| continue :timeout .{ .duration = .{
-                    .clock = timestamp.clock,
-                    .raw = (nowWindows(timestamp.clock) catch unreachable).durationTo(timestamp.raw),
-                } },
-                .duration => |duration| {
-                    _ = duration.clock; // Windows only supports monotonic
-                    timeout_buf = @intCast(@divTrunc(-duration.raw.nanoseconds, 100));
-                    break :timeout &timeout_buf;
-                },
-            };
+            const raw_timeout: ?*windows.LARGE_INTEGER = if (opt_deadline) |deadline| timeout: {
+                const now_timestamp = nowWindows(deadline.clock) catch unreachable;
+                const nanoseconds = now_timestamp.durationTo(deadline.raw).nanoseconds;
+                timeout_buf = @intCast(@divTrunc(-nanoseconds, 100));
+                break :timeout &timeout_buf;
+            } else null;
             // `RtlWaitOnAddress` passes the futex address in as the first argument to this call,
             // but it's unclear what that actually does, especially since `NtAlertThreadByThreadId`
             // does *not* accept the address so the kernel can't really be using it as a hint. An
@@ -15317,20 +15903,13 @@ fn park(timeout: Io.Timeout, addr_hint: ?*const anyopaque) error{Timeout}!void {
         },
         .netbsd => {
             var ts_buf: posix.timespec = undefined;
-            const ts: ?*posix.timespec, const abstime: bool, const clock_real: bool = switch (timeout) {
-                .none => .{ null, false, false },
-                .deadline => |timestamp| timeout: {
-                    ts_buf = timestampToPosix(timestamp.raw.nanoseconds);
-                    break :timeout .{ &ts_buf, true, timestamp.clock == .real };
-                },
-                .duration => |duration| timeout: {
-                    ts_buf = timestampToPosix(duration.raw.nanoseconds);
-                    break :timeout .{ &ts_buf, false, duration.clock == .real };
-                },
-            };
+            const ts: ?*posix.timespec, const clock_real: bool = if (opt_deadline) |deadline| timeout: {
+                ts_buf = timestampToPosix(deadline.raw.nanoseconds);
+                break :timeout .{ &ts_buf, deadline.clock == .real };
+            } else .{ null, true };
             switch (posix.errno(std.c._lwp_park(
                 if (clock_real) .REALTIME else .MONOTONIC,
-                .{ .ABSTIME = abstime },
+                .{ .ABSTIME = true },
                 ts,
                 0,
                 addr_hint,

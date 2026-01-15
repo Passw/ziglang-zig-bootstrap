@@ -265,9 +265,13 @@ pub const FILE = struct {
             return ri.FileName[0..@divExact(ri.FileNameLength, @sizeOf(WCHAR))];
         }
 
-        pub fn toBuffer(fri: *const RENAME_INFORMATION) []const u8 {
-            const start: [*]const u8 = @ptrCast(fri);
-            return start[0 .. @offsetOf(RENAME_INFORMATION, "FileName") + fri.FileNameLength];
+        pub fn toBuffer(fri: *RENAME_INFORMATION) []u8 {
+            const start: [*]u8 = @ptrCast(fri);
+            // The ABI size of the documented struct is 24 bytes, and attempting to use any size
+            // less than that will trigger INFO_LENGTH_MISMATCH, so enforce a minimum in cases where,
+            // for example, FileNameLength is 1 so only 22 bytes are technically needed.
+            const size = @max(24, @offsetOf(RENAME_INFORMATION, "FileName") + fri.FileNameLength);
+            return start[0..size];
         }
     };
 
@@ -2647,62 +2651,6 @@ pub fn SetHandleInformation(h: HANDLE, mask: DWORD, flags: DWORD) SetHandleInfor
     }
 }
 
-/// An alternate implementation of ProcessPrng from bcryptprimitives.dll
-/// This one has the following differences:
-/// * does not heap allocate `buffer`
-/// * does not introduce a dependency on bcryptprimitives.dll, which apparently
-///   runs a test suite every time it is loaded
-/// * reads buffer.len bytes from "\\Device\\CNG" rather than seeding a per-CPU
-///   AES csprng with 48 bytes.
-pub fn ProcessPrng(buffer: []u8) error{Unexpected}!void {
-    const device_path = [_]u16{ '\\', 'D', 'e', 'v', 'i', 'c', 'e', '\\', 'C', 'N', 'G' };
-    var nt_name: UNICODE_STRING = .{
-        .Length = device_path.len * 2,
-        .MaximumLength = 0,
-        .Buffer = @constCast(&device_path),
-    };
-    var cng_device: HANDLE = undefined;
-    var io_status_block: IO_STATUS_BLOCK = undefined;
-    switch (ntdll.NtOpenFile(
-        &cng_device,
-        .{
-            .STANDARD = .{ .SYNCHRONIZE = true },
-            .SPECIFIC = .{ .FILE = .{ .READ_DATA = true } },
-        },
-        &.{
-            .Length = @sizeOf(OBJECT_ATTRIBUTES),
-            .RootDirectory = null,
-            .ObjectName = &nt_name,
-            .Attributes = .{},
-            .SecurityDescriptor = null,
-            .SecurityQualityOfService = null,
-        },
-        &io_status_block,
-        .VALID_FLAGS,
-        .{ .IO = .SYNCHRONOUS_NONALERT },
-    )) {
-        .SUCCESS => {},
-        .OBJECT_NAME_NOT_FOUND => return error.Unexpected, // Observed on wine 10.0
-        else => |status| return unexpectedStatus(status),
-    }
-    defer _ = ntdll.NtClose(cng_device);
-    switch (ntdll.NtDeviceIoControlFile(
-        cng_device,
-        null,
-        null,
-        null,
-        &io_status_block,
-        IOCTL.KSEC.GEN_RANDOM,
-        null,
-        0,
-        buffer.ptr,
-        @intCast(buffer.len),
-    )) {
-        .SUCCESS => {},
-        else => |status| return unexpectedStatus(status),
-    }
-}
-
 pub const WaitForSingleObjectError = error{
     WaitAbandoned,
     WaitTimeOut,
@@ -3186,7 +3134,7 @@ pub fn DeleteFile(sub_path_w: []const u16, options: DeleteFileOptions) DeleteFil
     // FileDispositionInformation if the return value lets us know that some aspect of it is not supported.
     const need_fallback = need_fallback: {
         // Deletion with posix semantics if the filesystem supports it.
-        const info: FILE.DISPOSITION.INFORMATION.EX = .{ .Flags = .{
+        var info: FILE.DISPOSITION.INFORMATION.EX = .{ .Flags = .{
             .DELETE = true,
             .POSIX_SEMANTICS = true,
             .IGNORE_READONLY_ATTRIBUTE = true,
@@ -3215,7 +3163,7 @@ pub fn DeleteFile(sub_path_w: []const u16, options: DeleteFileOptions) DeleteFil
     if (need_fallback) {
         // Deletion with file pending semantics, which requires waiting or moving
         // files to get them removed (from here).
-        const file_dispo: FILE.DISPOSITION.INFORMATION = .{
+        var file_dispo: FILE.DISPOSITION.INFORMATION = .{
             .DeleteFile = TRUE,
         };
         rc = ntdll.NtSetInformationFile(
@@ -3250,7 +3198,7 @@ pub const RenameError = error{
     NetworkNotFound,
     AntivirusInterference,
     BadPathName,
-    RenameAcrossMountPoints,
+    CrossDevice,
 } || UnexpectedError;
 
 pub fn RenameFile(
@@ -3294,7 +3242,7 @@ pub fn RenameFile(
     // The strategy here is just to try using FileRenameInformationEx and fall back to
     // FileRenameInformation if the return value lets us know that some aspect of it is not supported.
     const need_fallback = need_fallback: {
-        const rename_info: FILE.RENAME_INFORMATION = .init(.{
+        var rename_info: FILE.RENAME_INFORMATION = .init(.{
             .Flags = .{
                 .REPLACE_IF_EXISTS = replace_if_exists,
                 .POSIX_SEMANTICS = true,
@@ -3327,7 +3275,7 @@ pub fn RenameFile(
     };
 
     if (need_fallback) {
-        const rename_info: FILE.RENAME_INFORMATION = .init(.{
+        var rename_info: FILE.RENAME_INFORMATION = .init(.{
             .Flags = .{ .REPLACE_IF_EXISTS = replace_if_exists },
             .RootDirectory = if (std.fs.path.isAbsoluteWindowsWtf16(new_path_w)) null else new_dir_fd,
             .FileName = new_path_w,
@@ -3351,7 +3299,7 @@ pub fn RenameFile(
         .ACCESS_DENIED => return error.AccessDenied,
         .OBJECT_NAME_NOT_FOUND => return error.FileNotFound,
         .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
-        .NOT_SAME_DEVICE => return error.RenameAcrossMountPoints,
+        .NOT_SAME_DEVICE => return error.CrossDevice,
         .OBJECT_NAME_COLLISION => return error.PathAlreadyExists,
         .DIRECTORY_NOT_EMPTY => return error.PathAlreadyExists,
         .FILE_IS_A_DIRECTORY => return error.IsDir,
@@ -3819,40 +3767,6 @@ pub fn NtFreeVirtualMemory(hProcess: HANDLE, addr: ?*PVOID, size: *SIZE_T, free_
         .INVALID_PARAMETER => NtFreeVirtualMemoryError.InvalidParameter,
         else => NtFreeVirtualMemoryError.Unexpected,
     };
-}
-
-pub const VirtualProtectError = error{
-    InvalidAddress,
-    Unexpected,
-};
-
-pub fn VirtualProtect(lpAddress: ?LPVOID, dwSize: SIZE_T, flNewProtect: DWORD, lpflOldProtect: *DWORD) VirtualProtectError!void {
-    // ntdll takes an extra level of indirection here
-    var addr = lpAddress;
-    var size = dwSize;
-    switch (ntdll.NtProtectVirtualMemory(GetCurrentProcess(), &addr, &size, flNewProtect, lpflOldProtect)) {
-        .SUCCESS => {},
-        .INVALID_ADDRESS => return error.InvalidAddress,
-        else => |st| return unexpectedStatus(st),
-    }
-}
-
-pub fn VirtualProtectEx(handle: HANDLE, addr: ?LPVOID, size: SIZE_T, new_prot: DWORD) VirtualProtectError!DWORD {
-    var old_prot: DWORD = undefined;
-    var out_addr = addr;
-    var out_size = size;
-    switch (ntdll.NtProtectVirtualMemory(
-        handle,
-        &out_addr,
-        &out_size,
-        new_prot,
-        &old_prot,
-    )) {
-        .SUCCESS => return old_prot,
-        .INVALID_ADDRESS => return error.InvalidAddress,
-        // TODO: map errors
-        else => |rc| return unexpectedStatus(rc),
-    }
 }
 
 pub const SetConsoleTextAttributeError = error{Unexpected};

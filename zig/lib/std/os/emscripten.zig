@@ -331,13 +331,14 @@ pub const POLL = struct {
     pub const RDBAND = 0x080;
 };
 
-pub const PROT = struct {
-    pub const NONE = 0x0;
-    pub const READ = 0x1;
-    pub const WRITE = 0x2;
-    pub const EXEC = 0x4;
-    pub const GROWSDOWN = 0x01000000;
-    pub const GROWSUP = 0x02000000;
+pub const PROT = packed struct(u32) {
+    READ: bool = false,
+    WRITE: bool = false,
+    EXEC: bool = false,
+    _: u21 = 0,
+    GROWSDOWN: bool = false,
+    GROWSUP: bool = false,
+    __: u6 = 0,
 };
 
 pub const rlim_t = u64;
@@ -728,6 +729,7 @@ pub const sockaddr = c.sockaddr;
 
 pub const blksize_t = i32;
 pub const nlink_t = u32;
+// https://github.com/emscripten-core/emscripten/blob/946ab574ae39401b51e75cd5257d894ae732ab54/system/lib/libc/musl/arch/emscripten/bits/alltypes.h#L140
 pub const time_t = i64;
 pub const mode_t = u32;
 pub const off_t = i64;
@@ -764,9 +766,24 @@ pub const stack_t = extern struct {
     size: usize,
 };
 
+// https://github.com/emscripten-core/emscripten/blob/946ab574ae39401b51e75cd5257d894ae732ab54/system/lib/libc/musl/arch/emscripten/bits/alltypes.h#L284
 pub const timespec = extern struct {
     sec: time_t,
     nsec: isize,
+
+    // https://github.com/emscripten-core/emscripten/blob/d72d7226f4733af8ff993dec70198cf09a24142d/system/lib/libc/musl/include/sys/stat.h#L77-L78
+
+    /// For use with `utimensat` and `futimens`.
+    pub const NOW: timespec = .{
+        .sec = 0,
+        .nsec = 0x3fffffff,
+    };
+
+    /// For use with `utimensat` and `futimens`.
+    pub const OMIT: timespec = .{
+        .sec = 0,
+        .nsec = 0x3ffffffe,
+    };
 };
 
 pub const timezone = extern struct {
