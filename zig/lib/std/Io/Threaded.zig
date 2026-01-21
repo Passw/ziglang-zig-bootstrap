@@ -5209,7 +5209,7 @@ fn fileRealPathPosix(userdata: ?*anyopaque, file: File, out_buffer: []u8) File.R
 
 fn realPathPosix(fd: posix.fd_t, out_buffer: []u8) File.RealPathError!usize {
     switch (native_os) {
-        .netbsd, .dragonfly, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => {
+        .dragonfly, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => {
             var sufficient_buffer: [posix.PATH_MAX]u8 = undefined;
             @memset(&sufficient_buffer, 0);
             const syscall: Syscall = try .start();
@@ -15791,7 +15791,7 @@ const parking_futex = struct {
                 );
                 switch (old_status.cancelation) {
                     .parked => {}, // state updated to `.none`
-                    .none => unreachable, // if another `wake` call is unparking this thread, it should have removed it from the list
+                    .none => continue, // race with timeout; they are about to lock `bucket.mutex` and remove themselves from the bucket
                     .canceling => continue, // race with a canceler who hasn't called `removeCanceledWaiter` yet
                     .canceled => unreachable,
                     .blocked => unreachable,
