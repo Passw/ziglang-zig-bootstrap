@@ -85,15 +85,6 @@ To build for x86 Windows, run the script within the `x86 Native Tools Command Pr
 
 ### Supported Targets
 
-If you try a "not tested" one and find a problem please file an issue,
-and a pull request linking to the issue in the table.
-
-If you try a "not tested" one and find that it works, please file a pull request
-changing the status to "OK".
-
-If you try an "OK" one and it does not work, please check if there is an existing
-issue, and if not, file an issue.
-
 Note: Generally, for Linux targets, we prefer the musl libc builds over the
 glibc builds here, because musl builds end up producing a static binary, which
 is more portable across Linux distributions.
