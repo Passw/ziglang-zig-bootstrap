@@ -1943,10 +1943,6 @@ pub fn io(t: *Threaded) Io {
                 .windows => netShutdownWindows,
                 else => netShutdownPosix,
             },
-            .netRead = switch (native_os) {
-                .windows => netReadWindows,
-                else => netReadPosix,
-            },
             .netWrite = switch (native_os) {
                 .windows => netWriteWindows,
                 else => netWritePosix,
@@ -2009,7 +2005,7 @@ const have_waitid = switch (native_os) {
 
 const have_wait4 = switch (native_os) {
     .linux => @hasField(std.os.linux.SYS, "wait4"),
-    .dragonfly, .freebsd, .netbsd, .openbsd, .illumos, .serenity, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => true,
+    .dragonfly, .freebsd, .netbsd, .openbsd, .illumos, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => true,
     else => false,
 };
 
@@ -2566,6 +2562,12 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
             };
             break :o .{ null, 1 };
         } },
+        .net_read => |o| return .{
+            .net_read = netRead(o.socket_handle, o.data) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| e,
+            },
+        },
     }
 }
 
@@ -2614,6 +2616,14 @@ fn batchAwaitAsync(userdata: ?*anyopaque, b: *Io.Batch) Io.Cancelable!void {
                         poll_len += 1;
                     },
                     .net_receive => |*o| {
+                        poll_buffer[poll_len] = .{
+                            .fd = o.socket_handle,
+                            .events = posix.POLL.IN | posix.POLL.ERR,
+                            .revents = 0,
+                        };
+                        poll_len += 1;
+                    },
+                    .net_read => |o| {
                         poll_buffer[poll_len] = .{
                             .fd = o.socket_handle,
                             .events = posix.POLL.IN | posix.POLL.ERR,
@@ -2798,6 +2808,7 @@ fn batchAwaitConcurrent(userdata: ?*anyopaque, b: *Io.Batch, timeout: Io.Timeout
                     storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
                     b.completed.tail = index;
                 },
+                .net_read => |o| try poll_storage.add(o.socket_handle, posix.POLL.IN | posix.POLL.ERR),
             }
             index = submission.node.next;
         }
@@ -2993,6 +3004,7 @@ fn batchApc(
                 .file_write_streaming => .{ .file_write_streaming = ntWriteFileResult(iosb) },
                 .device_io_control => .{ .device_io_control = iosb.* },
                 .net_receive => unreachable,
+                .net_read => unreachable,
             };
             storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
         },
@@ -3199,6 +3211,16 @@ fn batchDrainSubmittedWindows(t: *Threaded, b: *Io.Batch, concurrency: bool) (Io
                 if (concurrency) return error.ConcurrencyUnavailable;
                 batchCompleteBlockingWindows(b, operation_userdata, .{
                     .net_receive = netReceiveWindows(t, o.socket_handle, o.message_buffer, o.data_buffer, o.flags),
+                });
+            },
+            .net_read => |*o| {
+                // TODO integrate with overlapped I/O or equivalent to avoid this error
+                if (concurrency) return error.ConcurrencyUnavailable;
+                batchCompleteBlockingWindows(b, operation_userdata, .{
+                    .net_read = netRead(o.socket_handle, o.data) catch |err| switch (err) {
+                        error.Canceled => |e| return e,
+                        else => |e| e,
+                    },
                 });
             },
         }
@@ -5345,7 +5367,7 @@ fn dirOpenDirHaiku(
                     .NOMEM => return error.SystemResources,
                     .NOTDIR => return error.NotDir,
                     .PERM => return error.PermissionDenied,
-                    .BUSY => return error.DeviceBusy,
+                    .BUSY => |err| return errnoBug(err),
                     else => |err| return posix.unexpectedErrno(err),
                 }
             },
@@ -5462,7 +5484,7 @@ fn dirReadLinux(userdata: ?*anyopaque, dr: *Dir.Reader, buffer: []Dir.Entry) Dir
             }
             const syscall: Syscall = try .start();
             const n = while (true) {
-                const rc = linux.getdents64(dr.dir.handle, dr.buffer.ptr, dr.buffer.len);
+                const rc = linux.getdents64(dr.dir.handle, dr.buffer.ptr, @min(dr.buffer.len, std.math.maxInt(c_uint)));
                 switch (linux.errno(rc)) {
                     .SUCCESS => {
                         syscall.finish();
@@ -5791,10 +5813,119 @@ fn dirReadIllumos(userdata: ?*anyopaque, dr: *Dir.Reader, buffer: []Dir.Entry) D
 }
 
 fn dirReadHaiku(userdata: ?*anyopaque, dr: *Dir.Reader, buffer: []Dir.Entry) Dir.Reader.Error!usize {
-    _ = userdata;
-    _ = dr;
-    _ = buffer;
-    @panic("TODO implement dirReadHaiku");
+    const t: *Threaded = @ptrCast(@alignCast(userdata));
+    _ = t;
+    var buffer_index: usize = 0;
+    while (buffer.len - buffer_index != 0) {
+        if (dr.end - dr.index == 0) {
+            // Refill the buffer, unless we've already created references to
+            // buffered data.
+            if (buffer_index != 0) break;
+            if (dr.state == .reset) {
+                const syscall: Syscall = try .start();
+                while (true) {
+                    const rc = posix.system._kern_rewind_dir(dr.dir.handle);
+                    switch (@as(posix.E, @enumFromInt(@min(rc, 0)))) {
+                        .SUCCESS => {
+                            syscall.finish();
+                            break;
+                        },
+                        .INTR => {
+                            try syscall.checkCancel();
+                            continue;
+                        },
+                        else => |e| {
+                            syscall.finish();
+                            switch (e) {
+                                else => |err| return posix.unexpectedErrno(err),
+                            }
+                        },
+                    }
+                }
+                dr.state = .reading;
+            }
+            const syscall: Syscall = try .start();
+            const n: usize = while (true) {
+                const rc = posix.system._kern_read_dir(dr.dir.handle, dr.buffer.ptr, dr.buffer.len, @truncate(dr.buffer.len / @sizeOf(posix.system.DirEnt)));
+                switch (@as(posix.E, @enumFromInt(@min(rc, 0)))) {
+                    .SUCCESS => {
+                        syscall.finish();
+                        break @intCast(rc);
+                    },
+                    .INTR => {
+                        try syscall.checkCancel();
+                        continue;
+                    },
+                    else => |e| {
+                        syscall.finish();
+                        switch (e) {
+                            else => |err| return posix.unexpectedErrno(err),
+                        }
+                    },
+                }
+            };
+            if (n == 0) {
+                dr.state = .finished;
+                return 0;
+            }
+            dr.index = 0;
+            // _kern_read_dir returns entry count, but Dir.Reader is designed for byte count
+            dr.end = 0;
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                const entry = @as(*align(1) posix.system.DirEnt, @ptrCast(&dr.buffer[dr.end]));
+                dr.end += entry.reclen;
+            }
+        }
+        const entry = @as(*align(1) posix.system.DirEnt, @ptrCast(&dr.buffer[dr.index]));
+        const next_index = dr.index + entry.reclen;
+        dr.index = next_index;
+
+        const name = std.mem.sliceTo(@as([*:0]u8, @ptrCast(&entry.name)), 0);
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or entry.ino == 0) continue;
+
+        // haiku dirent doesn't expose type, so we have to call stat to get it.
+        var stat: std.c.Stat = undefined;
+        {
+            const syscall: Syscall = try .start();
+            while (true) {
+                const rc = posix.system._kern_read_stat(dr.dir.handle, name, false, &stat, @sizeOf(std.c.Stat));
+                switch (@as(posix.E, @enumFromInt(@min(rc, 0)))) {
+                    .SUCCESS => {
+                        syscall.finish();
+                        break;
+                    },
+                    .INTR => {
+                        try syscall.checkCancel();
+                        continue;
+                    },
+                    else => |e| {
+                        syscall.finish();
+                        switch (e) {
+                            else => |err| return posix.unexpectedErrno(err),
+                        }
+                    },
+                }
+            }
+        }
+
+        const entry_kind: File.Kind = switch (stat.mode & posix.S.IFMT) {
+            posix.S.IFBLK => .block_device,
+            posix.S.IFCHR => .character_device,
+            posix.S.IFDIR => .directory,
+            posix.S.IFIFO => .named_pipe,
+            posix.S.IFLNK => .sym_link,
+            posix.S.IFREG => .file,
+            else => .unknown,
+        };
+        buffer[buffer_index] = .{
+            .name = name,
+            .kind = entry_kind,
+            .inode = entry.ino,
+        };
+        buffer_index += 1;
+    }
+    return buffer_index;
 }
 
 fn dirReadWindows(userdata: ?*anyopaque, dr: *Dir.Reader, buffer: []Dir.Entry) Dir.Reader.Error!usize {
@@ -9812,7 +9943,10 @@ fn fileReadPositionalPosix(file: File, data: []const []u8, offset: u64) File.Rea
     if (have_preadv) {
         const syscall: Syscall = try .start();
         while (true) {
-            const rc = preadv_sym(file.handle, dest.ptr, @intCast(dest.len), @bitCast(offset));
+            const rc = if (native_os == .haiku)
+                posix.system.readv_pos(file.handle, @bitCast(offset), dest.ptr, @intCast(dest.len))
+            else
+                preadv_sym(file.handle, dest.ptr, @intCast(dest.len), @bitCast(offset));
             switch (posix.errno(rc)) {
                 .SUCCESS => {
                     syscall.finish();
@@ -9846,7 +9980,7 @@ fn fileReadPositionalPosix(file: File, data: []const []u8, offset: u64) File.Rea
 
     const syscall: Syscall = try .start();
     while (true) {
-        const rc = posix.pread(file.handle, dest[0].ptr, @intCast(dest[0].len), @bitCast(offset));
+        const rc = pread_sym(file.handle, dest[0].base, @intCast(dest[0].len), @bitCast(offset));
         switch (posix.errno(rc)) {
             .SUCCESS => {
                 syscall.finish();
@@ -10035,10 +10169,10 @@ fn fileSeekBy(userdata: ?*anyopaque, file: File, offset: i64) File.SeekError!voi
     if (posix.SEEK == void) return error.Unseekable;
 
     if (native_os == .linux and !builtin.link_libc and @sizeOf(usize) == 4) {
-        var result: u64 = undefined;
+        var result: i64 = undefined;
         const syscall: Syscall = try .start();
         while (true) {
-            switch (posix.errno(posix.system.llseek(file.handle, @bitCast(offset), &result, posix.SEEK.CUR))) {
+            switch (posix.errno(posix.system.llseek(file.handle, offset, &result, posix.SEEK.CUR))) {
                 .SUCCESS => {
                     syscall.finish();
                     return;
@@ -10149,8 +10283,8 @@ fn posixSeekTo(fd: posix.fd_t, offset: u64) File.SeekError!void {
     if (native_os == .linux and !builtin.link_libc and @sizeOf(usize) == 4) {
         const syscall: Syscall = try .start();
         while (true) {
-            var result: u64 = undefined;
-            switch (posix.errno(posix.system.llseek(fd, offset, &result, posix.SEEK.SET))) {
+            var result: i64 = undefined;
+            switch (posix.errno(posix.system.llseek(fd, @bitCast(offset), &result, posix.SEEK.SET))) {
                 .SUCCESS => {
                     syscall.finish();
                     return;
@@ -10550,7 +10684,10 @@ fn fileWritePositional(
 
     const syscall: Syscall = try .start();
     while (true) {
-        const rc = pwritev_sym(file.handle, &iovecs, @intCast(iovlen), @bitCast(offset));
+        const rc = if (native_os == .haiku)
+            posix.system.writev_pos(file.handle, @bitCast(offset), &iovecs, @intCast(iovlen))
+        else
+            pwritev_sym(file.handle, &iovecs, @intCast(iovlen), @bitCast(offset));
         switch (posix.errno(rc)) {
             .SUCCESS => {
                 syscall.finish();
@@ -12118,6 +12255,7 @@ fn netConnectIpWindows(
         .SUCCESS => {},
         .CANCELLED => unreachable,
         .INSUFFICIENT_RESOURCES => return error.SystemResources,
+        .CONNECTION_REFUSED => return error.ConnectionRefused,
         else => |status| return windows.unexpectedStatus(status),
     }
     return .{ .handle = socket_handle, .address = bound_address };
@@ -12549,11 +12687,14 @@ fn deferAcceptAfd(t: *Threaded, listen_handle: net.Socket.Handle, info: windows.
     }
 }
 
-fn netReadPosix(userdata: ?*anyopaque, fd: net.Socket.Handle, data: [][]u8) net.Stream.Reader.Error!usize {
+fn netRead(socket_handle: net.Socket.Handle, data: [][]u8) net.Stream.Reader.Error!usize {
     if (!have_networking) return error.NetworkDown;
-    const t: *Threaded = @ptrCast(@alignCast(userdata));
-    _ = t;
 
+    if (is_windows) return netReadWindows(socket_handle, data);
+    return netReadPosix(socket_handle, data);
+}
+
+fn netReadPosix(fd: net.Socket.Handle, data: [][]u8) net.Stream.Reader.Error!usize {
     var iovecs_buffer: [max_iovecs_len]posix.iovec = undefined;
     var i: usize = 0;
     for (data) |buf| {
@@ -12590,7 +12731,6 @@ fn netReadPosix(userdata: ?*anyopaque, fd: net.Socket.Handle, data: [][]u8) net.
                         .NOMEM => return error.SystemResources,
                         .NOTCONN => return error.SocketUnconnected,
                         .CONNRESET => return error.ConnectionResetByPeer,
-                        .TIMEDOUT => return error.Timeout,
                         .NOTCAPABLE => return error.AccessDenied,
                         else => |err| return posix.unexpectedErrno(err),
                     }
@@ -12622,7 +12762,6 @@ fn netReadPosix(userdata: ?*anyopaque, fd: net.Socket.Handle, data: [][]u8) net.
                     .NOMEM => return error.SystemResources,
                     .NOTCONN => return error.SocketUnconnected,
                     .CONNRESET => return error.ConnectionResetByPeer,
-                    .TIMEDOUT => return error.Timeout,
                     .PIPE => return error.SocketUnconnected,
                     .NETDOWN => return error.NetworkDown,
                     else => |err| return posix.unexpectedErrno(err),
@@ -12632,11 +12771,7 @@ fn netReadPosix(userdata: ?*anyopaque, fd: net.Socket.Handle, data: [][]u8) net.
     }
 }
 
-fn netReadWindows(userdata: ?*anyopaque, socket_handle: net.Socket.Handle, data: [][]u8) net.Stream.Reader.Error!usize {
-    if (!have_networking) return error.NetworkDown;
-    const t: *Threaded = @ptrCast(@alignCast(userdata));
-    _ = t;
-
+fn netReadWindows(socket_handle: net.Socket.Handle, data: [][]u8) net.Stream.Reader.Error!usize {
     var iovecs: [max_iovecs_len]windows.AFD.WSABUF(.@"var") = undefined;
     var len: u32 = 0;
     for (data) |buf| {
@@ -12658,6 +12793,7 @@ fn netReadWindows(userdata: ?*anyopaque, socket_handle: net.Socket.Handle, data:
         .SUCCESS => return iosb.Information,
         .CANCELLED => unreachable,
         .INSUFFICIENT_RESOURCES => return error.SystemResources,
+        .CONNECTION_RESET => return error.ConnectionResetByPeer,
         else => |status| return windows.unexpectedStatus(status),
     }
 }
@@ -13167,6 +13303,7 @@ fn netWriteWindows(
         .SUCCESS => return iosb.Information,
         .CANCELLED => unreachable,
         .INSUFFICIENT_RESOURCES => return error.SystemResources,
+        .CONNECTION_RESET => return error.ConnectionResetByPeer,
         else => |status| return windows.unexpectedStatus(status),
     }
 }
@@ -14063,7 +14200,7 @@ pub fn posixSocketModeProtocol(family: posix.sa_family_t, mode: net.Socket.Mode,
             .dgram => posix.SOCK.DGRAM,
             .seqpacket => posix.SOCK.SEQPACKET,
             .raw => posix.SOCK.RAW,
-            .rdm => posix.SOCK.RDM,
+            .rdm => if (@hasDecl(posix.SOCK, "RDM")) posix.SOCK.RDM else return error.OptionUnsupported,
         },
         if (protocol) |p| @intFromEnum(p) else if (is_windows) switch (family) {
             posix.AF.UNIX => switch (mode) {
@@ -14455,7 +14592,7 @@ fn lookupDns(
                 }
             }
             if (recv_err) |err| switch (err) {
-                error.Canceled => return error.Canceled,
+                error.Canceled => |e| return e,
                 error.Timeout => continue :send,
                 else => continue,
             };
@@ -14592,13 +14729,13 @@ fn lookupHostsReader(
         const line = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
             error.StreamTooLong => {
                 // Skip lines that are too long.
-                _ = reader.discardDelimiterInclusive('\n') catch |e| switch (e) {
+                _ = reader.discardDelimiterInclusive('\n') catch |er| switch (er) {
                     error.EndOfStream => break,
-                    error.ReadFailed => return error.ReadFailed,
+                    error.ReadFailed => |e| return e,
                 };
                 continue;
             },
-            error.ReadFailed => return error.ReadFailed,
+            error.ReadFailed => |e| return e,
             error.EndOfStream => break,
         };
         reader.toss(@min(1, reader.bufferedLen()));
@@ -15247,7 +15384,7 @@ fn childWaitPosix(child: *process.Child) process.Child.WaitError!process.Child.T
     const ru_ptr = if (child.request_resource_usage_statistics) &ru else null;
 
     if (have_wait4) {
-        var status: if (builtin.link_libc) c_int else u32 = undefined;
+        var status: if (builtin.link_libc) c_int else i32 = undefined;
         const syscall: Syscall = try .start();
         while (true) switch (posix.errno(posix.system.wait4(pid, &status, 0, ru_ptr))) {
             .SUCCESS => {
@@ -15290,7 +15427,7 @@ fn childWaitPosix(child: *process.Child) process.Child.WaitError!process.Child.T
         };
     }
 
-    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    var status: if (builtin.link_libc) c_int else i32 = undefined;
     const syscall: Syscall = try .start();
     while (true) switch (posix.errno(posix.system.waitpid(pid, &status, 0))) {
         .SUCCESS => {
@@ -15332,7 +15469,7 @@ fn childKillPosix(child: *process.Child) !void {
     };
 
     if (have_wait4) {
-        var status: if (builtin.link_libc) c_int else u32 = undefined;
+        var status: if (builtin.link_libc) c_int else i32 = undefined;
         while (true) switch (posix.errno(posix.system.wait4(pid, &status, 0, null))) {
             .SUCCESS => return,
             .INTR => continue,
@@ -15352,7 +15489,7 @@ fn childKillPosix(child: *process.Child) !void {
         };
     }
 
-    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    var status: if (builtin.link_libc) c_int else i32 = undefined;
     while (true) switch (posix.errno(posix.system.waitpid(pid, &status, 0))) {
         .SUCCESS => return,
         .INTR => continue,

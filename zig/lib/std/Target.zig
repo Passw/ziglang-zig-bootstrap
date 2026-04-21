@@ -68,6 +68,8 @@ pub const Os = struct {
         opengl,
         vulkan,
 
+        tios,
+
         // LLVM tags deliberately omitted:
         // - bridgeos
         // - cheriotrtos
@@ -207,6 +209,8 @@ pub const Os = struct {
                 .opencl,
                 .opengl,
                 .vulkan,
+
+                .tios,
                 => .semver,
 
                 .hurd => .hurd,
@@ -670,6 +674,12 @@ pub const Os = struct {
                         .max = .{ .major = 4, .minor = 6, .patch = 0 },
                     },
                 },
+                .tios => .{
+                    .semver = .{
+                        .min = .{ .major = 5, .minor = 0, .patch = 0 },
+                        .max = .{ .major = 5, .minor = 8, .patch = 4 },
+                    },
+                },
                 .vulkan => .{
                     .semver = .{
                         .min = .{ .major = 1, .minor = 2, .patch = 0 },
@@ -758,6 +768,7 @@ pub const wasm = @import("Target/wasm.zig");
 pub const x86 = @import("Target/x86.zig");
 pub const xcore = @import("Target/xcore.zig");
 pub const xtensa = @import("Target/xtensa.zig");
+pub const z80 = @import("Target/generic.zig");
 
 pub const Abi = enum {
     none,
@@ -832,6 +843,12 @@ pub const Abi = enum {
                 .thumb,
                 .thumbeb,
                 => .eabi,
+                else => .none,
+            },
+            .fuchsia => switch (arch) {
+                .arm,
+                .thumb,
+                => .eabihf,
                 else => .none,
             },
             .haiku => switch (arch) {
@@ -917,7 +934,6 @@ pub const Abi = enum {
             .wasi, .emscripten => .musl,
 
             .contiki,
-            .fuchsia,
             .hermit,
             .illumos,
             .managarm,
@@ -942,6 +958,7 @@ pub const Abi = enum {
             .opencl,
             .opengl,
             .vulkan,
+            .tios,
             => .none,
         };
     }
@@ -1002,6 +1019,7 @@ pub const Abi = enum {
             .gnueabi,
             .musleabi,
             .gnusf,
+            .muslsf,
             .ohoseabi,
             => .soft,
             else => .hard,
@@ -1068,6 +1086,7 @@ pub fn toElfMachine(target: *const Target) std.elf.EM {
         .avr => .AVR,
         .bpfeb, .bpfel => .BPF,
         .csky => .CSKY,
+        .ez80 => .Z80,
         .hexagon => .QDSP6,
         .hppa, .hppa64 => .PARISC,
         .kalimba => .CSR_KALIMBA,
@@ -1130,6 +1149,7 @@ pub fn toCoffMachine(target: *const Target) std.coff.IMAGE.FILE.MACHINE {
         .bpfeb,
         .bpfel,
         .csky,
+        .ez80,
         .hexagon,
         .hppa,
         .hppa64,
@@ -1205,7 +1225,7 @@ pub const Cpu = struct {
         pub const Set = struct {
             ints: [usize_count]usize,
 
-            pub const needed_bit_count = 317;
+            pub const needed_bit_count = 347;
             pub const byte_count = (needed_bit_count + 7) / 8;
             pub const usize_count = (byte_count + (@sizeOf(usize) - 1)) / @sizeOf(usize);
             pub const Index = std.math.Log2Int(std.meta.Int(.unsigned, usize_count * @bitSizeOf(usize)));
@@ -1336,6 +1356,7 @@ pub const Cpu = struct {
         bpfeb,
         bpfel,
         csky,
+        ez80,
         hexagon,
         hppa,
         hppa64,
@@ -1437,6 +1458,7 @@ pub const Cpu = struct {
             x86,
             xcore,
             xtensa,
+            z80,
         };
 
         pub inline fn family(arch: Arch) Family {
@@ -1449,6 +1471,7 @@ pub const Cpu = struct {
                 .avr => .avr,
                 .bpfeb, .bpfel => .bpf,
                 .csky => .csky,
+                .ez80 => .z80,
                 .hexagon => .hexagon,
                 .hppa, .hppa64 => .hppa,
                 .kalimba => .kalimba,
@@ -1678,6 +1701,7 @@ pub const Cpu = struct {
                 .x86_64,
                 .xcore,
                 .xtensa,
+                .ez80,
                 => .little,
 
                 .aarch64_be,
@@ -1948,6 +1972,10 @@ pub const Cpu = struct {
                 .spirv_fragment,
                 .spirv_vertex,
                 => &.{ .spirv32, .spirv64 },
+
+                .ez80_cet,
+                .ez80_tiflags,
+                => &.{.ez80},
             };
         }
     };
@@ -2033,6 +2061,7 @@ pub const Cpu = struct {
                 .hppa => &hppa.cpu.pa_7300lc,
                 .kvx => &kvx.cpu.coolidge_v2,
                 .lanai => &lanai.cpu.v11, // clang does not have a generic lanai model.
+                .loongarch32 => &loongarch.cpu.la32v1_0,
                 .loongarch64 => &loongarch.cpu.la64v1_0,
                 .m68k => &m68k.cpu.M68000,
                 .mips => &mips.cpu.mips32r2,
@@ -2236,6 +2265,7 @@ pub fn requiresLibC(target: *const Target) bool {
         .plan9,
         .other,
         .@"3ds",
+        .tios,
         => false,
     };
 }
@@ -2398,6 +2428,8 @@ pub const DynamicLinker = struct {
             .ps5,
             .psp,
             .vita,
+
+            .tios,
             => .none,
         };
     }
@@ -2417,8 +2449,10 @@ pub const DynamicLinker = struct {
     pub fn standard(cpu: Cpu, os: Os, abi: Abi) DynamicLinker {
         return switch (os.tag) {
             .fuchsia => switch (cpu.arch) {
+                .arm,
                 .aarch64,
                 .riscv64,
+                .thumb,
                 .x86_64,
                 => init("ld.so.1"), // Fuchsia is unusual in that `DT_INTERP` is just a basename.
                 else => none,
@@ -2815,6 +2849,8 @@ pub const DynamicLinker = struct {
             .opencl,
             .opengl,
             .vulkan,
+
+            .tios,
             => none,
 
             // TODO go over each item in this list and either move it to the above list, or
@@ -2848,6 +2884,9 @@ pub fn ptrBitWidth_arch_abi(cpu_arch: Cpu.Arch, abi: Abi) u16 {
         .msp430,
         .x86_16,
         => 16,
+
+        .ez80,
+        => 24,
 
         .arc,
         .arceb,
@@ -2917,6 +2956,8 @@ pub fn ptrBitWidth(target: *const Target) u16 {
 pub fn stackAlignment(target: *const Target) u16 {
     // Overrides for when the stack alignment is not equal to the pointer width.
     switch (target.cpu.arch) {
+        .ez80,
+        => return 1,
         .m68k,
         => return 2,
         .amdgcn,
@@ -2997,6 +3038,7 @@ pub fn cCharSignedness(target: *const Target) std.builtin.Signedness {
         .arc,
         .arceb,
         .csky,
+        .ez80,
         .hexagon,
         .msp430,
         .powerpc,
@@ -3049,8 +3091,6 @@ pub fn cTypeByteSize(t: *const Target, c_type: CType) u16 {
         => @divExact(cTypeBitSize(t, c_type), 8),
 
         .longdouble => switch (cTypeBitSize(t, c_type)) {
-            16 => 2,
-            32 => 4,
             64 => 8,
             80 => @intCast(std.mem.alignForward(usize, 10, cTypeAlignment(t, .longdouble))),
             128 => 16,
@@ -3364,6 +3404,13 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) u16 {
             .long, .ulong => return 64,
             .longlong, .ulonglong, .double, .longdouble => return 64,
         },
+        .tios => switch (c_type) {
+            .char => return 8,
+            .short, .ushort => return 16,
+            .int, .uint => return 24,
+            .long, .ulong, .float, .double => return 32,
+            .longlong, .ulonglong, .longdouble => return 64,
+        },
 
         .ps3,
         .contiki,
@@ -3376,7 +3423,7 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) u16 {
 pub fn cTypeAlignment(target: *const Target, c_type: CType) u16 {
     // Overrides for unusual alignments
     switch (target.cpu.arch) {
-        .avr => return 1,
+        .avr, .ez80 => return 1,
         .x86 => switch (target.os.tag) {
             .windows, .uefi => switch (c_type) {
                 .longlong, .ulonglong, .double => return 8,
@@ -3406,6 +3453,8 @@ pub fn cTypeAlignment(target: *const Target, c_type: CType) u16 {
     return @min(
         std.math.ceilPowerOfTwoAssert(u16, (cTypeBitSize(target, c_type) + 7) / 8),
         @as(u16, switch (target.cpu.arch) {
+            .ez80 => 1,
+
             .msp430,
             .x86_16,
             => 2,
@@ -3484,7 +3533,7 @@ pub fn cTypePreferredAlignment(target: *const Target, c_type: CType) u16 {
             .longdouble => return 4,
             else => {},
         },
-        .avr => return 1,
+        .avr, .ez80 => return 1,
         .x86 => switch (target.os.tag) {
             .windows, .uefi => switch (c_type) {
                 .longdouble => switch (target.abi) {
@@ -3516,6 +3565,8 @@ pub fn cTypePreferredAlignment(target: *const Target, c_type: CType) u16 {
     return @min(
         std.math.ceilPowerOfTwoAssert(u16, (cTypeBitSize(target, c_type) + 7) / 8),
         @as(u16, switch (target.cpu.arch) {
+            .ez80 => 1,
+
             .x86_16, .msp430 => 2,
 
             .arc,
@@ -3587,7 +3638,9 @@ pub fn cTypePreferredAlignment(target: *const Target, c_type: CType) u16 {
 
 pub fn cMaxIntAlignment(target: *const Target) u16 {
     return switch (target.cpu.arch) {
-        .avr => 1,
+        .avr,
+        .ez80,
+        => 1,
 
         .msp430, .x86_16 => 2,
 
@@ -3726,6 +3779,7 @@ pub fn cCallingConvention(target: *const Target) ?std.builtin.CallingConvention 
         .amdgcn => .{ .amdgcn_device = .{} },
         .nvptx, .nvptx64 => .nvptx_device,
         .spirv32, .spirv64 => .spirv_device,
+        .ez80 => .ez80_cet,
     };
 }
 

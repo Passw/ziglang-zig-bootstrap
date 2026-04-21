@@ -385,8 +385,6 @@ pub const Block = struct {
     /// What mode to generate float operations in, set by @setFloatMode
     float_mode: std.builtin.FloatMode = .strict,
 
-    c_import_buf: ?*std.array_list.Managed(u8) = null,
-
     /// If not `null`, this boolean is set when a `dbg_var_ptr`, `dbg_var_val`, or `dbg_arg_inline`.
     /// instruction is emitted. It signals that the innermost lexically
     /// enclosing `block`/`block_inline` should be translated into a real AIR
@@ -526,7 +524,6 @@ pub const Block = struct {
             .runtime_index = parent.runtime_index,
             .want_safety = parent.want_safety,
             .float_mode = parent.float_mode,
-            .c_import_buf = parent.c_import_buf,
             .error_return_trace_index = parent.error_return_trace_index,
             .need_debug_scope = parent.need_debug_scope,
             .src_base_inst = parent.src_base_inst,
@@ -1189,7 +1186,6 @@ fn analyzeBodyInner(
             .bool_not                     => try sema.zirBoolNot(block, inst),
             .bool_br_and                  => try sema.zirBoolBr(block, inst, false),
             .bool_br_or                   => try sema.zirBoolBr(block, inst, true),
-            .c_import                     => try sema.zirCImport(block, inst),
             .call                         => try sema.zirCall(block, inst, .direct),
             .field_call                   => try sema.zirCall(block, inst, .field),
             .cmp_lt                       => try sema.zirCmp(block, inst, .lt),
@@ -1414,9 +1410,6 @@ fn analyzeBodyInner(
                     .sub_with_overflow  => try sema.zirOverflowArithmetic(block, extended, extended.opcode),
                     .mul_with_overflow  => try sema.zirOverflowArithmetic(block, extended, extended.opcode),
                     .shl_with_overflow  => try sema.zirOverflowArithmetic(block, extended, extended.opcode),
-                    .c_undef            => try sema.zirCUndef(            block, extended),
-                    .c_include          => try sema.zirCInclude(          block, extended),
-                    .c_define           => try sema.zirCDefine(           block, extended),
                     .wasm_memory_size   => try sema.zirWasmMemorySize(    block, extended),
                     .wasm_memory_grow   => try sema.zirWasmMemoryGrow(    block, extended),
                     .prefetch           => try sema.zirPrefetch(          block, extended),
@@ -4116,7 +4109,7 @@ fn zirForLen(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Air.
             if (i == len_idx) continue;
             const eq = try block.addBinOp(.cmp_eq, len, arg_len);
             ok = if (ok != .none)
-                try block.addBinOp(.bool_and, ok, eq)
+                try block.addBinOp(.bit_and, ok, eq)
             else
                 eq;
         }
@@ -5212,136 +5205,6 @@ fn zirLoop(sema: *Sema, parent_block: *Block, inst: Zir.Inst.Index) CompileError
     return sema.resolveAnalyzedBlock(parent_block, src, &child_block, merges, false);
 }
 
-fn zirCImport(sema: *Sema, parent_block: *Block, inst: Zir.Inst.Index) CompileError!Air.Inst.Ref {
-    const tracy = trace(@src());
-    defer tracy.end();
-
-    const pt = sema.pt;
-    const zcu = pt.zcu;
-    const comp = zcu.comp;
-    const gpa = comp.gpa;
-    const io = comp.io;
-
-    const pl_node = sema.code.instructions.items(.data)[@intFromEnum(inst)].pl_node;
-    const src = parent_block.nodeOffset(pl_node.src_node);
-    const extra = sema.code.extraData(Zir.Inst.Block, pl_node.payload_index);
-    const body = sema.code.bodySlice(extra.end, extra.data.body_len);
-
-    var c_import_buf = std.array_list.Managed(u8).init(gpa);
-    defer c_import_buf.deinit();
-
-    var child_block: Block = .{
-        .parent = parent_block,
-        .sema = sema,
-        .namespace = parent_block.namespace,
-        .instructions = .empty,
-        .inlining = parent_block.inlining,
-        .comptime_reason = .{ .reason = .{
-            .src = src,
-            .r = .{ .simple = .operand_cImport },
-        } },
-        .c_import_buf = &c_import_buf,
-        .runtime_cond = parent_block.runtime_cond,
-        .runtime_loop = parent_block.runtime_loop,
-        .runtime_index = parent_block.runtime_index,
-        .src_base_inst = parent_block.src_base_inst,
-        .type_name_ctx = parent_block.type_name_ctx,
-    };
-    defer child_block.instructions.deinit(gpa);
-
-    _ = try sema.analyzeInlineBody(&child_block, body, inst);
-
-    const prog_node = zcu.cur_sema_prog_node.start("@cImport", 0);
-    defer prog_node.end();
-
-    var c_import_res = comp.cImport(c_import_buf.items, parent_block.ownerModule(), prog_node) catch |err|
-        return sema.fail(&child_block, src, "C import failed: {t}", .{err});
-    defer c_import_res.deinit(gpa);
-
-    if (c_import_res.errors.errorMessageCount() != 0) {
-        const msg = msg: {
-            const msg = try sema.errMsg(src, "C import failed", .{});
-            errdefer msg.destroy(gpa);
-
-            if (!comp.config.link_libc)
-                try sema.errNote(src, msg, "libc headers not available; compilation does not link against libc", .{});
-
-            const gop = try zcu.cimport_errors.getOrPut(gpa, sema.owner);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = c_import_res.errors;
-                c_import_res.errors = std.zig.ErrorBundle.empty;
-            }
-            break :msg msg;
-        };
-        return sema.failWithOwnedErrorMsg(&child_block, msg);
-    }
-    const parent_mod = parent_block.ownerModule();
-    const digest = Cache.binToHex(c_import_res.digest);
-
-    const new_file_index = file: {
-        const c_import_zig_path = try comp.arena.dupe(u8, "o" ++ std.fs.path.sep_str ++ digest);
-        const c_import_mod = Package.Module.create(comp.arena, .{
-            .paths = .{
-                .root = try .fromRoot(comp.arena, comp.dirs, .local_cache, c_import_zig_path),
-                .root_src_path = "cimport.zig",
-            },
-            .fully_qualified_name = c_import_zig_path,
-            .cc_argv = parent_mod.cc_argv,
-            .inherited = .{},
-            .global = comp.config,
-            .parent = parent_mod,
-        }) catch |err| switch (err) {
-            error.OutOfMemory => |e| return e,
-            // None of these are possible because we are creating a package with
-            // the exact same configuration as the parent package, which already
-            // passed these checks.
-            error.ValgrindUnsupportedOnTarget => unreachable,
-            error.TargetRequiresSingleThreaded => unreachable,
-            error.BackendRequiresSingleThreaded => unreachable,
-            error.TargetRequiresPic => unreachable,
-            error.PieRequiresPic => unreachable,
-            error.DynamicLinkingRequiresPic => unreachable,
-            error.TargetHasNoRedZone => unreachable,
-            error.StackCheckUnsupportedByTarget => unreachable,
-            error.StackProtectorUnsupportedByTarget => unreachable,
-            error.StackProtectorUnavailableWithoutLibC => unreachable,
-        };
-        const c_import_file_path: Compilation.Path = try c_import_mod.root.join(gpa, comp.dirs, "cimport.zig");
-        errdefer c_import_file_path.deinit(gpa);
-        const c_import_file = try gpa.create(Zcu.File);
-        errdefer gpa.destroy(c_import_file);
-        const c_import_file_index = try zcu.intern_pool.createFile(gpa, io, pt.tid, .{
-            .bin_digest = c_import_file_path.digest(),
-            .file = c_import_file,
-            .root_type = .none,
-        });
-        c_import_file.* = .{
-            .status = .never_loaded,
-            .stat = undefined,
-            .is_builtin = false,
-            .path = c_import_file_path,
-            .source = null,
-            .tree = null,
-            .zir = null,
-            .zoir = null,
-            .mod = c_import_mod,
-            .sub_file_path = "cimport.zig",
-            .module_changed = false,
-            .prev_zir = null,
-            .zoir_invalidated = false,
-        };
-        try zcu.alive_files.putNoClobber(zcu.gpa, c_import_file_index, undefined);
-        break :file c_import_file_index;
-    };
-    pt.updateFile(new_file_index, zcu.fileByIndex(new_file_index)) catch |err|
-        return sema.fail(&child_block, src, "C import failed: {s}", .{@errorName(err)});
-
-    try pt.ensureFilePopulated(new_file_index);
-    const ty: Type = .fromInterned(zcu.fileRootType(new_file_index));
-    try sema.addTypeReferenceEntry(src, ty);
-    return .fromType(ty);
-}
-
 fn zirSuspendBlock(sema: *Sema, parent_block: *Block, inst: Zir.Inst.Index) CompileError!Air.Inst.Ref {
     const inst_data = sema.code.instructions.items(.data)[@intFromEnum(inst)].pl_node;
     const src = parent_block.nodeOffset(inst_data.src_node);
@@ -5388,7 +5251,6 @@ fn zirBlock(sema: *Sema, parent_block: *Block, inst: Zir.Inst.Index) CompileErro
         .is_typeof = parent_block.is_typeof,
         .want_safety = parent_block.want_safety,
         .float_mode = parent_block.float_mode,
-        .c_import_buf = parent_block.c_import_buf,
         .runtime_cond = parent_block.runtime_cond,
         .runtime_loop = parent_block.runtime_loop,
         .runtime_index = parent_block.runtime_index,
@@ -7837,7 +7699,7 @@ fn zirErrorFromInt(sema: *Sema, block: *Block, extended: Zir.Inst.Extended.InstD
         const is_lte_len = try block.addUnOp(.cmp_lte_errors_len, operand);
         const zero_val = Air.internedToRef((try pt.intValue(err_int_ty, 0)).toIntern());
         const is_non_zero = try block.addBinOp(.cmp_neq, operand, zero_val);
-        const ok = try block.addBinOp(.bool_and, is_lte_len, is_non_zero);
+        const ok = try block.addBinOp(.bit_and, is_lte_len, is_non_zero);
         try sema.addSafetyCheck(block, src, ok, .invalid_error_code);
     }
     return block.addInst(.{
@@ -14699,7 +14561,7 @@ fn addDivIntOverflowSafety(
             break :ok try block.addCmpVector(casted_rhs, neg_one_ref, .neq);
         };
 
-        const ok = try block.addReduce(try block.addBinOp(.bool_or, lhs_ok, rhs_ok), .And);
+        const ok = try block.addReduce(try block.addBinOp(.bit_or, lhs_ok, rhs_ok), .And);
         try sema.addSafetyCheck(block, src, ok, .integer_overflow);
     } else {
         const lhs_ok: Air.Inst.Ref = if (maybe_lhs_val == null) ok: {
@@ -14712,7 +14574,7 @@ fn addDivIntOverflowSafety(
         } else .none; // means false
 
         const ok = if (lhs_ok != .none and rhs_ok != .none)
-            try block.addBinOp(.bool_or, lhs_ok, rhs_ok)
+            try block.addBinOp(.bit_or, lhs_ok, rhs_ok)
         else if (lhs_ok != .none)
             lhs_ok
         else if (rhs_ok != .none)
@@ -21374,7 +21236,7 @@ fn zirErrorCast(sema: *Sema, block: *Block, extended: Zir.Inst.Extended.InstData
             } else {
                 // Error must be in destination set or zero.
                 const has_value = try block.addTyOp(.error_set_has_value, dest_err_ty, err_int_inst);
-                const ok = try block.addBinOp(.bool_or, has_value, is_zero);
+                const ok = try block.addBinOp(.bit_or, has_value, is_zero);
                 try sema.addSafetyCheck(block, src, ok, .invalid_error_code);
             }
         } else {
@@ -21932,7 +21794,7 @@ fn ptrCastFull(
         assert(operand_ptr_int != .none);
         const ptr_is_non_zero = try block.addBinOp(.cmp_neq, operand_ptr_int, .zero_usize);
         const ok = if (src_info.flags.size == .slice and dest_info.flags.size == .slice) ok: {
-            break :ok try block.addBinOp(.bool_or, operand_len_is_zero, ptr_is_non_zero);
+            break :ok try block.addBinOp(.bit_or, operand_len_is_zero, ptr_is_non_zero);
         } else ptr_is_non_zero;
         try sema.addSafetyCheck(block, src, ok, .cast_to_null);
     }
@@ -21945,7 +21807,7 @@ fn ptrCastFull(
         const ptr_masked = try block.addBinOp(.bit_and, operand_ptr_int, align_mask);
         const is_aligned = try block.addBinOp(.cmp_eq, ptr_masked, .zero_usize);
         const ok = if (src_info.flags.size == .slice and dest_info.flags.size == .slice) ok: {
-            break :ok try block.addBinOp(.bool_or, operand_len_is_zero, is_aligned);
+            break :ok try block.addBinOp(.bit_or, operand_len_is_zero, is_aligned);
         } else is_aligned;
         try sema.addSafetyCheck(block, src, ok, .incorrect_alignment);
     }
@@ -22477,7 +22339,7 @@ fn checkAtomicPtrOperand(
     try sema.ensureLayoutResolved(elem_ty, elem_ty_src, .ptr_access);
     var diag: Zcu.AtomicPtrAlignmentDiagnostics = .{};
     const alignment = zcu.atomicPtrAlignment(elem_ty, &diag) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
+        error.OutOfMemory => |e| return e,
         error.FloatTooBig => return sema.fail(
             block,
             elem_ty_src,
@@ -24455,7 +24317,7 @@ fn zirMemcpy(
         const dest_plus_len = try sema.analyzePtrArithmetic(block, src, raw_dest_ptr, len, .ptr_add, src);
         const ok1 = try block.addBinOp(.cmp_gte, raw_dest_ptr, src_plus_len);
         const ok2 = try block.addBinOp(.cmp_gte, new_src_ptr, dest_plus_len);
-        const ok = try block.addBinOp(.bool_or, ok1, ok2);
+        const ok = try block.addBinOp(.bit_or, ok1, ok2);
         try sema.addSafetyCheck(block, src, ok, .memcpy_alias);
     }
 
@@ -24688,54 +24550,6 @@ fn zirFuncFancy(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!A
         noalias_bits,
         is_noinline,
     );
-}
-
-fn zirCUndef(
-    sema: *Sema,
-    block: *Block,
-    extended: Zir.Inst.Extended.InstData,
-) CompileError!Air.Inst.Ref {
-    const extra = sema.code.extraData(Zir.Inst.UnNode, extended.operand).data;
-    const src = block.builtinCallArgSrc(extra.node, 0);
-
-    const name = try sema.resolveConstString(block, src, extra.operand, .{ .simple = .operand_cUndef_macro_name });
-    try block.c_import_buf.?.print("#undef {s}\n", .{name});
-    return .void_value;
-}
-
-fn zirCInclude(
-    sema: *Sema,
-    block: *Block,
-    extended: Zir.Inst.Extended.InstData,
-) CompileError!Air.Inst.Ref {
-    const extra = sema.code.extraData(Zir.Inst.UnNode, extended.operand).data;
-    const src = block.builtinCallArgSrc(extra.node, 0);
-
-    const name = try sema.resolveConstString(block, src, extra.operand, .{ .simple = .operand_cInclude_file_name });
-    try block.c_import_buf.?.print("#include <{s}>\n", .{name});
-    return .void_value;
-}
-
-fn zirCDefine(
-    sema: *Sema,
-    block: *Block,
-    extended: Zir.Inst.Extended.InstData,
-) CompileError!Air.Inst.Ref {
-    const pt = sema.pt;
-    const zcu = pt.zcu;
-    const extra = sema.code.extraData(Zir.Inst.BinNode, extended.operand).data;
-    const name_src = block.builtinCallArgSrc(extra.node, 0);
-    const val_src = block.builtinCallArgSrc(extra.node, 1);
-
-    const name = try sema.resolveConstString(block, name_src, extra.lhs, .{ .simple = .operand_cDefine_macro_name });
-    const rhs = sema.resolveInst(extra.rhs);
-    if (sema.typeOf(rhs).zigTypeTag(zcu) != .void) {
-        const value = try sema.resolveConstString(block, val_src, extra.rhs, .{ .simple = .operand_cDefine_macro_value });
-        try block.c_import_buf.?.print("#define {s} {s}\n", .{ name, value });
-    } else {
-        try block.c_import_buf.?.print("#define {s}\n", .{name});
-    }
-    return .void_value;
 }
 
 fn zirWasmMemorySize(
@@ -29710,7 +29524,7 @@ fn coerceCompatiblePtrs(
         const ok = if (inst_ty.isSlice(zcu)) ok: {
             const len = try sema.analyzeSliceLen(block, inst_src, inst);
             const len_zero = try block.addBinOp(.cmp_eq, len, .zero_usize);
-            break :ok try block.addBinOp(.bool_or, len_zero, is_non_zero);
+            break :ok try block.addBinOp(.bit_or, len_zero, is_non_zero);
         } else is_non_zero;
         try sema.addSafetyCheck(block, inst_src, ok, .cast_to_null);
     }

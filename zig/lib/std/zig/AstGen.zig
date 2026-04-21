@@ -199,7 +199,7 @@ pub fn generate(gpa: Allocator, tree: Ast) Allocator.Error!Zir {
             assert(struct_decl_ref.toIndex().? == .main_struct_inst);
             break :fatal false;
         } else |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
+            error.OutOfMemory => |e| return e,
             error.AnalysisFail => break :fatal true, // Handled via compile_errors below.
         }
     } else fatal: {
@@ -243,10 +243,13 @@ pub fn generate(gpa: Allocator, tree: Ast) Allocator.Error!Zir {
         }
     }
 
+    try astgen.extra.shrinkToLen(gpa);
+    try astgen.string_bytes.shrinkToLen(gpa);
+
     return .{
         .instructions = if (fatal) .empty else astgen.instructions.toOwnedSlice(),
-        .string_bytes = try astgen.string_bytes.toOwnedSlice(gpa),
-        .extra = try astgen.extra.toOwnedSlice(gpa),
+        .string_bytes = astgen.string_bytes.toOwnedSliceAssert(),
+        .extra = astgen.extra.toOwnedSliceAssert(),
     };
 }
 
@@ -1776,11 +1779,12 @@ fn structInitExpr(
     }
 
     {
-        var sfba = std.heap.stackFallback(256, astgen.arena);
-        const sfba_allocator = sfba.get();
+        var bfa_buf: [256]u8 = undefined;
+        var bfa_state: std.heap.BufferFirstAllocator = .init(&bfa_buf, astgen.arena);
+        const bfa = bfa_state.allocator();
 
         var duplicate_names: std.array_hash_map.Auto(Zir.NullTerminatedString, ArrayList(Ast.TokenIndex)) = .empty;
-        try duplicate_names.ensureTotalCapacity(sfba_allocator, @intCast(struct_init.ast.fields.len));
+        try duplicate_names.ensureTotalCapacity(bfa, @intCast(struct_init.ast.fields.len));
 
         // When there aren't errors, use this to avoid a second iteration.
         var any_duplicate = false;
@@ -1789,14 +1793,14 @@ fn structInitExpr(
             const name_token = tree.firstToken(field) - 2;
             const name_index = try astgen.identAsString(name_token);
 
-            const gop = try duplicate_names.getOrPut(sfba_allocator, name_index);
+            const gop = try duplicate_names.getOrPut(bfa, name_index);
 
             if (gop.found_existing) {
-                try gop.value_ptr.append(sfba_allocator, name_token);
+                try gop.value_ptr.append(bfa, name_token);
                 any_duplicate = true;
             } else {
                 gop.value_ptr.* = .empty;
-                try gop.value_ptr.append(sfba_allocator, name_token);
+                try gop.value_ptr.append(bfa, name_token);
             }
         }
 
@@ -2870,7 +2874,6 @@ fn addEnsureResult(gz: *GenZir, maybe_unused_result: Zir.Inst.Ref, statement: As
             .mul_add,
             .max,
             .min,
-            .c_import,
             .@"resume",
             .ret_err_value_code,
             .ret_ptr,
@@ -4998,6 +5001,10 @@ fn structDeclInner(
     );
     if (field_comptime_bits) |bits| @memset(bits.get(astgen), 0);
 
+    const old_hasher = astgen.src_hasher;
+    defer astgen.src_hasher = old_hasher;
+    astgen.src_hasher = .init(.{});
+
     // Before any field bodies comes the backing int type, if specified.
     const backing_int_type_body_len: ?u32 = if (maybe_backing_int_node.unwrap()) |backing_int_node| len: {
         if (layout != .@"packed") return astgen.failNode(
@@ -5005,6 +5012,7 @@ fn structDeclInner(
             "non-packed struct does not support backing integer type",
             .{},
         );
+        astgen.src_hasher.update(astgen.tree.getNodeSource(backing_int_node));
         const type_ref = try typeExpr(&block_scope, &namespace.base, backing_int_node);
         if (!block_scope.endsWithNoReturn()) {
             _ = try block_scope.addBreak(.break_inline, decl_inst, type_ref);
@@ -5013,10 +5021,6 @@ fn structDeclInner(
         block_scope.instructions.items.len = block_scope.instructions_top;
         break :len body_len;
     } else null;
-
-    const old_hasher = astgen.src_hasher;
-    defer astgen.src_hasher = old_hasher;
-    astgen.src_hasher = .init(.{});
 
     var next_field_idx: u32 = 0;
     for (container_decl.ast.members) |member_node| {
@@ -5278,8 +5282,13 @@ fn unionDeclInner(
     const field_align_body_lens = try scratch.addOptionalSlice(scan_result.any_field_aligns, scan_result.fields_len);
     const field_value_body_lens = try scratch.addOptionalSlice(scan_result.any_field_values, scan_result.fields_len);
 
+    const old_hasher = astgen.src_hasher;
+    defer astgen.src_hasher = old_hasher;
+    astgen.src_hasher = .init(.{});
+
     // Before any field bodies comes the tag/backing type, if specified.
     const arg_type_body_len: ?u32 = if (opt_arg_node.unwrap()) |arg_node| len: {
+        astgen.src_hasher.update(astgen.tree.getNodeSource(arg_node));
         const type_ref = try typeExpr(&block_scope, &namespace.base, arg_node);
         if (!block_scope.endsWithNoReturn()) {
             _ = try block_scope.addBreak(.break_inline, decl_inst, type_ref);
@@ -5288,10 +5297,6 @@ fn unionDeclInner(
         block_scope.instructions.items.len = block_scope.instructions_top;
         break :len body_len;
     } else null;
-
-    const old_hasher = astgen.src_hasher;
-    defer astgen.src_hasher = old_hasher;
-    astgen.src_hasher = .init(.{});
 
     var next_field_idx: u32 = 0;
     for (members) |member_node| {
@@ -5483,8 +5488,13 @@ fn containerDecl(
             const field_names = try scratch.addSlice(fields_len);
             const field_value_body_lens = try scratch.addOptionalSlice(scan_result.any_field_values, fields_len);
 
+            const old_hasher = astgen.src_hasher;
+            defer astgen.src_hasher = old_hasher;
+            astgen.src_hasher = .init(.{});
+
             // Before any field bodies comes the tag type, if specified.
             const tag_type_body_len: ?u32 = if (container_decl.ast.arg.unwrap()) |tag_type_node| len: {
+                astgen.src_hasher.update(astgen.tree.getNodeSource(tag_type_node));
                 const type_ref = try typeExpr(&block_scope, &namespace.base, tag_type_node);
                 if (!block_scope.endsWithNoReturn()) {
                     _ = try block_scope.addBreak(.break_inline, decl_inst, type_ref);
@@ -5493,10 +5503,6 @@ fn containerDecl(
                 block_scope.instructions.items.len = block_scope.instructions_top;
                 break :len body_len;
             } else null;
-
-            const old_hasher = astgen.src_hasher;
-            defer astgen.src_hasher = old_hasher;
-            astgen.src_hasher = .init(.{});
 
             var next_field_idx: u32 = 0;
             var opt_nonexhaustive_node: Ast.Node.OptionalIndex = .none;
@@ -5681,7 +5687,7 @@ fn containerMember(
 
             const prev_decl_index = wip_decls.index;
             astgen.fnDecl(gz, scope, wip_decls, member_node, body, full) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
+                error.OutOfMemory => |e| return e,
                 error.AnalysisFail => {
                     wip_decls.index = prev_decl_index;
                     try addFailedDeclaration(
@@ -5704,7 +5710,7 @@ fn containerMember(
             const full = tree.fullVarDecl(member_node).?;
             const prev_decl_index = wip_decls.index;
             astgen.globalVarDecl(gz, scope, wip_decls, member_node, full) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
+                error.OutOfMemory => |e| return e,
                 error.AnalysisFail => {
                     wip_decls.index = prev_decl_index;
                     try addFailedDeclaration(
@@ -5722,7 +5728,7 @@ fn containerMember(
         .@"comptime" => {
             const prev_decl_index = wip_decls.index;
             astgen.comptimeDecl(gz, scope, wip_decls, member_node) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
+                error.OutOfMemory => |e| return e,
                 error.AnalysisFail => {
                     wip_decls.index = prev_decl_index;
                     try addFailedDeclaration(
@@ -5742,7 +5748,7 @@ fn containerMember(
             // Since it doesn't strictly matter *what* this is, let's save ourselves the trouble
             // of duplicating the test name logic, and just assume this is an unnamed test.
             astgen.testDecl(gz, scope, wip_decls, member_node) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
+                error.OutOfMemory => |e| return e,
                 error.AnalysisFail => {
                     wip_decls.index = prev_decl_index;
                     try addFailedDeclaration(
@@ -6656,9 +6662,16 @@ fn whileExpr(
                 .operand = undefined,
             } },
         });
+        if (!continue_scope.is_comptime) {
+            _ = try continue_scope.addRestoreErrRetIndex(.{ .block = continue_block }, .always, then_node);
+        }
         _ = try continue_scope.addBreak(break_tag, continue_block, .void_value);
     }
     try continue_scope.setBlockBody(continue_block);
+    if (!then_scope.is_comptime) {
+        const cont_node = while_full.ast.cont_expr.unwrap() orelse then_node;
+        _ = try then_scope.addRestoreErrRetIndex(.{ .block = cond_block }, .always, cont_node);
+    }
     _ = try then_scope.addBreak(break_tag, cond_block, .void_value);
 
     var else_scope = parent_gz.makeSubBlock(&cond_scope.base);
@@ -6703,6 +6716,9 @@ fn whileExpr(
 
         try checkUsed(parent_gz, &else_scope.base, sub_scope);
         if (!else_scope.endsWithNoReturn()) {
+            if (!else_scope.is_comptime) {
+                _ = try else_scope.addRestoreErrRetIndex(.{ .block = loop_block }, .always, else_node);
+            }
             _ = try else_scope.addBreakWithSrcNode(break_tag, loop_block, else_result, else_node);
         }
     } else {
@@ -6973,6 +6989,9 @@ fn forExpr(
     });
 
     const break_tag: Zir.Inst.Tag = if (is_inline) .break_inline else .@"break";
+    if (!then_scope.is_comptime) {
+        _ = try then_scope.addRestoreErrRetIndex(.{ .block = cond_block }, .always, then_node);
+    }
     _ = try then_scope.addBreak(break_tag, cond_block, .void_value);
 
     var else_scope = parent_gz.makeSubBlock(&cond_scope.base);
@@ -6990,6 +7009,9 @@ fn forExpr(
             _ = try addEnsureResult(&else_scope, else_result, else_node);
         }
         if (!else_scope.endsWithNoReturn()) {
+            if (!else_scope.is_comptime) {
+                _ = try else_scope.addRestoreErrRetIndex(.{ .block = loop_block }, .always, else_node);
+            }
             _ = try else_scope.addBreakWithSrcNode(break_tag, loop_block, else_result, else_node);
         }
     } else {
@@ -8405,9 +8427,10 @@ fn tunnelThroughClosure(
 
     // Otherwise we need a tunnel. First, figure out the path of namespaces we
     // are tunneling through. This is usually only going to be one or two, so
-    // use an SFBA to optimize for the common case.
-    var sfba = std.heap.stackFallback(@sizeOf(usize) * 2, astgen.arena);
-    var intermediate_tunnels = try sfba.get().alloc(*Scope.Namespace, num_tunnels - 1);
+    // use an BFA to optimize for the common case.
+    var bfa_buf: [2]usize = undefined;
+    var bfa: std.heap.BufferFirstAllocator = .init(@ptrCast(&bfa_buf), astgen.arena);
+    var intermediate_tunnels = try bfa.allocator().alloc(*Scope.Namespace, num_tunnels - 1);
 
     const root_ns = ns: {
         var i: usize = num_tunnels - 1;
@@ -8562,7 +8585,7 @@ fn numberLiteral(gz: *GenZir, ri: ResultInfo, node: Ast.Node.Index, source_node:
             big_int.setString(@intFromEnum(base), bytes[prefix_offset..]) catch |err| switch (err) {
                 error.InvalidCharacter => unreachable, // caught in `parseNumberLiteral`
                 error.InvalidBase => unreachable, // we only pass 16, 8, 2, see above
-                error.OutOfMemory => return error.OutOfMemory,
+                error.OutOfMemory => |e| return e,
             };
 
             const limbs = big_int.limbs[0..big_int.len()];
@@ -8955,7 +8978,6 @@ fn typeOf(
         var typeof_scope = gz.makeSubBlock(scope);
         typeof_scope.is_comptime = false;
         typeof_scope.is_typeof = true;
-        typeof_scope.c_import = false;
         defer typeof_scope.unstack();
 
         const ty_expr = try reachableExpr(&typeof_scope, &typeof_scope.base, .{ .rl = .none }, args[0], node);
@@ -9055,8 +9077,7 @@ fn builtinCall(
     const builtin_name = tree.tokenSlice(builtin_token);
 
     // We handle the different builtins manually because they have different semantics depending
-    // on the function. For example, `@as` and others participate in result location semantics,
-    // and `@cImport` creates a special scope that collects a .c source code text buffer.
+    // on the function. For example, `@as` and others participate in result location semantics.
     // Also, some builtins have a variable number of parameters.
 
     const info = BuiltinFn.list.get(builtin_name) orelse {
@@ -9175,7 +9196,6 @@ fn builtinCall(
         .bit_cast   => return bitCast(  gz, scope, ri, node, params[0]),
         .TypeOf     => return typeOf(   gz, scope, ri, node, params),
         .union_init => return unionInit(gz, scope, ri, node, params),
-        .c_import   => return cImport(  gz, scope,     node, params[0]),
         .min        => return minMax(   gz, scope, ri, node, params, .min),
         .max        => return minMax(   gz, scope, ri, node, params, .max),
         // zig fmt: on
@@ -9484,9 +9504,6 @@ fn builtinCall(
         .bit_offset_of => return offsetOf(gz, scope, ri, node, params[0], params[1], .bit_offset_of),
         .offset_of     => return offsetOf(gz, scope, ri, node, params[0], params[1], .offset_of),
 
-        .c_undef   => return simpleCBuiltin(gz, scope, ri, node, params[0], .c_undef),
-        .c_include => return simpleCBuiltin(gz, scope, ri, node, params[0], .c_include),
-
         .cmpxchg_strong => return cmpxchg(gz, scope, ri, node, params, 1),
         .cmpxchg_weak   => return cmpxchg(gz, scope, ri, node, params, 0),
         // zig fmt: on
@@ -9506,17 +9523,6 @@ fn builtinCall(
                 .node = gz.nodeIndexToRelative(node),
                 .lhs = index_arg,
                 .rhs = delta_arg,
-            });
-            return rvalue(gz, ri, result, node);
-        },
-        .c_define => {
-            if (!gz.c_import) return gz.astgen.failNode(node, "C define valid only inside C import block", .{});
-            const name = try comptimeExpr(gz, scope, .{ .rl = .{ .coerced_ty = .slice_const_u8_type } }, params[0], .operand_cDefine_macro_name);
-            const value = try comptimeExpr(gz, scope, .{ .rl = .none }, params[1], .operand_cDefine_macro_value);
-            const result = try gz.addExtendedPayload(.c_define, Zir.Inst.BinNode{
-                .node = gz.nodeIndexToRelative(node),
-                .lhs = name,
-                .rhs = value,
             });
             return rvalue(gz, ri, result, node);
         },
@@ -9951,30 +9957,6 @@ fn divBuiltin(
     return rvalue(gz, ri, result, node);
 }
 
-fn simpleCBuiltin(
-    gz: *GenZir,
-    scope: *Scope,
-    ri: ResultInfo,
-    node: Ast.Node.Index,
-    operand_node: Ast.Node.Index,
-    tag: Zir.Inst.Extended,
-) InnerError!Zir.Inst.Ref {
-    const name: []const u8 = if (tag == .c_undef) "C undef" else "C include";
-    if (!gz.c_import) return gz.astgen.failNode(node, "{s} valid only inside C import block", .{name});
-    const operand = try comptimeExpr(
-        gz,
-        scope,
-        .{ .rl = .{ .coerced_ty = .slice_const_u8_type } },
-        operand_node,
-        if (tag == .c_undef) .operand_cUndef_macro_name else .operand_cInclude_file_name,
-    );
-    _ = try gz.addExtendedPayload(tag, Zir.Inst.UnNode{
-        .node = gz.nodeIndexToRelative(node),
-        .operand = operand,
-    });
-    return rvalue(gz, ri, .void_value, node);
-}
-
 fn offsetOf(
     gz: *GenZir,
     scope: *Scope,
@@ -10022,35 +10004,6 @@ fn shiftOp(
         .rhs = rhs,
     });
     return rvalue(gz, ri, result, node);
-}
-
-fn cImport(
-    gz: *GenZir,
-    scope: *Scope,
-    node: Ast.Node.Index,
-    body_node: Ast.Node.Index,
-) InnerError!Zir.Inst.Ref {
-    const astgen = gz.astgen;
-    const gpa = astgen.gpa;
-
-    if (gz.c_import) return gz.astgen.failNode(node, "cannot nest @cImport", .{});
-
-    var block_scope = gz.makeSubBlock(scope);
-    block_scope.is_comptime = true;
-    block_scope.c_import = true;
-    defer block_scope.unstack();
-
-    const block_inst = try gz.makeBlockInst(.c_import, node);
-    const block_result = try fullBodyExpr(&block_scope, &block_scope.base, .{ .rl = .none }, body_node, .normal);
-    _ = try gz.addUnNode(.ensure_result_used, block_result, node);
-    if (!gz.refIsNoReturn(block_result)) {
-        _ = try block_scope.addBreak(.break_inline, block_inst, .void_value);
-    }
-    try block_scope.setBlockBody(block_inst);
-    // block_scope unstacked now, can add new instructions to gz
-    try gz.instructions.append(gpa, block_inst);
-
-    return block_inst.toRef();
 }
 
 fn overflowArithmetic(
@@ -11339,7 +11292,6 @@ const GenZir = struct {
     /// This is set to true for a `GenZir` of a `block_inline`, indicating that
     /// exits from this block should use `break_inline` rather than `break`.
     is_inline: bool = false,
-    c_import: bool = false,
     /// The containing decl AST node.
     decl_node_index: Ast.Node.Index,
     /// The containing decl line index, absolute.
@@ -11427,7 +11379,6 @@ const GenZir = struct {
         return .{
             .is_comptime = gz.is_comptime,
             .is_typeof = gz.is_typeof,
-            .c_import = gz.c_import,
             .decl_node_index = gz.decl_node_index,
             .decl_line = gz.decl_line,
             .parent = scope,
@@ -12999,17 +12950,18 @@ fn scanContainer(
         next: ?*@This(),
     };
 
-    // The maps below are allocated into this SFBA to avoid using the GPA for small namespaces.
-    var sfba_state = std.heap.stackFallback(512, astgen.gpa);
-    const sfba = sfba_state.get();
+    // The maps below are allocated into this BFA to avoid using the GPA for small namespaces.
+    var bfa_buf: [512]u8 = undefined;
+    var bfa_state: std.heap.BufferFirstAllocator = .init(&bfa_buf, astgen.gpa);
+    const bfa = bfa_state.allocator();
 
     var names: std.AutoArrayHashMapUnmanaged(Zir.NullTerminatedString, NameEntry) = .empty;
     var test_names: std.AutoArrayHashMapUnmanaged(Zir.NullTerminatedString, NameEntry) = .empty;
     var decltest_names: std.AutoArrayHashMapUnmanaged(Zir.NullTerminatedString, NameEntry) = .empty;
     defer {
-        names.deinit(sfba);
-        test_names.deinit(sfba);
-        decltest_names.deinit(sfba);
+        names.deinit(bfa);
+        test_names.deinit(bfa);
+        decltest_names.deinit(bfa);
     }
 
     var any_duplicates = false;
@@ -13081,7 +13033,7 @@ fn scanContainer(
                     else => {}, // unnamed test
                     .string_literal => {
                         const name = try astgen.strLitAsString(test_name_token);
-                        const gop = try test_names.getOrPut(sfba, name.index);
+                        const gop = try test_names.getOrPut(bfa, name.index);
                         if (gop.found_existing) {
                             var e = gop.value_ptr;
                             while (e.next) |n| e = n;
@@ -13094,7 +13046,7 @@ fn scanContainer(
                     },
                     .identifier => {
                         const name = try astgen.identAsString(test_name_token);
-                        const gop = try decltest_names.getOrPut(sfba, name);
+                        const gop = try decltest_names.getOrPut(bfa, name);
                         if (gop.found_existing) {
                             var e = gop.value_ptr;
                             while (e.next) |n| e = n;
@@ -13121,7 +13073,7 @@ fn scanContainer(
         }
 
         {
-            const gop = try names.getOrPut(sfba, name_str_index);
+            const gop = try names.getOrPut(bfa, name_str_index);
             const new_ent: NameEntry = .{
                 .tok = name_token,
                 .next = null,

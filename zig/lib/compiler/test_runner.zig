@@ -488,7 +488,7 @@ var fuzz_runner: if (builtin.fuzz) struct {
     fn inputPoller() Io.Cancelable!void {
         @disableInstrumentation();
         switch (inputPollerInner()) {
-            error.Canceled => return error.Canceled,
+            error.Canceled => |e| return e,
             error.ReadFailed => {
                 if (stdin_reader.err.? == error.Canceled) return error.Canceled;
                 panic("failed to read from stdin: {t}", .{stdin_reader.err.?});
@@ -563,7 +563,7 @@ pub fn fuzz(
                     const stderr = std.debug.lockStderr(&.{}).terminal();
                     p: {
                         if (@errorReturnTrace()) |trace| {
-                            std.debug.writeStackTrace(trace, stderr) catch break :p;
+                            std.debug.writeErrorReturnTrace(trace, stderr) catch break :p;
                         }
                         stderr.writer.print("failed with error.{t}\n", .{err}) catch break :p;
                     }

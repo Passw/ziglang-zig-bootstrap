@@ -296,7 +296,6 @@ pub fn buildTsan(comp: *Compilation, prog_node: std.Progress.Node) BuildError!vo
         .verbose_air = comp.verbose_air,
         .verbose_llvm_ir = comp.verbose_llvm_ir,
         .verbose_llvm_bc = comp.verbose_llvm_bc,
-        .verbose_cimport = comp.verbose_cimport,
         .verbose_llvm_cpu_features = comp.verbose_llvm_cpu_features,
         .clang_passthrough_mode = comp.clang_passthrough_mode,
         .skip_linker_dependencies = skip_linker_dependencies,
@@ -314,7 +313,7 @@ pub fn buildTsan(comp: *Compilation, prog_node: std.Progress.Node) BuildError!vo
     defer sub_compilation.destroy();
 
     comp.updateSubCompilation(sub_compilation, misc_task, prog_node) catch |err| switch (err) {
-        error.AlreadyReported => return error.AlreadyReported,
+        error.AlreadyReported => |e| return e,
         else => |e| {
             comp.lockAndSetMiscFailure(misc_task, "unable to build {t}: compilation failed: {s}", .{ misc_task, @errorName(e) });
             return error.AlreadyReported;

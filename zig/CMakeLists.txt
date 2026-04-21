@@ -38,7 +38,7 @@ project(zig
 )
 
 set(ZIG_VERSION_MAJOR 0)
-set(ZIG_VERSION_MINOR 16)
+set(ZIG_VERSION_MINOR 17)
 set(ZIG_VERSION_PATCH 0)
 set(ZIG_VERSION "" CACHE STRING "Override Zig version string. Default is to find out with git.")
 
@@ -133,9 +133,9 @@ else()
     set(ZIG_SYSTEM_LIBCXX "stdc++" CACHE STRING "system libcxx name for build.zig")
 endif()
 
-find_package(llvm 21)
-find_package(clang 21)
-find_package(lld 21)
+find_package(llvm 22)
+find_package(clang 22)
+find_package(lld 22)
 
 if(ZIG_STATIC_ZLIB)
     if (MSVC)
@@ -735,11 +735,6 @@ if(MSVC OR MINGW)
 endif()
 
 
-# "-Dno-langref" is hardcoded because stage2 builds lack the `@cImport`
-# feature, which some of the doctests rely on.
-
-# To obtain this document, run `zig build` against stage3 rather than stage2.
-# Note that the `langref` step can be used to isolate this task.
 set(ZIG_BUILD_ARGS
   --zig-lib-dir "${PROJECT_SOURCE_DIR}/lib"
 
@@ -749,8 +744,6 @@ set(ZIG_BUILD_ARGS
 
   -Denable-llvm
   "-Dconfig_h=${ZIG_CONFIG_H_OUT}"
-
-  -Dno-langref
 )
 
 set(ZIG_EXTRA_BUILD_ARGS "" CACHE STRING "Extra zig build args")

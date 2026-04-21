@@ -206,6 +206,7 @@ pub fn buildLibCxx(comp: *Compilation, prog_node: std.Progress.Node) BuildError!
 
         try addCxxArgs(comp, arena, &cflags);
 
+        try cflags.append("-w"); // Disable all warnings.
         try cflags.append("-DNDEBUG");
         try cflags.append("-DLIBC_NAMESPACE=__llvm_libc_common_utils");
         try cflags.append("-D_LIBCPP_BUILDING_LIBRARY");
@@ -223,9 +224,6 @@ pub fn buildLibCxx(comp: *Compilation, prog_node: std.Progress.Node) BuildError!
 
         try cflags.append("-nostdinc++");
         try cflags.append("-std=c++23");
-        try cflags.append("-Wno-user-defined-literals");
-        try cflags.append("-Wno-covered-switch-default");
-        try cflags.append("-Wno-suggest-override");
 
         // These depend on only the zig lib directory file path, which is
         // purposefully either in the cache or not in the cache. The decision
@@ -273,7 +271,6 @@ pub fn buildLibCxx(comp: *Compilation, prog_node: std.Progress.Node) BuildError!
         .verbose_air = comp.verbose_air,
         .verbose_llvm_ir = comp.verbose_llvm_ir,
         .verbose_llvm_bc = comp.verbose_llvm_bc,
-        .verbose_cimport = comp.verbose_cimport,
         .verbose_llvm_cpu_features = comp.verbose_llvm_cpu_features,
         .clang_passthrough_mode = comp.clang_passthrough_mode,
         .skip_linker_dependencies = true,
@@ -288,7 +285,7 @@ pub fn buildLibCxx(comp: *Compilation, prog_node: std.Progress.Node) BuildError!
     defer sub_compilation.destroy();
 
     comp.updateSubCompilation(sub_compilation, misc_task, prog_node) catch |err| switch (err) {
-        error.AlreadyReported => return error.AlreadyReported,
+        error.AlreadyReported => |e| return e,
         else => |e| {
             comp.lockAndSetMiscFailure(misc_task, "unable to build libc++: compilation failed: {t}", .{e});
             return error.AlreadyReported;
@@ -401,6 +398,7 @@ pub fn buildLibCxxAbi(comp: *Compilation, prog_node: std.Progress.Node) BuildErr
 
         try addCxxArgs(comp, arena, &cflags);
 
+        try cflags.append("-w"); // Disable all warnings.
         try cflags.append("-DNDEBUG");
         try cflags.append("-D_LIBCPP_BUILDING_LIBRARY");
         try cflags.append("-D_LIBCXXABI_BUILDING_LIBRARY");
@@ -422,9 +420,6 @@ pub fn buildLibCxxAbi(comp: *Compilation, prog_node: std.Progress.Node) BuildErr
         try cflags.append("-nostdinc++");
         try cflags.append("-fstrict-aliasing");
         try cflags.append("-std=c++23");
-        try cflags.append("-Wno-user-defined-literals");
-        try cflags.append("-Wno-covered-switch-default");
-        try cflags.append("-Wno-suggest-override");
 
         // These depend on only the zig lib directory file path, which is
         // purposefully either in the cache or not in the cache. The decision
@@ -469,7 +464,6 @@ pub fn buildLibCxxAbi(comp: *Compilation, prog_node: std.Progress.Node) BuildErr
         .verbose_air = comp.verbose_air,
         .verbose_llvm_ir = comp.verbose_llvm_ir,
         .verbose_llvm_bc = comp.verbose_llvm_bc,
-        .verbose_cimport = comp.verbose_cimport,
         .verbose_llvm_cpu_features = comp.verbose_llvm_cpu_features,
         .clang_passthrough_mode = comp.clang_passthrough_mode,
         .skip_linker_dependencies = true,
@@ -484,7 +478,7 @@ pub fn buildLibCxxAbi(comp: *Compilation, prog_node: std.Progress.Node) BuildErr
     defer sub_compilation.destroy();
 
     comp.updateSubCompilation(sub_compilation, misc_task, prog_node) catch |err| switch (err) {
-        error.AlreadyReported => return error.AlreadyReported,
+        error.AlreadyReported => |e| return e,
         else => |e| {
             comp.lockAndSetMiscFailure(
                 .libcxxabi,
@@ -544,11 +538,20 @@ pub fn addCxxArgs(
     // Compilation.addCCArgs. This option makes it use serial backend which
     // is simple and works everywhere.
     try cflags.append("-D_LIBCPP_PSTL_BACKEND_SERIAL");
-    try cflags.append(switch (optimize_mode) {
-        .Debug => "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG",
-        .ReleaseFast, .ReleaseSmall => "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE",
-        .ReleaseSafe => "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST",
-    });
+    switch (optimize_mode) {
+        .Debug => {
+            try cflags.append("-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG");
+            try cflags.append("-D_LIBCPP_ASSERTION_SEMANTIC_DEFAULT=_LIBCPP_ASSERTION_SEMANTIC_ENFORCE");
+        },
+        .ReleaseFast, .ReleaseSmall => {
+            try cflags.append("-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE");
+            try cflags.append("-D_LIBCPP_ASSERTION_SEMANTIC_DEFAULT=_LIBCPP_ASSERTION_SEMANTIC_IGNORE");
+        },
+        .ReleaseSafe => {
+            try cflags.append("-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST");
+            try cflags.append("-D_LIBCPP_ASSERTION_SEMANTIC_DEFAULT=_LIBCPP_ASSERTION_SEMANTIC_ENFORCE");
+        },
+    }
     if (target.isGnuLibC()) {
         // glibc 2.16 introduced aligned_alloc
         if (target.os.versionRange().gnuLibCVersion().?.order(.{ .major = 2, .minor = 16, .patch = 0 }) == .lt) {
