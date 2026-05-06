@@ -137,8 +137,6 @@ is more portable across Linux distributions.
 | `mipsel-linux-gnueabihf`    | OK     |
 | `mipsel-linux-musleabi`     | OK     |
 | `mipsel-linux-musleabihf`   | OK     |
-| `powerpc-linux-gnueabi`     | OK     |
-| `powerpc-linux-gnueabihf`   | OK     |
 | `powerpc-linux-musleabi`    | OK     |
 | `powerpc-linux-musleabihf`  | OK     |
 | `powerpc64-linux-musl`      | OK     |
