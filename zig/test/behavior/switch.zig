@@ -276,6 +276,7 @@ test "switch prong with variable" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     try switchProngWithVarFn(SwitchProngWithVarEnum{ .One = 13 });
     try switchProngWithVarFn(SwitchProngWithVarEnum{ .Two = 13.0 });
@@ -299,6 +300,7 @@ fn switchProngWithVarFn(a: SwitchProngWithVarEnum) !void {
 test "switch on enum using pointer capture" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     try testSwitchEnumPtrCapture();
     try comptime testSwitchEnumPtrCapture();
@@ -359,6 +361,7 @@ fn testSwitchHandleAllCasesRange(x: u8) u8 {
 test "switch on union with some prongs capturing" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const X = union(enum) {
         a,
@@ -395,6 +398,7 @@ test "switch on const enum with var" {
 
 test "anon enum literal used in switch on union enum" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const Foo = union(enum) {
         a: i32,
@@ -576,6 +580,7 @@ test "switch with null and T peer types and inferred result location type" {
 test "switch prongs with cases with identical payload types" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const Union = union(enum) {
         A: usize,
@@ -617,6 +622,8 @@ test "switch prongs with cases with identical payload types" {
 }
 
 test "switch prong pointer capture alignment" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const U = union(enum) {
         a: u8 align(8),
         b: u8 align(4),
@@ -840,6 +847,7 @@ test "switch capture peer type resolution" {
 
 test "switch capture peer type resolution for in-memory coercible payloads" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const T1 = c_int;
     const t1_info = @typeInfo(T1).int;
@@ -863,6 +871,7 @@ test "switch capture peer type resolution for in-memory coercible payloads" {
 
 test "switch pointer capture peer type resolution" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const T1 = c_int;
     const t1_info = @typeInfo(T1).int;
@@ -968,6 +977,8 @@ test "switch prong captures range" {
 }
 
 test "prong with inline call to unreachable" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const U = union(enum) {
         void: void,
         bool: bool,
@@ -1174,6 +1185,8 @@ test "switch with uninstantiable union fields" {
 }
 
 test "switch with tag capture" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const U = union(enum) {
         a,
         b: i32,
@@ -1307,6 +1320,8 @@ test "single-item prong in switch on enum has comptime-known capture" {
 }
 
 test "single range switch prong capture" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const S = struct {
         fn doTheTest(x: u8) !void {
             switch (x) {
@@ -1328,6 +1343,8 @@ test "single range switch prong capture" {
 }
 
 test "switch on packed struct" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const P = packed struct {
         a: u1,
         b: u1,
@@ -1358,6 +1375,8 @@ test "switch on packed struct" {
 }
 
 test "switch on packed union" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const P = packed union(u2) {
         a: u2,
         b: i2,
@@ -1405,6 +1424,8 @@ test "switch on packed union" {
 }
 
 test "switch on nested packed containers" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const P = packed struct {
         iu: u17,
         is: i31,
@@ -1458,6 +1479,8 @@ test "switch on nested packed containers" {
 }
 
 test "switch on large types" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const S = struct {
         fn doTheTest(a: u128, b: i500) !void {
             switch (a) {
@@ -1485,4 +1508,74 @@ test "switch on large types" {
     };
     try S.doTheTest(0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_1234, 0xFFFF_1234);
     try comptime S.doTheTest(0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_1234, 0xFFFF_1234);
+}
+
+test "error captures narrow error sets" {
+    const S = struct {
+        fn doTheTest(err: error{ A, B, C, D }) !void {
+            switch (err) {
+                error.A, error.B => |e| comptime assert(@TypeOf(e) == error{ A, B }),
+                else => |e| comptime assert(@TypeOf(e) == error{ C, D }),
+            }
+            switch (err) {
+                inline error.A, error.B => |e| comptime {
+                    if (e == error.A)
+                        assert(@TypeOf(e) == error{A})
+                    else if (e == error.B)
+                        assert(@TypeOf(e) == error{B})
+                    else
+                        unreachable;
+                },
+                inline else => |e| comptime {
+                    if (e == error.C)
+                        assert(@TypeOf(e) == error{C})
+                    else if (e == error.D)
+                        assert(@TypeOf(e) == error{D})
+                    else
+                        unreachable;
+                },
+            }
+        }
+    };
+
+    try S.doTheTest(error.B);
+    try comptime S.doTheTest(error.B);
+    try comptime S.doTheTest(error.C);
+}
+
+test "repeated switch analysis overrides previous analysis results" {
+    // This tests an implementation detail where semantic analysis of switch
+    // statements uses the switch inst itself to store capture values and result
+    // type information while analyzing (parts of) that switch inst.
+    // If that inst has already been assigned a result by a previous analysis
+    // that result needs to be overwritten.
+
+    comptime {
+        const x: u32 = 123;
+        for (0..2) |_| _ = switch (x) {
+            123 => |capture| capture,
+            else => unreachable,
+        };
+    }
+    comptime {
+        const x: union(enum) { a, b, c } = .a;
+        for (0..2) |_| _ = switch (x) {
+            .a => |_, tag| tag,
+            else => unreachable,
+        };
+    }
+    comptime {
+        const x: enum { a, b, c } = .a;
+        for (0..2) |_| _ = label: switch (x) {
+            .a => continue :label .b,
+            else => 123,
+        };
+    }
+    comptime {
+        const x: anyerror!void = error.MyError;
+        for (0..2) |_| _ = x catch |err| switch (err) {
+            error.MyError => {},
+            else => unreachable,
+        };
+    }
 }

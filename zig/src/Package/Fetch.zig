@@ -162,9 +162,9 @@ pub const JobQueue = struct {
         /// Both non-lazy and lazy dependencies are always fetched.
         all,
     };
-    pub const Table = std.AutoArrayHashMapUnmanaged(Package.Hash, *Fetch);
-    pub const UnlazySet = std.AutoArrayHashMapUnmanaged(Package.Hash, void);
-    pub const ForkSet = std.ArrayHashMapUnmanaged(Fork, void, Fork.Context, false);
+    pub const Table = std.array_hash_map.Auto(Package.Hash, *Fetch);
+    pub const UnlazySet = std.array_hash_map.Auto(Package.Hash, void);
+    pub const ForkSet = std.array_hash_map.Custom(Fork, void, Fork.Context, false);
 
     pub const Fork = struct {
         path: Cache.Path,
@@ -782,7 +782,7 @@ fn runResource(
         f.package_root = try ls.pkg_root.join(arena, computed_package_hash.toSlice());
         renameTmpIntoCache(io, package_sub_path, f.package_root) catch |err| {
             try eb.addRootErrorMessage(.{ .msg = try eb.printString(
-                "unable to rename temporary directory {f} into package cache directory {f}: {t}",
+                "failed renaming temporary directory {f} into package cache directory {f}: {t}",
                 .{ package_sub_path, f.package_root, err },
             ) });
             return error.FetchFailed;
@@ -802,7 +802,7 @@ fn runResource(
     if (!package_sub_path.eql(tmp_directory_path)) {
         tmp_directory_path.root_dir.handle.deleteDir(io, tmp_directory_path.sub_path) catch |err| switch (err) {
             error.Canceled => |e| return e,
-            else => |e| log.warn("failed to delete temporary directory {f}: {t}", .{ tmp_directory_path, e }),
+            else => |e| log.warn("failed deleting temporary directory {f}: {t}", .{ tmp_directory_path, e }),
         };
     }
 
@@ -1151,10 +1151,10 @@ const FileType = enum {
 
     /// Parameter is a content-disposition header value.
     fn fromContentDisposition(cd_header: []const u8) ?FileType {
-        const attach_end = ascii.indexOfIgnoreCase(cd_header, "attachment;") orelse
+        const attach_end = ascii.findIgnoreCase(cd_header, "attachment;") orelse
             return null;
 
-        var value_start = ascii.indexOfIgnoreCasePos(cd_header, attach_end + 1, "filename") orelse
+        var value_start = ascii.findIgnoreCasePos(cd_header, attach_end + 1, "filename") orelse
             return null;
         value_start += "filename".len;
         if (cd_header[value_start] == '*') {
@@ -1212,7 +1212,7 @@ fn initResource(f: *Fetch, uri: std.Uri, resource: *Resource, reader_buffer: []u
     {
         resource.* = .{ .http_request = .{
             .request = http_client.request(.GET, uri, .{}) catch |err|
-                return f.fail(f.location_tok, try eb.printString("unable to connect to server: {t}", .{err})),
+                return f.fail(f.location_tok, try eb.printString("server connection failed: {t}", .{err})),
             .response = undefined,
             .transfer_buffer = reader_buffer,
             .decompress_buffer = &.{},
@@ -1725,7 +1725,7 @@ fn computeHash(f: *Fetch, pkg_path: Cache.Path, filter: Filter) RunError!Compute
 
     // Track directories which had any files deleted from them so that empty directories
     // can be deleted.
-    var sus_dirs: std.StringArrayHashMapUnmanaged(void) = .empty;
+    var sus_dirs: std.array_hash_map.String(void) = .empty;
     defer sus_dirs.deinit(gpa);
 
     var walker = try root_dir.walk(gpa);
@@ -2002,7 +2002,7 @@ fn normalizePath(bytes: []u8) void {
 }
 
 const Filter = struct {
-    include_paths: std.StringArrayHashMapUnmanaged(void) = .empty,
+    include_paths: std.array_hash_map.String(void) = .empty,
 
     /// sub_path is relative to the package root.
     pub fn includePath(self: *const Filter, sub_path: []const u8) bool {

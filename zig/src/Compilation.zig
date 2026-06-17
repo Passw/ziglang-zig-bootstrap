@@ -87,7 +87,7 @@ link_inputs: []const link.Input,
 framework_dirs: []const []const u8,
 /// These are only for DLLs dependencies fulfilled by the `.def` files shipped
 /// with Zig. Static libraries are provided as `link.Input` values.
-windows_libs: std.StringArrayHashMapUnmanaged(void),
+windows_libs: std.array_hash_map.String(void),
 /// The number of items in `windows_libs` which we have already built. All items at or after this
 /// index will be built in `performAllTheWork`.
 windows_libs_num_done: u32,
@@ -101,10 +101,10 @@ native_system_include_paths: []const []const u8,
 /// List of symbols forced as undefined in the symbol table
 /// thus forcing their resolution by the linker.
 /// Corresponds to `-u <symbol>` for ELF/MachO and `/include:<symbol>` for COFF/PE.
-force_undefined_symbols: std.StringArrayHashMapUnmanaged(void),
+force_undefined_symbols: std.array_hash_map.String(void),
 
-c_object_table: std.AutoArrayHashMapUnmanaged(*CObject, void) = .empty,
-win32_resource_table: if (dev.env.supports(.win32_resource)) std.AutoArrayHashMapUnmanaged(*Win32Resource, void) else struct {
+c_object_table: std.array_hash_map.Auto(*CObject, void) = .empty,
+win32_resource_table: if (dev.env.supports(.win32_resource)) std.array_hash_map.Auto(*Win32Resource, void) else struct {
     pub fn keys(_: @This()) [0]void {
         return .{};
     }
@@ -145,11 +145,11 @@ win32_resource_work_queue: if (dev.env.supports(.win32_resource)) std.Deque(*Win
 
 /// The ErrorMsg memory is owned by the `CObject`, using Compilation's general purpose allocator.
 /// This data is accessed by multiple threads and is protected by `mutex`.
-failed_c_objects: std.AutoArrayHashMapUnmanaged(*CObject, *CObject.Diag.Bundle) = .empty,
+failed_c_objects: std.array_hash_map.Auto(*CObject, *CObject.Diag.Bundle) = .empty,
 
 /// The ErrorBundle memory is owned by the `Win32Resource`, using Compilation's general purpose allocator.
 /// This data is accessed by multiple threads and is protected by `mutex`.
-failed_win32_resources: if (dev.env.supports(.win32_resource)) std.AutoArrayHashMapUnmanaged(*Win32Resource, ErrorBundle) else struct {
+failed_win32_resources: if (dev.env.supports(.win32_resource)) std.array_hash_map.Auto(*Win32Resource, ErrorBundle) else struct {
     pub fn values(_: @This()) [0]void {
         return .{};
     }
@@ -157,7 +157,7 @@ failed_win32_resources: if (dev.env.supports(.win32_resource)) std.AutoArrayHash
 } = .{},
 
 /// Miscellaneous things that can fail.
-misc_failures: std.AutoArrayHashMapUnmanaged(MiscTask, MiscError) = .empty,
+misc_failures: std.array_hash_map.Auto(MiscTask, MiscError) = .empty,
 
 /// When this is `true` it means invoking clang as a sub-process is expected to inherit
 /// stdin, stdout, stderr, and if it returns non success, to forward the exit code.
@@ -177,7 +177,7 @@ verbose_link: bool,
 link_depfile: ?[]const u8,
 disable_c_depfile: bool,
 stack_report: bool,
-debug_compiler_runtime_libs: ?std.builtin.OptimizeMode,
+debug_compiler_runtime_libs: ?std.lang.OptimizeMode,
 debug_compile_errors: bool,
 /// Do not check this field directly. Instead, use the `debugIncremental` wrapper function.
 debug_incremental: bool,
@@ -298,15 +298,15 @@ const QueuedJobs = struct {
     ubsan_rt_lib: bool = false,
     ubsan_rt_obj: bool = false,
     fuzzer_lib: bool = false,
-    musl_crt_file: [@typeInfo(musl.CrtFile).@"enum".fields.len]bool = @splat(false),
-    glibc_crt_file: [@typeInfo(glibc.CrtFile).@"enum".fields.len]bool = @splat(false),
-    freebsd_crt_file: [@typeInfo(freebsd.CrtFile).@"enum".fields.len]bool = @splat(false),
-    netbsd_crt_file: [@typeInfo(netbsd.CrtFile).@"enum".fields.len]bool = @splat(false),
-    openbsd_crt_file: [@typeInfo(openbsd.CrtFile).@"enum".fields.len]bool = @splat(false),
+    musl_crt_file: [@typeInfo(musl.CrtFile).@"enum".field_names.len]bool = @splat(false),
+    glibc_crt_file: [@typeInfo(glibc.CrtFile).@"enum".field_names.len]bool = @splat(false),
+    freebsd_crt_file: [@typeInfo(freebsd.CrtFile).@"enum".field_names.len]bool = @splat(false),
+    netbsd_crt_file: [@typeInfo(netbsd.CrtFile).@"enum".field_names.len]bool = @splat(false),
+    openbsd_crt_file: [@typeInfo(openbsd.CrtFile).@"enum".field_names.len]bool = @splat(false),
     /// one of WASI libc static objects
-    wasi_libc_crt_file: [@typeInfo(wasi_libc.CrtFile).@"enum".fields.len]bool = @splat(false),
+    wasi_libc_crt_file: [@typeInfo(wasi_libc.CrtFile).@"enum".field_names.len]bool = @splat(false),
     /// one of the mingw-w64 static objects
-    mingw_crt_file: [@typeInfo(mingw.CrtFile).@"enum".fields.len]bool = @splat(false),
+    mingw_crt_file: [@typeInfo(mingw.CrtFile).@"enum".field_names.len]bool = @splat(false),
     /// all of the glibc shared objects
     glibc_shared_objects: bool = false,
     freebsd_shared_objects: bool = false,
@@ -752,12 +752,9 @@ pub const Directories = struct {
             else => []const u8,
         },
         environ_map: *const std.process.Environ.Map,
+        cwd: []const u8,
     ) Directories {
         const wasi = builtin.target.os.tag == .wasi;
-
-        const cwd = introspect.getResolvedCwd(io, arena) catch |err| {
-            fatal("unable to get cwd: {t}", .{err});
-        };
 
         const zig_lib: Cache.Directory = d: {
             if (override_zig_lib) |path| break :d openUnresolved(arena, io, cwd, path, .@"zig lib");
@@ -868,7 +865,7 @@ pub const TimeReport = struct {
     /// a function) all generic instances of this function. It also includes time spent analyzing
     /// function bodies if this is a function (generic or otherwise).
     /// An entry not existing means the declaration has not been analyzed (so far).
-    decl_sema_info: std.AutoArrayHashMapUnmanaged(InternPool.TrackedInst.Index, struct {
+    decl_sema_info: std.array_hash_map.Auto(InternPool.TrackedInst.Index, struct {
         ns: u64,
         count: u32,
     }),
@@ -878,14 +875,14 @@ pub const TimeReport = struct {
     /// instances, both of this function itself and of its parent namespace.
     /// An entry not existing means the declaration has not been codegenned (so far).
     /// Every key in `decl_codegen_ns` is also in `decl_sema_ns`.
-    decl_codegen_ns: std.AutoArrayHashMapUnmanaged(InternPool.TrackedInst.Index, u64),
+    decl_codegen_ns: std.array_hash_map.Auto(InternPool.TrackedInst.Index, u64),
 
     /// Key is a ZIR `declaration` instruction which is anything other than a `comptime` decl; value
     /// is the number of nanoseconds spent linking it into the binary. As above, this is the total
     /// across all generic instances.
     /// An entry not existing means the declaration has not been linked (so far).
     /// Every key in `decl_link_ns` is also in `decl_sema_ns`.
-    decl_link_ns: std.AutoArrayHashMapUnmanaged(InternPool.TrackedInst.Index, u64),
+    decl_link_ns: std.array_hash_map.Auto(InternPool.TrackedInst.Index, u64),
 
     pub fn deinit(tr: *TimeReport, gpa: Allocator) void {
         tr.stats = undefined;
@@ -1071,8 +1068,8 @@ pub const CObject = struct {
         }
 
         pub const Bundle = struct {
-            file_names: std.AutoArrayHashMapUnmanaged(u32, []const u8) = .empty,
-            category_names: std.AutoArrayHashMapUnmanaged(u32, []const u8) = .empty,
+            file_names: std.array_hash_map.Auto(u32, []const u8) = .empty,
+            category_names: std.array_hash_map.Auto(u32, []const u8) = .empty,
             diags: []Diag = &.{},
 
             pub fn destroy(bundle: *Bundle, gpa: Allocator) void {
@@ -1125,13 +1122,13 @@ pub const CObject = struct {
                 var bc = std.zig.llvm.BitcodeReader.init(gpa, .{ .reader = &file_reader.interface });
                 defer bc.deinit();
 
-                var file_names: std.AutoArrayHashMapUnmanaged(u32, []const u8) = .empty;
+                var file_names: std.array_hash_map.Auto(u32, []const u8) = .empty;
                 errdefer {
                     for (file_names.values()) |file_name| gpa.free(file_name);
                     file_names.deinit(gpa);
                 }
 
-                var category_names: std.AutoArrayHashMapUnmanaged(u32, []const u8) = .empty;
+                var category_names: std.array_hash_map.Auto(u32, []const u8) = .empty;
                 errdefer {
                     for (category_names.values()) |category_name| gpa.free(category_name);
                     category_names.deinit(gpa);
@@ -1607,7 +1604,7 @@ pub const CreateOptions = struct {
     /// implementations still do.
     lib_directories: []const Cache.Directory = &.{},
     rpath_list: []const []const u8 = &[0][]const u8{},
-    symbol_wrap_set: std.StringArrayHashMapUnmanaged(void) = .empty,
+    symbol_wrap_set: std.array_hash_map.String(void) = .empty,
     c_source_files: []const CSourceFile = &.{},
     rc_source_files: []const RcSourceFile = &.{},
     manifest_file: ?[]const u8 = null,
@@ -1676,7 +1673,7 @@ pub const CreateOptions = struct {
     verbose_llvm_bc: ?[]const u8 = null,
     link_depfile: ?[]const u8 = null,
     verbose_llvm_cpu_features: bool = false,
-    debug_compiler_runtime_libs: ?std.builtin.OptimizeMode = null,
+    debug_compiler_runtime_libs: ?std.lang.OptimizeMode = null,
     debug_compile_errors: bool = false,
     debug_incremental: bool = false,
     /// Normally when you create a `Compilation`, Zig will automatically build
@@ -1686,7 +1683,7 @@ pub const CreateOptions = struct {
     skip_linker_dependencies: bool = false,
     hash_style: link.File.Lld.Elf.HashStyle = .both,
     entry: Entry = .default,
-    force_undefined_symbols: std.StringArrayHashMapUnmanaged(void) = .empty,
+    force_undefined_symbols: std.array_hash_map.String(void) = .empty,
     stack_size: ?u64 = null,
     image_base: ?u64 = null,
     version: ?std.SemanticVersion = null,
@@ -1750,9 +1747,13 @@ pub const CreateOptions = struct {
                 .no => return null,
                 .yes_cache => {
                     assert(opts.cache_mode != .none);
+                    const target = &opts.root_mod.resolved_target.result;
                     return try ea.cacheName(arena, .{
                         .root_name = opts.root_name,
-                        .target = &opts.root_mod.resolved_target.result,
+                        .cpu_arch = target.cpu.arch,
+                        .os_tag = target.os.tag,
+                        .ofmt = target.ofmt,
+                        .abi = target.abi,
                         .output_mode = opts.config.output_mode,
                         .link_mode = opts.config.link_mode,
                         .version = opts.version,
@@ -1869,7 +1870,7 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
     const comp: *Compilation = comp: {
         // We put the `Compilation` itself in the arena. Freeing the arena will free the module.
         // It's initialized later after we prepare the initialization options.
-        const root_name = try arena.dupeZ(u8, options.root_name);
+        const root_name = try arena.dupeSentinel(u8, options.root_name, 0);
 
         // The "any" values provided by resolved config only account for
         // explicitly-provided settings. We now make them additionally account
@@ -2307,9 +2308,9 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
 
         if (opt_zcu) |zcu| {
             // Populate `zcu.module_roots`.
-            const pt: Zcu.PerThread = .activate(zcu, .main);
-            defer pt.deactivate();
-            pt.populateModuleRootTable() catch |err| switch (err) {
+            const active = zcu.acquire();
+            defer active.release();
+            active.pt.populateModuleRootTable() catch |err| switch (err) {
                 error.OutOfMemory => |e| return e,
                 error.IllegalZigImport => return diag.fail(.illegal_zig_import),
             };
@@ -2551,10 +2552,10 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
                         error.LibCInstallationMissingCrtDir => return diag.fail(.libc_installation_missing_crt_dir),
                     };
 
-                    const fields = @typeInfo(@TypeOf(paths)).@"struct".fields;
-                    try comp.oneshot_prelink_tasks.ensureUnusedCapacity(gpa, fields.len + 1);
-                    inline for (fields) |field| {
-                        if (@field(paths, field.name)) |path| {
+                    const field_names = @typeInfo(@TypeOf(paths)).@"struct".field_names;
+                    try comp.oneshot_prelink_tasks.ensureUnusedCapacity(gpa, field_names.len + 1);
+                    inline for (field_names) |field_name| {
+                        if (@field(paths, field_name)) |path| {
                             comp.oneshot_prelink_tasks.appendAssumeCapacity(.{ .load_object = path });
                         }
                     }
@@ -2869,8 +2870,8 @@ pub const UpdateError = error{
 
 /// Detect changes to source files, perform semantic analysis, and update the output files.
 pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateError!void {
-    const tracy_trace = trace(@src());
-    defer tracy_trace.end();
+    const tracy_frame = tracy.namedFrame(comp.root_name);
+    defer tracy_frame.end();
 
     const gpa = comp.gpa;
     const io = comp.io;
@@ -3007,10 +3008,19 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
 
     // For compiling C objects, we rely on the cache hash system to avoid duplicating work.
     // Add a Job for each C object.
-    try comp.c_object_work_queue.ensureUnusedCapacity(gpa, comp.c_object_table.count());
-    for (comp.c_object_table.keys()) |c_object| {
-        comp.c_object_work_queue.pushBackAssumeCapacity(c_object);
-        try comp.appendFileSystemInput(try .fromUnresolved(arena, comp.dirs, &.{c_object.src.src_path}));
+    if (comp.bin_file != null and comp.bin_file.?.post_prelink) {
+        assert(comp.config.incremental);
+        // TODO: this indicates that we are using incremental compilation and this is not the first
+        // incremental update. The incremental linkers do not (currently?) support updating C inputs
+        // incrementally. The frontend needs to learn to trigger a full rebuild if a C link input
+        // changes. For now, to avoid crashing the linker in this case, don't kick off C object
+        // updates if we've done prelink already. https://codeberg.org/ziglang/zig/issues/32081
+    } else {
+        try comp.c_object_work_queue.ensureUnusedCapacity(gpa, comp.c_object_table.count());
+        for (comp.c_object_table.keys()) |c_object| {
+            comp.c_object_work_queue.pushBackAssumeCapacity(c_object);
+            try comp.appendFileSystemInput(try .fromUnresolved(arena, comp.dirs, &.{c_object.src.src_path}));
+        }
     }
 
     for (comp.link_inputs) |input| if (input.path()) |path| {
@@ -3034,9 +3044,6 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
     }
 
     if (comp.zcu) |zcu| {
-        const pt: Zcu.PerThread = .activate(zcu, .main);
-        defer pt.deactivate();
-
         assert(zcu.cur_analysis_timer == null);
 
         zcu.skip_analysis_this_update = false;
@@ -3089,8 +3096,9 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
     try comp.performAllTheWork(main_progress_node, arena);
 
     if (comp.zcu) |zcu| {
-        const pt: Zcu.PerThread = .activate(zcu, .main);
-        defer pt.deactivate();
+        const active = zcu.acquire();
+        defer active.release();
+        const pt = active.pt;
 
         assert(zcu.cur_analysis_timer == null);
 
@@ -3141,9 +3149,7 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
     }
 
     switch (comp.cache_use) {
-        .none, .incremental => {
-            try flush(comp, arena, .main);
-        },
+        .none, .incremental => try flush(comp, arena),
         .whole => |whole| {
             if (comp.file_system_inputs) |buf| try man.populateFileSystemInputs(buf);
             if (comp.parent_whole_cache) |pwc| {
@@ -3224,7 +3230,7 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
                 };
             }
 
-            try flush(comp, arena, .main);
+            try flush(comp, arena);
 
             // Calling `flush` may have produced errors, in which case the
             // cache manifest must not be written.
@@ -3236,9 +3242,7 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
             }
 
             // Failure here only means an unnecessary cache miss.
-            man.writeManifest() catch |err| {
-                log.warn("failed to write cache manifest: {s}", .{@errorName(err)});
-            };
+            man.writeManifest() catch |err| log.warn("failed to write cache manifest: {t}", .{err});
 
             assert(whole.lock == null);
             whole.lock = man.toOwnedLock();
@@ -3317,12 +3321,12 @@ pub fn resolveEmitPathFlush(
     }
 }
 
-fn flush(comp: *Compilation, arena: Allocator, tid: Zcu.PerThread.Id) (Io.Cancelable || Allocator.Error)!void {
+fn flush(comp: *Compilation, arena: Allocator) (Io.Cancelable || Allocator.Error)!void {
     const io = comp.io;
+    const tid: Zcu.PerThread.Id = .acquire(io);
+    defer tid.release(io);
     if (comp.zcu) |zcu| {
         if (zcu.llvm_object) |llvm_object| {
-            const pt: Zcu.PerThread = .activate(zcu, tid);
-            defer pt.deactivate();
 
             // Emit the ZCU object from LLVM now; it's required to flush the output file.
             // If there's an output file, it wants to decide where the LLVM object goes!
@@ -3336,15 +3340,17 @@ fn flush(comp: *Compilation, arena: Allocator, tid: Zcu.PerThread.Id) (Io.Cancel
                 comp.time_report.?.stats.real_ns_llvm_emit = ns;
             };
 
-            llvm_object.emit(pt, .{
+            const zcu_obj_path: ?Cache.Path = if (comp.bin_file != null) p: {
+                break :p try comp.resolveEmitPathFlush(arena, .temp, llvm_object.out_bin_basename);
+            } else null;
+
+            const active = zcu.activate(tid);
+            defer active.deactivate();
+            llvm_object.emit(active.pt, .{
                 .pre_ir_path = comp.verbose_llvm_ir,
                 .pre_bc_path = comp.verbose_llvm_bc,
 
-                .bin_path = p: {
-                    const lf = comp.bin_file orelse break :p null;
-                    const p = try comp.resolveEmitPathFlush(arena, .temp, lf.zcu_object_basename.?);
-                    break :p try p.toStringZ(arena);
-                },
+                .bin_path = if (zcu_obj_path) |p| try p.toStringZ(arena) else null,
                 .asm_path = p: {
                     const raw = comp.emit_asm orelse break :p null;
                     const p = try comp.resolveEmitPathFlush(arena, .artifact, raw);
@@ -3368,9 +3374,20 @@ fn flush(comp: *Compilation, arena: Allocator, tid: Zcu.PerThread.Id) (Io.Cancel
                 .fuzz = comp.config.any_fuzz,
                 .lto = comp.config.lto,
             }) catch |err| switch (err) {
-                error.LinkFailure => {}, // Already reported.
+                error.AlreadyReported => {},
                 error.OutOfMemory => |e| return e,
             };
+
+            if (zcu_obj_path) |path| {
+                // Tell the linker backend about the ZCU object emitted by LLVM.
+                link.doPrelinkTask(comp, .{ .load_object = path });
+                // `link.Queue` has not called `prelink` because it knew we would want to send that
+                // final link input. It is *our* responsibility to call `prelink` now we're done.
+                comp.bin_file.?.prelink() catch |err| switch (err) {
+                    error.AlreadyReported => return,
+                    else => |e| return e,
+                };
+            }
         }
     }
     if (comp.bin_file) |lf| {
@@ -3382,7 +3399,7 @@ fn flush(comp: *Compilation, arena: Allocator, tid: Zcu.PerThread.Id) (Io.Cancel
         };
         // This is needed before reading the error flags.
         lf.flush(arena, tid, comp.link_prog_node) catch |err| switch (err) {
-            error.LinkFailure => {}, // Already reported.
+            error.AlreadyReported => return,
             error.OutOfMemory, error.Canceled => |e| return e,
         };
     }
@@ -3528,14 +3545,7 @@ fn addNonIncrementalStuffToCacheManifest(
     man.hash.addListOfBytes(opts.rpath_list);
     man.hash.addListOfBytes(opts.symbol_wrap_set.keys());
     if (comp.config.link_libc) {
-        man.hash.add(comp.libc_installation != null);
-        if (comp.libc_installation) |libc_installation| {
-            man.hash.addOptionalBytes(libc_installation.crt_dir);
-            if (target.abi == .msvc or target.abi == .itanium) {
-                man.hash.addOptionalBytes(libc_installation.msvc_lib_dir);
-                man.hash.addOptionalBytes(libc_installation.kernel32_lib_dir);
-            }
-        }
+        LibCInstallation.addToHash(comp.libc_installation, &man.hash, target.abi);
         man.hash.addOptionalBytes(target.dynamic_linker.get());
     }
     man.hash.add(opts.repro);
@@ -4054,7 +4064,7 @@ pub fn getAllErrorsAlloc(comp: *Compilation) error{OutOfMemory}!ErrorBundle {
             }
         }
         if (zcu.skip_analysis_this_update) break :zcu_errors;
-        var sorted_failed_analysis: std.AutoArrayHashMapUnmanaged(InternPool.AnalUnit, *Zcu.ErrorMsg).DataList.Slice = s: {
+        var sorted_failed_analysis: std.array_hash_map.Auto(InternPool.AnalUnit, *Zcu.ErrorMsg).DataList.Slice = s: {
             const SortOrder = struct {
                 zcu: *Zcu,
                 errors: []const *Zcu.ErrorMsg,
@@ -4350,7 +4360,7 @@ pub fn addModuleErrorMsg(
 
     // De-duplicate error notes. The main use case in mind for this is
     // too many "note: called from here" notes when eval branch quota is reached.
-    var notes: std.ArrayHashMapUnmanaged(ErrorBundle.ErrorMessage, void, ErrorNoteHashContext, true) = .empty;
+    var notes: std.array_hash_map.Custom(ErrorBundle.ErrorMessage, void, ErrorNoteHashContext, true) = .empty;
     defer notes.deinit(gpa);
 
     var last_note_loc: ?std.zig.Loc = null;
@@ -4490,13 +4500,11 @@ fn performAllTheWork(
 
     defer if (comp.zcu) |zcu| zcu.codegen_task_pool.cancel(zcu);
     if (comp.zcu) |zcu| {
-        const pt: Zcu.PerThread = .activate(zcu, .main);
-        defer {
-            pt.deactivate();
-            // Regardless of errors, `comp.zcu` needs to update its generation number.
-            zcu.generation += 1;
-        }
-        try pt.update(main_progress_node, &decl_work_timer);
+        // Regardless of errors, `comp.zcu` needs to update its generation number.
+        defer zcu.generation += 1;
+        const active = zcu.acquire();
+        defer active.release();
+        try active.pt.update(main_progress_node, &decl_work_timer);
     }
 
     comp.link_queue.finishZcuQueue(comp);
@@ -4675,49 +4683,49 @@ fn dispatchPrelinkWork(comp: *Compilation, main_progress_node: std.Progress.Node
         prelink_group.async(io, buildLibZigC, .{ comp, main_progress_node });
     }
 
-    for (0..@typeInfo(musl.CrtFile).@"enum".fields.len) |i| {
+    for (0..@typeInfo(musl.CrtFile).@"enum".field_names.len) |i| {
         if (comp.queued_jobs.musl_crt_file[i]) {
             const tag: musl.CrtFile = @enumFromInt(i);
             prelink_group.async(io, buildMuslCrtFile, .{ comp, tag, main_progress_node });
         }
     }
 
-    for (0..@typeInfo(glibc.CrtFile).@"enum".fields.len) |i| {
+    for (0..@typeInfo(glibc.CrtFile).@"enum".field_names.len) |i| {
         if (comp.queued_jobs.glibc_crt_file[i]) {
             const tag: glibc.CrtFile = @enumFromInt(i);
             prelink_group.async(io, buildGlibcCrtFile, .{ comp, tag, main_progress_node });
         }
     }
 
-    for (0..@typeInfo(freebsd.CrtFile).@"enum".fields.len) |i| {
+    for (0..@typeInfo(freebsd.CrtFile).@"enum".field_names.len) |i| {
         if (comp.queued_jobs.freebsd_crt_file[i]) {
             const tag: freebsd.CrtFile = @enumFromInt(i);
             prelink_group.async(io, buildFreeBSDCrtFile, .{ comp, tag, main_progress_node });
         }
     }
 
-    for (0..@typeInfo(netbsd.CrtFile).@"enum".fields.len) |i| {
+    for (0..@typeInfo(netbsd.CrtFile).@"enum".field_names.len) |i| {
         if (comp.queued_jobs.netbsd_crt_file[i]) {
             const tag: netbsd.CrtFile = @enumFromInt(i);
             prelink_group.async(io, buildNetBSDCrtFile, .{ comp, tag, main_progress_node });
         }
     }
 
-    for (0..@typeInfo(openbsd.CrtFile).@"enum".fields.len) |i| {
+    for (0..@typeInfo(openbsd.CrtFile).@"enum".field_names.len) |i| {
         if (comp.queued_jobs.openbsd_crt_file[i]) {
             const tag: openbsd.CrtFile = @enumFromInt(i);
             prelink_group.async(io, buildOpenBSDCrtFile, .{ comp, tag, main_progress_node });
         }
     }
 
-    for (0..@typeInfo(wasi_libc.CrtFile).@"enum".fields.len) |i| {
+    for (0..@typeInfo(wasi_libc.CrtFile).@"enum".field_names.len) |i| {
         if (comp.queued_jobs.wasi_libc_crt_file[i]) {
             const tag: wasi_libc.CrtFile = @enumFromInt(i);
             prelink_group.async(io, buildWasiLibcCrtFile, .{ comp, tag, main_progress_node });
         }
     }
 
-    for (0..@typeInfo(mingw.CrtFile).@"enum".fields.len) |i| {
+    for (0..@typeInfo(mingw.CrtFile).@"enum".field_names.len) |i| {
         if (comp.queued_jobs.mingw_crt_file[i]) {
             const tag: mingw.CrtFile = @enumFromInt(i);
             prelink_group.async(io, buildMingwCrtFile, .{ comp, tag, main_progress_node });
@@ -4823,7 +4831,7 @@ fn docsCopyFallible(comp: *Compilation) anyerror!void {
     var buffer: [1024]u8 = undefined;
     var tar_file_writer = tar_file.writer(io, &buffer);
 
-    var seen_table: std.AutoArrayHashMapUnmanaged(*Package.Module, []const u8) = .empty;
+    var seen_table: std.array_hash_map.Auto(*Package.Module, []const u8) = .empty;
     defer seen_table.deinit(comp.gpa);
 
     try seen_table.put(comp.gpa, zcu.main_mod, comp.root_name);
@@ -4928,8 +4936,8 @@ fn workerDocsWasmFallible(comp: *Compilation, prog_node: std.Progress.Node) SubU
     defer arena_allocator.deinit();
     const arena = arena_allocator.allocator();
 
-    const optimize_mode = std.builtin.OptimizeMode.ReleaseSmall;
-    const output_mode = std.builtin.OutputMode.Exe;
+    const optimize_mode = std.lang.OptimizeMode.ReleaseSmall;
+    const output_mode = std.lang.OutputMode.Exe;
     const resolved_target: Package.Module.ResolvedTarget = .{
         .result = std.zig.system.resolveTargetQuery(io, .{
             .cpu_arch = .wasm32,
@@ -5248,7 +5256,7 @@ fn workerUpdateCObject(
     progress_node: std.Progress.Node,
 ) void {
     comp.updateCObject(c_object, progress_node) catch |err| switch (err) {
-        error.AnalysisFail => return,
+        error.AlreadyReported => return,
         else => {
             comp.reportRetryableCObjectError(c_object, err) catch |oom| switch (oom) {
                 // Swallowing this error is OK because it's implied to be OOM when
@@ -5265,7 +5273,7 @@ fn workerUpdateWin32Resource(
     progress_node: std.Progress.Node,
 ) void {
     comp.updateWin32Resource(win32_resource, progress_node) catch |err| switch (err) {
-        error.AnalysisFail => return,
+        error.AlreadyReported => return,
         else => {
             comp.reportRetryableWin32ResourceError(win32_resource, err) catch |oom| switch (oom) {
                 // Swallowing this error is OK because it's implied to be OOM when
@@ -5285,8 +5293,8 @@ fn buildRt(
     comp: *Compilation,
     root_source_name: []const u8,
     root_name: []const u8,
-    output_mode: std.builtin.OutputMode,
-    link_mode: std.builtin.LinkMode,
+    output_mode: std.lang.OutputMode,
+    link_mode: std.lang.LinkMode,
     misc_task: MiscTask,
     prog_node: std.Progress.Node,
     options: RtOptions,
@@ -5488,7 +5496,7 @@ fn reportRetryableCObjectError(comp: *Compilation, c_object: *CObject, err: anye
     c_object.status = .failure_retryable;
 
     switch (comp.failCObj(c_object, "{t}", .{err})) {
-        error.AnalysisFail => return,
+        error.AlreadyReported => return,
         else => |e| return e,
     }
 }
@@ -6341,6 +6349,8 @@ fn addCommonCCArgs(
                 // LLVM doesn't distinguish between Solaris and illumos, but the illumos GCC fork
                 // defines this macro.
                 .illumos => try argv.append("__illumos__"),
+                // This macro has not yet been upstreamed by SerenityOS to Clang.
+                .serenity => try argv.append("__serenity__"),
                 // Homebrew targets without LLVM support; use communities's preferred macros.
                 .@"3ds" => try argv.append("-D__3DS__"),
                 .psp => try argv.append("-D__PSP__"),
@@ -6639,6 +6649,19 @@ pub fn addCCArgs(
         }
     }
 
+    if (target.cpu.arch.isPowerPC()) {
+        // We do not -- and probably never will -- support the IBM 128-bit `long double` format.
+        // LLVM and Clang also do not have complete support for it, producing wrong values in some
+        // cases. So just enforce IEEE `long double` everywhere - either binary64 or binary128
+        // depending on what the OS/ABI requires.
+        try argv.appendSlice(&.{
+            "-mabi=ieeelongdouble",
+            // Clang has some truly goofy logic for emitting warnings about the
+            // "current library" not supporting IEEE `long double`.
+            "-Wno-unsupported-abi",
+        });
+    }
+
     // We might want to support -mfloat-abi=softfp for Arm and CSKY here in the future.
     if (target_util.clangSupportsFloatAbiArg(target)) {
         const fabi = @tagName(target.abi.float());
@@ -6836,7 +6859,7 @@ fn failCObj(
     c_object: *CObject,
     comptime format: []const u8,
     args: anytype,
-) error{ OutOfMemory, AnalysisFail } {
+) error{ OutOfMemory, AlreadyReported } {
     @branchHint(.cold);
     const diag_bundle = blk: {
         const diag_bundle = try comp.gpa.create(CObject.Diag.Bundle);
@@ -6860,7 +6883,7 @@ fn failCObjWithOwnedDiagBundle(
     comp: *Compilation,
     c_object: *CObject,
     diag_bundle: *CObject.Diag.Bundle,
-) error{ OutOfMemory, AnalysisFail } {
+) error{ OutOfMemory, AlreadyReported } {
     @branchHint(.cold);
     assert(diag_bundle.diags.len > 0);
     {
@@ -6874,10 +6897,10 @@ fn failCObjWithOwnedDiagBundle(
         comp.failed_c_objects.putAssumeCapacityNoClobber(c_object, diag_bundle);
     }
     c_object.status = .failure;
-    return error.AnalysisFail;
+    return error.AlreadyReported;
 }
 
-fn failWin32Resource(comp: *Compilation, win32_resource: *Win32Resource, comptime format: []const u8, args: anytype) error{ OutOfMemory, AnalysisFail } {
+fn failWin32Resource(comp: *Compilation, win32_resource: *Win32Resource, comptime format: []const u8, args: anytype) error{ OutOfMemory, AlreadyReported } {
     @branchHint(.cold);
     var bundle: ErrorBundle.Wip = undefined;
     try bundle.init(comp.gpa);
@@ -6904,7 +6927,7 @@ fn failWin32ResourceWithOwnedBundle(
     comp: *Compilation,
     win32_resource: *Win32Resource,
     err_bundle: ErrorBundle,
-) error{ OutOfMemory, AnalysisFail } {
+) error{ OutOfMemory, AlreadyReported } {
     @branchHint(.cold);
     {
         const io = comp.io;
@@ -6913,7 +6936,7 @@ fn failWin32ResourceWithOwnedBundle(
         try comp.failed_win32_resources.putNoClobber(comp.gpa, win32_resource, err_bundle);
     }
     win32_resource.status = .failure;
-    return error.AnalysisFail;
+    return error.AlreadyReported;
 }
 
 pub const FileExt = enum {
@@ -7260,7 +7283,7 @@ fn dumpArgvWriter(w: *Io.Writer, argv: []const []const u8) Io.Writer.Error!void 
     try w.writeByte('\n');
 }
 
-pub fn getZigBackend(comp: Compilation) std.builtin.CompilerBackend {
+pub fn getZigBackend(comp: Compilation) std.lang.CompilerBackend {
     const target = &comp.root_mod.resolved_target.result;
     return target_util.zigBackend(target, comp.config.use_llvm);
 }
@@ -7302,8 +7325,8 @@ fn buildOutputFromZig(
     comp: *Compilation,
     src_basename: []const u8,
     root_name: []const u8,
-    output_mode: std.builtin.OutputMode,
-    link_mode: std.builtin.LinkMode,
+    output_mode: std.lang.OutputMode,
+    link_mode: std.lang.LinkMode,
     misc_task_tag: MiscTask,
     prog_node: std.Progress.Node,
     options: RtOptions,
@@ -7426,14 +7449,14 @@ fn buildOutputFromZig(
     assert(out.* == null);
     out.* = crt_file;
 
-    try comp.queuePrelinkTaskMode(crt_file.full_object_path, &config);
+    try comp.queuePrelinkTaskMode(crt_file.full_object_path, false, &config);
 }
 
 pub const CrtFileOptions = struct {
     function_sections: bool = true,
     data_sections: bool = true,
     omit_frame_pointer: ?bool = null,
-    unwind_tables: ?std.builtin.UnwindTables = null,
+    unwind_tables: ?std.lang.UnwindTables = null,
     pic: ?bool = null,
     no_builtin: ?bool = null,
 
@@ -7443,7 +7466,7 @@ pub const CrtFileOptions = struct {
 pub fn build_crt_file(
     comp: *Compilation,
     root_name: []const u8,
-    output_mode: std.builtin.OutputMode,
+    output_mode: std.lang.OutputMode,
     misc_task_tag: MiscTask,
     prog_node: std.Progress.Node,
     /// These elements have to get mutated to add the owner module after it is
@@ -7460,9 +7483,14 @@ pub fn build_crt_file(
     defer arena_allocator.deinit();
     const arena = arena_allocator.allocator();
 
+    const target = &comp.root_mod.resolved_target.result;
+
     const basename = try std.zig.binNameAlloc(gpa, .{
         .root_name = root_name,
-        .target = &comp.root_mod.resolved_target.result,
+        .cpu_arch = target.cpu.arch,
+        .os_tag = target.os.tag,
+        .ofmt = target.ofmt,
+        .abi = target.abi,
         .output_mode = output_mode,
     });
 
@@ -7560,7 +7588,7 @@ pub fn build_crt_file(
     try comp.updateSubCompilation(sub_compilation, misc_task_tag, prog_node);
 
     const crt_file = try sub_compilation.toCrtFile();
-    try comp.queuePrelinkTaskMode(crt_file.full_object_path, &config);
+    try comp.queuePrelinkTaskMode(crt_file.full_object_path, false, &config);
 
     {
         comp.mutex.lockUncancelable(io);
@@ -7570,12 +7598,14 @@ pub fn build_crt_file(
     }
 }
 
-pub fn queuePrelinkTaskMode(comp: *Compilation, path: Cache.Path, config: *const Compilation.Config) Io.Cancelable!void {
+/// If `must_link` is set, then static library inputs will have all member objects linked into the
+/// output, instead of only those required to resolve symbol references.
+pub fn queuePrelinkTaskMode(comp: *Compilation, path: Cache.Path, must_link: bool, config: *const Compilation.Config) Io.Cancelable!void {
     try comp.queuePrelinkTasks(switch (config.output_mode) {
         .Exe => unreachable,
         .Obj => &.{.{ .load_object = path }},
         .Lib => &.{switch (config.link_mode) {
-            .static => .{ .load_archive = path },
+            .static => .{ .load_archive = .{ .path = path, .must_link = must_link } },
             .dynamic => .{ .load_dso = path },
         }},
     });
@@ -7583,6 +7613,9 @@ pub fn queuePrelinkTaskMode(comp: *Compilation, path: Cache.Path, config: *const
 
 /// Only valid to call during `update`.
 pub fn queuePrelinkTasks(comp: *Compilation, tasks: []const link.PrelinkTask) Io.Cancelable!void {
+    if (tasks.len > 0) {
+        if (comp.bin_file) |lf| assert(!lf.post_prelink);
+    }
     comp.link_prog_node.increaseEstimatedTotalItems(tasks.len);
     try comp.link_queue.enqueuePrelink(comp, tasks);
 }
@@ -7655,7 +7688,7 @@ pub fn addLinkLib(comp: *Compilation, lib_name: []const u8) !void {
 
 /// This decides the optimization mode for all zig-provided libraries, including
 /// compiler-rt, libcxx, libc, libunwind, etc.
-pub fn compilerRtOptMode(comp: Compilation) std.builtin.OptimizeMode {
+pub fn compilerRtOptMode(comp: Compilation) std.lang.OptimizeMode {
     if (comp.debug_compiler_runtime_libs) |mode| {
         return mode;
     }

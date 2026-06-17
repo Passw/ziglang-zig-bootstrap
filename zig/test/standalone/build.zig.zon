@@ -171,9 +171,6 @@
         .run_output_paths = .{
             .path = "run_output_paths",
         },
-        .run_output_caching = .{
-            .path = "run_output_caching",
-        },
         .empty_global_error_set = .{
             .path = "empty_global_error_set",
         },
@@ -195,6 +192,9 @@
         },
         .debug_io_color = .{
             .path = "debug_io_color",
+        },
+        .elf2 = .{
+            .path = "elf2",
         },
     },
     .paths = .{

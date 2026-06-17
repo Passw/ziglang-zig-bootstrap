@@ -30,20 +30,19 @@ strings: std.HashMapUnmanaged(
 ),
 string_bytes: std.ArrayList(u8),
 image_section_table: std.ArrayList(Symbol.Index),
-pseudo_section_table: std.AutoArrayHashMapUnmanaged(String, Symbol.Index),
-object_section_table: std.AutoArrayHashMapUnmanaged(String, Symbol.Index),
+pseudo_section_table: std.array_hash_map.Auto(String, Symbol.Index),
+object_section_table: std.array_hash_map.Auto(String, Symbol.Index),
 symbol_table: std.ArrayList(Symbol),
-globals: std.AutoArrayHashMapUnmanaged(GlobalName, Symbol.Index),
+globals: std.array_hash_map.Auto(GlobalName, Symbol.Index),
 global_pending_index: u32,
-navs: std.AutoArrayHashMapUnmanaged(InternPool.Nav.Index, Symbol.Index),
-uavs: std.AutoArrayHashMapUnmanaged(InternPool.Index, Symbol.Index),
+navs: std.array_hash_map.Auto(InternPool.Nav.Index, Symbol.Index),
+uavs: std.array_hash_map.Auto(InternPool.Index, Symbol.Index),
 lazy: std.EnumArray(link.File.LazySymbol.Kind, struct {
-    map: std.AutoArrayHashMapUnmanaged(InternPool.Index, Symbol.Index),
+    map: std.array_hash_map.Auto(InternPool.Index, Symbol.Index),
     pending_index: u32,
 }),
-pending_uavs: std.AutoArrayHashMapUnmanaged(Node.UavMapIndex, struct {
+pending_uavs: std.array_hash_map.Auto(Node.UavMapIndex, struct {
     alignment: InternPool.Alignment,
-    src_loc: Zcu.LazySrcLoc,
 }),
 relocs: std.ArrayList(Reloc),
 const_prog_node: std.Progress.Node,
@@ -81,15 +80,31 @@ pub const msdos_stub: [120]u8 = .{
     0x00, 0x00, // Overlay number. Zero means this is the main executable.
 }
     // Reserved words.
-    ++ .{ 0x00, 0x00 } ** 4
-        // OEM-related fields.
+    ++ .{
+        0x00, 0x00,
+        0x00, 0x00,
+        0x00, 0x00,
+        0x00, 0x00,
+    }
+    // OEM-related fields.
     ++ .{
         0x00, 0x00, // OEM identifier.
         0x00, 0x00, // OEM information.
     }
     // Reserved words.
-    ++ .{ 0x00, 0x00 } ** 10
-        // Address of the PE header (a long). This matches the size of this entire MS-DOS stub, so that's the address of what's after this MS-DOS stub.
+    ++ .{
+        0x00, 0x00,
+        0x00, 0x00,
+        0x00, 0x00,
+        0x00, 0x00,
+        0x00, 0x00,
+        0x00, 0x00,
+        0x00, 0x00,
+        0x00, 0x00,
+        0x00, 0x00,
+        0x00, 0x00,
+    }
+    // Address of the PE header (a long). This matches the size of this entire MS-DOS stub, so that's the address of what's after this MS-DOS stub.
     ++ .{ 0x78, 0x00, 0x00, 0x00 }
     // What follows is a 16-bit x86 MS-DOS program of 7 instructions that prints the bytes after these instructions and then exits.
     ++ .{
@@ -232,7 +247,7 @@ pub const Node = union(enum) {
 
     pub const Tag = @typeInfo(Node).@"union".tag_type.?;
 
-    const known_count = @typeInfo(@TypeOf(known)).@"struct".fields.len;
+    const known_count = @typeInfo(@TypeOf(known)).@"struct".field_names.len;
     const known = known: {
         const Known = enum {
             file,
@@ -244,8 +259,9 @@ pub const Node = union(enum) {
             section_table,
         };
         var mut_known: std.enums.EnumFieldStruct(Known, MappedFile.Node.Index, null) = undefined;
-        for (@typeInfo(Known).@"enum".fields) |field|
-            @field(mut_known, field.name) = @enumFromInt(field.value);
+        const info = @typeInfo(Known).@"enum";
+        for (info.field_names, info.field_values) |field_name, field_value|
+            @field(mut_known, field_name) = @enumFromInt(field_value);
         break :known mut_known;
     };
 
@@ -256,7 +272,7 @@ pub const Node = union(enum) {
 
 pub const ImportTable = struct {
     ni: MappedFile.Node.Index,
-    entries: std.AutoArrayHashMapUnmanaged(void, Entry),
+    entries: std.array_hash_map.Auto(void, Entry),
 
     pub const Entry = struct {
         import_lookup_table_ni: MappedFile.Node.Index,
@@ -371,7 +387,7 @@ pub const Symbol = struct {
         text,
         _,
 
-        const known_count = @typeInfo(Index).@"enum".fields.len;
+        const known_count = @typeInfo(Index).@"enum".field_names.len;
 
         pub fn get(si: Symbol.Index, coff: *Coff) *Symbol {
             return &coff.symbol_table.items[@intFromEnum(si)];
@@ -1075,7 +1091,7 @@ fn computeNodeSectionOffset(coff: *Coff, ni: MappedFile.Node.Index) u32 {
     }
 }
 
-pub inline fn targetEndian(_: *const Coff) std.builtin.Endian {
+pub inline fn targetEndian(_: *const Coff) std.lang.Endian {
     return .little;
 }
 fn targetLoad(coff: *const Coff, ptr: anytype) @typeInfo(@TypeOf(ptr)).pointer.child {
@@ -1312,7 +1328,7 @@ pub fn getUavVAddr(
 
 pub fn getVAddr(coff: *Coff, reloc_info: link.File.RelocInfo, target_si: Symbol.Index) !u64 {
     try coff.addReloc(
-        @enumFromInt(reloc_info.parent.atom_index),
+        @enumFromInt(@intFromEnum(reloc_info.parent.atom_index)),
         reloc_info.offset,
         target_si,
         reloc_info.addend,
@@ -1508,18 +1524,15 @@ pub fn addReloc(
     target.target_relocs = ri;
 }
 
-pub fn prelink(coff: *Coff, prog_node: std.Progress.Node) void {
+pub fn prelink(coff: *Coff, prog_node: std.Progress.Node) link.Error!void {
     _ = coff;
     _ = prog_node;
 }
 
 pub fn updateNav(coff: *Coff, pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) !void {
     coff.updateNavInner(pt, nav_index) catch |err| switch (err) {
-        error.OutOfMemory,
-        error.Overflow,
-        error.RelocationNotByteAligned,
-        => |e| return e,
-        else => |e| return coff.base.cgFail(nav_index, "linker failed to update variable: {t}", .{e}),
+        else => |e| return e,
+        error.MappedFileIo => return coff.base.cgFail(nav_index, "linker failed to update variable: {t}", .{coff.mf.io_err.?}),
     };
 }
 fn updateNavInner(coff: *Coff, pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) !void {
@@ -1562,12 +1575,11 @@ fn updateNavInner(coff: *Coff, pt: Zcu.PerThread, nav_index: InternPool.Nav.Inde
         codegen.generateSymbol(
             &coff.base,
             pt,
-            zcu.navSrcLoc(nav_index),
             .fromInterned(nav.resolved.?.value),
             &nw.interface,
-            .{ .atom_index = @intFromEnum(si) },
+            .{ .atom_index = @enumFromInt(@intFromEnum(si)) },
         ) catch |err| switch (err) {
-            error.WriteFailed => return error.OutOfMemory,
+            error.WriteFailed => return nw.err.?,
             else => |e| return e,
         };
         si.get(coff).size = @intCast(nw.interface.end);
@@ -1598,8 +1610,7 @@ pub fn lowerUav(
     pt: Zcu.PerThread,
     uav_val: InternPool.Index,
     uav_align: InternPool.Alignment,
-    src_loc: Zcu.LazySrcLoc,
-) !codegen.SymbolResult {
+) !link.File.SymbolId {
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
 
@@ -1616,12 +1627,11 @@ pub fn lowerUav(
         } else {
             gop.value_ptr.* = .{
                 .alignment = uav_align,
-                .src_loc = src_loc,
             };
             coff.const_prog_node.increaseEstimatedTotalItems(1);
         }
     }
-    return .{ .sym_index = @intFromEnum(si) };
+    return @enumFromInt(@intFromEnum(si));
 }
 
 pub fn updateFunc(
@@ -1631,15 +1641,11 @@ pub fn updateFunc(
     mir: *const codegen.AnyMir,
 ) !void {
     coff.updateFuncInner(pt, func_index, mir) catch |err| switch (err) {
-        error.OutOfMemory,
-        error.Overflow,
-        error.RelocationNotByteAligned,
-        error.CodegenFail,
-        => |e| return e,
-        else => |e| return coff.base.cgFail(
+        else => |e| return e,
+        error.MappedFileIo => return coff.base.cgFail(
             pt.zcu.funcInfo(func_index).owner_nav,
-            "linker failed to update function: {s}",
-            .{@errorName(e)},
+            "linker failed to update function: {t}",
+            .{coff.mf.io_err.?},
         ),
     };
 }
@@ -1697,9 +1703,8 @@ fn updateFuncInner(
     codegen.emitFunction(
         &coff.base,
         pt,
-        zcu.navSrcLoc(func.owner_nav),
         func_index,
-        @intFromEnum(si),
+        @enumFromInt(@intFromEnum(si)),
         mir,
         &nw.interface,
         .none,
@@ -1716,9 +1721,11 @@ pub fn updateErrorData(coff: *Coff, pt: Zcu.PerThread) !void {
         .kind = .const_data,
         .index = @intCast(coff.lazy.getPtr(.const_data).map.getIndex(.anyerror_type) orelse return),
     }) catch |err| switch (err) {
-        error.OutOfMemory => |e| return e,
-        error.CodegenFail => return error.LinkFailure,
-        else => |e| return coff.base.comp.link_diags.fail("updateErrorData failed {t}", .{e}),
+        else => |e| return e,
+        error.MappedFileIo => return coff.base.comp.link_diags.fail(
+            "updateErrorData failed: {t}",
+            .{coff.mf.io_err.?},
+        ),
     };
 }
 
@@ -1763,12 +1770,11 @@ pub fn idle(coff: *Coff, tid: Zcu.PerThread.Id) !bool {
                 .{ .zcu = comp.zcu.?, .tid = tid },
                 pending_uav.key,
                 pending_uav.value.alignment,
-                pending_uav.value.src_loc,
             ) catch |err| switch (err) {
-                error.OutOfMemory => |e| return e,
-                else => |e| return comp.link_diags.fail(
+                else => |e| return e,
+                error.MappedFileIo => return comp.link_diags.fail(
                     "linker failed to lower constant: {t}",
-                    .{e},
+                    .{coff.mf.io_err.?},
                 ),
             };
             break :task;
@@ -1783,10 +1789,10 @@ pub fn idle(coff: *Coff, tid: Zcu.PerThread.Id) !bool {
             );
             defer sub_prog_node.end();
             coff.flushGlobal(pt, gmi) catch |err| switch (err) {
-                error.OutOfMemory => |e| return e,
-                else => |e| return comp.link_diags.fail(
+                else => |e| return e,
+                error.MappedFileIo => return comp.link_diags.fail(
                     "linker failed to lower constant: {t}",
-                    .{e},
+                    .{coff.mf.io_err.?},
                 ),
             };
             break :task;
@@ -1810,10 +1816,10 @@ pub fn idle(coff: *Coff, tid: Zcu.PerThread.Id) !bool {
             );
             defer sub_prog_node.end();
             coff.flushLazy(pt, lmr) catch |err| switch (err) {
-                error.OutOfMemory => |e| return e,
-                else => |e| return comp.link_diags.fail(
+                else => |e| return e,
+                error.MappedFileIo => return comp.link_diags.fail(
                     "linker failed to lower lazy {s}: {t}",
-                    .{ kind, e },
+                    .{ kind, coff.mf.io_err.? },
                 ),
             };
             break :task;
@@ -1868,7 +1874,6 @@ fn flushUav(
     pt: Zcu.PerThread,
     umi: Node.UavMapIndex,
     uav_align: InternPool.Alignment,
-    src_loc: Zcu.LazySrcLoc,
 ) !void {
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
@@ -1911,12 +1916,11 @@ fn flushUav(
     codegen.generateSymbol(
         &coff.base,
         pt,
-        src_loc,
         .fromInterned(uav_val),
         &nw.interface,
-        .{ .atom_index = @intFromEnum(si) },
+        .{ .atom_index = @enumFromInt(@intFromEnum(si)) },
     ) catch |err| switch (err) {
-        error.WriteFailed => return error.OutOfMemory,
+        error.WriteFailed => return nw.err.?,
         else => |e| return e,
     };
     si.get(coff).size = @intCast(nw.interface.end);
@@ -2122,16 +2126,18 @@ fn flushLazy(coff: *Coff, pt: Zcu.PerThread, lmr: Node.LazyMapRef) !void {
     var nw: MappedFile.Node.Writer = undefined;
     ni.writer(&coff.mf, gpa, &nw);
     defer nw.deinit();
-    try codegen.generateLazySymbol(
+    codegen.generateLazySymbol(
         &coff.base,
         pt,
-        Type.fromInterned(lazy.ty).srcLocOrNull(pt.zcu) orelse .unneeded,
         lazy,
         &required_alignment,
         &nw.interface,
         .none,
-        .{ .atom_index = @intFromEnum(si) },
-    );
+        .{ .atom_index = @enumFromInt(@intFromEnum(si)) },
+    ) catch |err| switch (err) {
+        error.WriteFailed => return nw.err.?,
+        else => |e| return e,
+    };
     si.get(coff).size = @intCast(nw.interface.end);
     si.applyLocationRelocs(coff);
 }
@@ -2298,17 +2304,6 @@ pub fn updateExports(
     exported: Zcu.Exported,
     export_indices: []const Zcu.Export.Index,
 ) !void {
-    return coff.updateExportsInner(pt, exported, export_indices) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.LinkFailure => error.AnalysisFail,
-    };
-}
-fn updateExportsInner(
-    coff: *Coff,
-    pt: Zcu.PerThread,
-    exported: Zcu.Exported,
-    export_indices: []const Zcu.Export.Index,
-) !void {
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
     const ip = &zcu.intern_pool;
@@ -2323,18 +2318,11 @@ fn updateExportsInner(
     try coff.symbol_table.ensureUnusedCapacity(gpa, export_indices.len);
     const exported_si: Symbol.Index = switch (exported) {
         .nav => |nav| try coff.navSymbol(zcu, nav),
-        .uav => |uav| @enumFromInt(switch (try coff.lowerUav(
+        .uav => |uav| @enumFromInt(@intFromEnum(try coff.lowerUav(
             pt,
             uav,
             Type.fromInterned(ip.typeOf(uav)).abiAlignment(zcu),
-            export_indices[0].ptr(zcu).src,
-        )) {
-            .sym_index => |si| si,
-            .fail => |em| {
-                defer em.destroy(gpa);
-                return coff.base.comp.link_diags.fail("{s}", .{em.msg});
-            },
-        }),
+        ))),
     };
     while (try coff.idle(pt.tid)) {}
     const exported_ni = exported_si.node(coff);

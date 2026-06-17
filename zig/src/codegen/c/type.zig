@@ -249,6 +249,7 @@ pub const CType = union(enum) {
                 .null,
                 .enum_literal,
                 .@"opaque",
+                .spirv,
                 .noreturn,
                 .void,
                 => return .void,
@@ -512,7 +513,7 @@ pub const CType = union(enum) {
             },
         }
     }
-    fn classifyBitInt(signedness: std.builtin.Signedness, bits: u16, zcu: *const Zcu) IntClass {
+    fn classifyBitInt(signedness: std.lang.Signedness, bits: u16, zcu: *const Zcu) IntClass {
         const is_ez80 = zcu.getTarget().cpu.arch == .ez80;
         return switch (bits) {
             0 => .void,
@@ -571,30 +572,30 @@ pub const CType = union(enum) {
     pub const Dependencies = struct {
         /// Key is any Zig type which corresponds to a C `struct`, `union`, or `typedef`. That C
         /// type must be declared and complete.
-        type: std.AutoArrayHashMapUnmanaged(InternPool.Index, void),
+        type: std.array_hash_map.Auto(InternPool.Index, void),
 
         /// Key is a Zig type which is the *payload* of an error union. The C `struct` type
         /// corresponding to such an error union must be declared and complete.
         ///
         /// These are separate from `type` to avoid redundant types for every different error set
         /// used with the same payload type---for instance a different C type for every `E!void`.
-        errunion_type: std.AutoArrayHashMapUnmanaged(InternPool.Index, void),
+        errunion_type: std.array_hash_map.Auto(InternPool.Index, void),
 
         /// Like `type`, but the type does not necessarily need to be completed yet: a forward
         /// declaration is sufficient.
-        type_fwd: std.AutoArrayHashMapUnmanaged(InternPool.Index, void),
+        type_fwd: std.array_hash_map.Auto(InternPool.Index, void),
 
         /// Like `errunion_type`, but the type does not necessarily need to be completed yet: a
         /// forward declaration is sufficient.
-        errunion_type_fwd: std.AutoArrayHashMapUnmanaged(InternPool.Index, void),
+        errunion_type_fwd: std.array_hash_map.Auto(InternPool.Index, void),
 
         /// Key is a Zig type; value is a bitmask of alignments. For every bit which is set, an
         /// aligned typedef is required. For instance, if bit 3 is set, the C type 'aligned__8_foo'
         /// must be declared through `typedef` (but not necessarily completed yet).
-        aligned_type_fwd: std.AutoArrayHashMapUnmanaged(InternPool.Index, u64),
+        aligned_type_fwd: std.array_hash_map.Auto(InternPool.Index, u64),
 
         /// Key specifies a big-int type whose C `struct` must be declared and complete.
-        bigint: std.AutoArrayHashMapUnmanaged(BigInt, void),
+        bigint: std.array_hash_map.Auto(BigInt, void),
 
         pub const empty: Dependencies = .{
             .type = .empty,
@@ -865,6 +866,7 @@ pub const CType = union(enum) {
             switch (ty.zigTypeTag(zcu)) {
                 .frame => unreachable,
                 .@"anyframe" => unreachable,
+                .spirv => unreachable,
 
                 .type => try w.writeAll("type"),
                 .void => try w.writeAll("void"),
@@ -988,6 +990,7 @@ pub const CType = union(enum) {
             .anyframe_type,
             .simple_type,
             .opaque_type,
+            .spirv_type,
             .error_set_type,
             .inferred_error_set_type,
             => true,

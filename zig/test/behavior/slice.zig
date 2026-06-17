@@ -67,6 +67,7 @@ test "comptime slice of undefined pointer of length 0" {
 
 test "implicitly cast array of size 0 to slice" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     var msg = [_]u8{};
     try assertLenIsZero(&msg);
@@ -172,6 +173,7 @@ test "pass a slice of types to a function" {
 
 test "generic malloc free" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const a = memAlloc(u8, 10) catch unreachable;
     memFree(u8, a);
@@ -210,6 +212,8 @@ test "comptime slice of pointer preserves comptime var" {
 }
 
 test "comptime pointer cast array and then slice" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const array = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
 
     const ptrA: [*]const u8 = @as([*]const u8, @ptrCast(&array));
@@ -276,6 +280,7 @@ test "slice string literal has correct type" {
 
 test "result location zero sized array inside struct field implicit cast to slice" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const E = struct {
         entries: []u32,
@@ -314,7 +319,7 @@ test "C pointer slice access" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
-    var buf: [10]u32 = [1]u32{42} ** 10;
+    var buf: [10]u32 = @splat(42);
     const c_ptr = @as([*c]const u32, @ptrCast(&buf));
 
     var runtime_zero: usize = 0;
@@ -382,15 +387,17 @@ test "obtaining a null terminated slice" {
 }
 
 test "empty array to slice" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const S = struct {
         fn doTheTest() !void {
             const empty: []align(16) u8 = &[_]u8{};
             const align_1: []align(1) u8 = empty;
             const align_4: []align(4) u8 = empty;
             const align_16: []align(16) u8 = empty;
-            try expect(1 == @typeInfo(@TypeOf(align_1)).pointer.alignment);
-            try expect(4 == @typeInfo(@TypeOf(align_4)).pointer.alignment);
-            try expect(16 == @typeInfo(@TypeOf(align_16)).pointer.alignment);
+            try expect(1 == @typeInfo(@TypeOf(align_1)).pointer.attrs.@"align");
+            try expect(4 == @typeInfo(@TypeOf(align_4)).pointer.attrs.@"align");
+            try expect(16 == @typeInfo(@TypeOf(align_16)).pointer.attrs.@"align");
         }
     };
 
@@ -768,16 +775,6 @@ test "array concat of slices gives ptr to array" {
     }
 }
 
-test "array mult of slice gives ptr to array" {
-    comptime {
-        var a: []const u8 = "aoeu";
-        _ = &a;
-        const c = a ** 2;
-        try expect(std.mem.eql(u8, c, "aoeuaoeu"));
-        try expect(@TypeOf(c) == *const [8]u8);
-    }
-}
-
 test "slice bounds in comptime concatenation" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
@@ -796,6 +793,8 @@ test "slice bounds in comptime concatenation" {
 }
 
 test "slice sentinel access at comptime" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     {
         const str0 = &[_:0]u8{ '1', '2', '3' };
         const slice0: [:0]const u8 = str0;
@@ -862,6 +861,8 @@ test "slice len modification at comptime" {
 }
 
 test "slice field ptr const" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const const_slice: []const u8 = "string";
 
     const const_ptr_const_slice = &const_slice;
@@ -875,6 +876,7 @@ test "slice field ptr const" {
 
 test "slice field ptr var" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     var var_slice: []const u8 = "string";
 
@@ -1060,6 +1062,8 @@ test "peer slices keep abi alignment with empty struct" {
 }
 
 test "sentinel expression in slice operation has result type" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const sentinel = std.math.maxInt(u16);
 
     const arr: [3]u16 = .{ 1, 2, sentinel };

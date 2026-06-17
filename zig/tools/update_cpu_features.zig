@@ -1507,7 +1507,7 @@ const targets = [_]ArchTarget{
             },
             .{
                 .zig_name = "variable_pointers",
-                .desc = "Enable SPV_KHR_physical_storage_buffer extension and the PhysicalStorageBufferAddresses capability",
+                .desc = "Enable SPV_KHR_variable_pointers extension and the VariablePointers capability",
                 .deps = &.{"v1_0"},
             },
         },
@@ -1547,6 +1547,103 @@ const targets = [_]ArchTarget{
                 .llvm_name = null,
                 .zig_name = "baseline_rv64",
                 .features = &.{ "64bit", "a", "c", "d", "f", "i", "m" },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "spacemit_a100",
+                .features = &.{
+                    "64bit",
+                    "a",
+                    "b",
+                    "c",
+                    "dlen_factor_2",
+                    "i",
+                    "m",
+                    "optimized_nf2_segment_load_store",
+                    "optimized_nf3_segment_load_store",
+                    "optimized_nf4_segment_load_store",
+                    "smepmp",
+                    "smnpm",
+                    "smstateen",
+                    "ssccptr",
+                    "sscofpmf",
+                    "sscounterenw",
+                    "ssnpm",
+                    "sspm",
+                    "sstc",
+                    "sstvala",
+                    "sstvecd",
+                    "ssu64xl",
+                    "supm",
+                    "svade",
+                    "svbare",
+                    "svinval",
+                    "svnapot",
+                    "svpbmt",
+                    "unaligned_scalar_mem",
+                    "v",
+                    "vxrm_pipeline_flush",
+                    "za64rs",
+                    "zawrs",
+                    "zbc",
+                    "zbkc",
+                    "zcb",
+                    "zcmop",
+                    "zfa",
+                    "zfh",
+                    "zic64b",
+                    "zicbom",
+                    "zicbop",
+                    "zicboz",
+                    "ziccamoa",
+                    "ziccif",
+                    "zicclsm",
+                    "ziccrse",
+                    "zicntr",
+                    "zicond",
+                    "zifencei",
+                    "zihintntl",
+                    "zihintpause",
+                    "zihpm",
+                    "zimop",
+                    "zkt",
+                    "zvbb",
+                    "zvfbfwma",
+                    "zvfh",
+                    "zvkng",
+                    "zvknha",
+                    "zvksc",
+                    "zvksg",
+                    "zvl1024b",
+                },
+            },
+            .{
+                .llvm_name = null,
+                .zig_name = "spacemit_x100",
+                .features = &.{
+                    "dlen_factor_2",
+                    "optimized_nf2_segment_load_store",
+                    "optimized_nf3_segment_load_store",
+                    "optimized_nf4_segment_load_store",
+                    "rva23s64",
+                    "smepmp",
+                    "smnpm",
+                    "smstateen",
+                    "sspm",
+                    "unaligned_scalar_mem",
+                    "vxrm_pipeline_flush",
+                    "xsmtvdot",
+                    "zbc",
+                    "zbkc",
+                    "zfh",
+                    "zvfbfwma",
+                    "zvfh",
+                    "zvkng",
+                    "zvknha",
+                    "zvksc",
+                    "zvksg",
+                    "zvl256b",
+                },
             },
         },
     },
@@ -2010,7 +2107,9 @@ const Job = struct {
 };
 
 fn processOneTarget(io: Io, job: Job) void {
-    errdefer |err| std.debug.panic("panic: {s}", .{@errorName(err)});
+    processOneTargetInner(io, job) catch |err| std.debug.panic("panic: {s}", .{@errorName(err)});
+}
+fn processOneTargetInner(io: Io, job: Job) !void {
     const target = job.target;
 
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -2337,7 +2436,7 @@ fn processOneTarget(io: Io, job: Job) void {
         try w.print("    @setEvalBranchQuota({d});\n", .{branch_quota});
     }
     try w.writeAll(
-        \\    const len = @typeInfo(Feature).@"enum".fields.len;
+        \\    const len = @typeInfo(Feature).@"enum".field_names.len;
         \\    std.debug.assert(len <= CpuFeature.Set.needed_bit_count);
         \\    var result: [len]CpuFeature = undefined;
         \\
@@ -2406,7 +2505,7 @@ fn processOneTarget(io: Io, job: Job) void {
         \\    const ti = @typeInfo(Feature);
         \\    for (&result, 0..) |*elem, i| {
         \\        elem.index = i;
-        \\        elem.name = ti.@"enum".fields[i].name;
+        \\        elem.name = ti.@"enum".field_names[i];
         \\    }
         \\    break :blk result;
         \\};

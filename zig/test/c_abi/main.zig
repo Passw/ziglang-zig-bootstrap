@@ -15,8 +15,8 @@ const have_i128 = builtin.cpu.arch != .x86 and !builtin.cpu.arch.isArm() and
     builtin.cpu.arch != .hexagon and
     builtin.cpu.arch != .s390x; // https://github.com/llvm/llvm-project/issues/168460
 
-const have_f128 = builtin.cpu.arch.isWasm() or (builtin.cpu.arch.isX86() and !builtin.os.tag.isDarwin());
-const have_f80 = builtin.cpu.arch.isX86();
+const have_f128 = builtin.cpu.arch.isWasm() or (builtin.cpu.arch.isX86() and !builtin.os.tag.isDarwin() and builtin.abi != .msvc);
+const have_f80 = builtin.cpu.arch.isX86() and builtin.abi != .msvc;
 
 extern fn run_c_tests() void;
 
@@ -291,6 +291,7 @@ test "C ABI struct u8" {
     if (builtin.cpu.arch.isMIPS64()) return error.SkipZigTest;
     if (builtin.cpu.arch.isPowerPC32()) return error.SkipZigTest;
     if (builtin.cpu.arch == .s390x) return error.SkipZigTest;
+    if (builtin.cpu.arch == .x86 and builtin.os.tag == .windows) return error.SkipZigTest;
 
     const s = c_ret_struct_u8();
     try expect(s.a == 4);
@@ -318,6 +319,7 @@ test "C ABI struct u16" {
     if (builtin.cpu.arch.isMIPS64()) return error.SkipZigTest;
     if (builtin.cpu.arch.isPowerPC32()) return error.SkipZigTest;
     if (builtin.cpu.arch == .s390x) return error.SkipZigTest;
+    if (builtin.cpu.arch == .x86 and builtin.os.tag == .windows) return error.SkipZigTest;
 
     const s = c_ret_struct_u16();
     try expect(s.a == 10);
@@ -345,6 +347,7 @@ test "C ABI struct u32" {
     if (builtin.cpu.arch.isMIPS64()) return error.SkipZigTest;
     if (builtin.cpu.arch.isPowerPC32()) return error.SkipZigTest;
     if (builtin.cpu.arch == .s390x) return error.SkipZigTest;
+    if (builtin.cpu.arch == .x86 and builtin.os.tag == .windows) return error.SkipZigTest;
 
     const s = c_ret_struct_u32();
     try expect(s.a == 16);
@@ -372,6 +375,7 @@ test "C ABI struct u64" {
     if (builtin.cpu.arch.isPowerPC32()) return error.SkipZigTest;
     if (builtin.cpu.arch == .riscv32) return error.SkipZigTest;
     if (builtin.cpu.arch == .s390x) return error.SkipZigTest;
+    if (builtin.cpu.arch == .x86 and builtin.os.tag == .windows) return error.SkipZigTest;
 
     const s = c_ret_struct_u64();
     try expect(s.a == 22);
@@ -485,6 +489,7 @@ test "C ABI struct f32" {
     if (builtin.cpu.arch.isMIPS64()) return error.SkipZigTest;
     if (builtin.cpu.arch.isPowerPC32()) return error.SkipZigTest;
     if (builtin.cpu.arch == .s390x) return error.SkipZigTest;
+    if (builtin.cpu.arch == .x86 and builtin.os.tag == .windows) return error.SkipZigTest;
 
     const s = c_ret_struct_f32();
     try expect(s.a == 2.5);
@@ -513,6 +518,7 @@ test "C ABI struct f64" {
     if (builtin.cpu.arch.isArm() and builtin.abi.float() == .soft) return error.SkipZigTest;
     if (builtin.cpu.arch == .riscv32) return error.SkipZigTest;
     if (builtin.cpu.arch == .s390x) return error.SkipZigTest;
+    if (builtin.cpu.arch == .x86 and builtin.os.tag == .windows) return error.SkipZigTest;
 
     const s = c_ret_struct_f64();
     try expect(s.a == 2.5);
@@ -705,6 +711,7 @@ test "C ABI struct i32 i32" {
     if (builtin.cpu.arch == .riscv32) return error.SkipZigTest;
     if (builtin.cpu.arch.isLoongArch()) return error.SkipZigTest;
     if (builtin.cpu.arch == .s390x) return error.SkipZigTest;
+    if (builtin.cpu.arch == .x86 and builtin.os.tag == .windows) return error.SkipZigTest;
 
     const s: Struct_i32_i32 = .{
         .a = 1,
@@ -5681,6 +5688,7 @@ test "C ABI pointer sized float struct" {
     if (builtin.cpu.arch.isArm() and builtin.abi.float() == .soft) return error.SkipZigTest;
     if (builtin.cpu.arch.isLoongArch() and builtin.abi.float() == .soft) return error.SkipZigTest;
     if (builtin.cpu.arch == .s390x) return error.SkipZigTest;
+    if (builtin.cpu.arch == .x86 and builtin.os.tag == .windows) return error.SkipZigTest;
 
     c_ptr_size_float_struct(.{ .x = 1, .y = 2 });
 
@@ -5812,6 +5820,7 @@ test "PD: Zig passes to C" {
     if (builtin.cpu.arch.isLoongArch()) return error.SkipZigTest;
     if (builtin.cpu.arch == .hexagon) return error.SkipZigTest;
     if (builtin.cpu.arch == .s390x) return error.SkipZigTest;
+    if (builtin.cpu.arch == .x86 and builtin.os.tag == .windows) return error.SkipZigTest;
     try expectOk(c_assert_PD(.{ .v1 = null, .v2 = 0.5 }));
 }
 test "PD: Zig returns to C" {
@@ -5827,6 +5836,7 @@ test "PD: C passes to Zig" {
     if (builtin.cpu.arch.isLoongArch()) return error.SkipZigTest;
     if (builtin.cpu.arch == .hexagon) return error.SkipZigTest;
     if (builtin.cpu.arch == .s390x) return error.SkipZigTest;
+    if (builtin.cpu.arch == .x86 and builtin.os.tag == .windows) return error.SkipZigTest;
     try expectOk(c_send_PD());
 }
 test "PD: C returns to Zig" {
@@ -5936,6 +5946,7 @@ test "f16 struct" {
     if (builtin.target.cpu.arch.isPowerPC32()) return error.SkipZigTest;
     if (builtin.cpu.arch.isArm() and builtin.mode != .Debug) return error.SkipZigTest;
     if (builtin.cpu.arch == .s390x) return error.SkipZigTest;
+    if (builtin.cpu.arch == .x86 and builtin.os.tag == .windows) return error.SkipZigTest;
 
     const a = c_f16_struct(.{ .a = 12 });
     try expect(a.a == 34);
@@ -6045,6 +6056,7 @@ test "Stdcall ABI structs" {
     if (builtin.cpu.arch.isLoongArch()) return error.SkipZigTest;
     if (builtin.cpu.arch == .hexagon) return error.SkipZigTest;
     if (builtin.cpu.arch == .s390x) return error.SkipZigTest;
+    if (builtin.cpu.arch == .x86 and builtin.os.tag == .windows) return error.SkipZigTest;
 
     const res = stdcall_coord2(
         .{ .x = 0x1111, .y = 0x2222 },
@@ -6075,7 +6087,7 @@ test "Stdcall ABI big union" {
 }
 
 extern fn c_explict_win64(ByRef) callconv(.{ .x86_64_win = .{} }) ByRef;
-test "explicit SysV calling convention" {
+test "explicit Win64 calling convention" {
     if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
 
     const res = c_explict_win64(.{ .val = 1, .arr = undefined });
@@ -6083,7 +6095,7 @@ test "explicit SysV calling convention" {
 }
 
 extern fn c_explict_sys_v(ByRef) callconv(.{ .x86_64_sysv = .{} }) ByRef;
-test "explicit Win64 calling convention" {
+test "explicit SysV calling convention" {
     if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
 
     const res = c_explict_sys_v(.{ .val = 1, .arr = undefined });
@@ -6146,4 +6158,139 @@ test "byval tail callsite attribute" {
         .size = .{ .width = 3, .height = 4 },
     };
     try expect(v.run() == 3.0);
+}
+
+test "x86 fastcall calling convention" {
+    if (builtin.cpu.arch != .x86) return error.SkipZigTest;
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.abi != .msvc) return error.SkipZigTest;
+
+    const static = struct {
+        const fastcall: std.builtin.CallingConvention = .{ .x86_fastcall = .{} };
+
+        extern fn c_fastcall_check(a: c_int, b: f32, c: *anyopaque, d: f64, e: c_int) callconv(fastcall) void;
+        export fn zig_fastcall_check(a: c_int, b: f32, c: *anyopaque, d: f64, e: c_int) callconv(fastcall) void {
+            if (a != 1) @panic("test failure");
+            if (b != 2.0) @panic("test failure");
+            if (@intFromPtr(c) != 3) @panic("test failure");
+            if (d != 4.0) @panic("test failure");
+            if (e != 5) @panic("test failure");
+        }
+
+        const SRet = extern struct {
+            a: i32,
+            b: i32,
+            c: i32,
+        };
+        extern fn c_fastcall_sret() callconv(fastcall) SRet;
+        export fn zig_fastcall_sret() callconv(fastcall) SRet {
+            return .{
+                .a = 1,
+                .b = 2,
+                .c = 3,
+            };
+        }
+
+        const NoSRet = extern struct {
+            a: i8,
+            b: i16,
+        };
+        extern fn c_fastcall_no_sret() callconv(fastcall) NoSRet;
+        export fn zig_fastcall_no_sret() callconv(fastcall) NoSRet {
+            return .{
+                .a = 1,
+                .b = 2,
+            };
+        }
+
+        const NoSRetF32F32 = extern struct {
+            a: f32,
+            b: f32,
+        };
+        extern fn c_fastcall_no_sret_f32_f32() callconv(fastcall) NoSRetF32F32;
+        export fn zig_fastcall_no_sret_f32_f32() callconv(fastcall) NoSRetF32F32 {
+            return .{
+                .a = 1,
+                .b = 2,
+            };
+        }
+
+        const NoSRetF64 = extern struct {
+            a: f64,
+        };
+        extern fn c_fastcall_no_sret_f64() callconv(fastcall) NoSRetF64;
+        export fn zig_fastcall_no_sret_f64() callconv(fastcall) NoSRetF64 {
+            return .{
+                .a = 1,
+            };
+        }
+
+        extern fn c_fastcall_ret_f32() callconv(fastcall) f32;
+        export fn zig_fastcall_ret_f32() callconv(fastcall) f32 {
+            return 1;
+        }
+
+        extern fn c_fastcall_ret_f64() callconv(fastcall) f64;
+        export fn zig_fastcall_ret_f64() callconv(fastcall) f64 {
+            return 1;
+        }
+
+        extern fn run_c_fastcall_tests() void;
+    };
+
+    static.c_fastcall_check(1, 2.0, @ptrFromInt(3), 4.0, 5);
+
+    {
+        const s = static.c_fastcall_sret();
+        try expect(s.a == 1);
+        try expect(s.b == 2);
+        try expect(s.c == 3);
+    }
+    {
+        const s = static.c_fastcall_no_sret();
+        try expect(s.a == 1);
+        try expect(s.b == 2);
+    }
+    {
+        const s = static.c_fastcall_no_sret_f32_f32();
+        try expect(s.a == 1);
+        try expect(s.b == 2);
+    }
+    {
+        const s = static.c_fastcall_no_sret_f64();
+        try expect(s.a == 1);
+    }
+    {
+        const s = static.c_fastcall_ret_f32();
+        try expect(s == 1);
+    }
+    {
+        const s = static.c_fastcall_ret_f64();
+        try expect(s == 1);
+    }
+
+    static.run_c_fastcall_tests();
+}
+
+test "x86 vectorcall calling convention" {
+    if (builtin.cpu.arch != .x86) return error.SkipZigTest;
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.abi != .msvc) return error.SkipZigTest;
+
+    const static = struct {
+        extern fn c_vectorcall_check(a: c_int, b: f32, c: f64, d: *anyopaque, e: f32, f: f64, g: f64, h: f32, i: f32, j: c_int) callconv(.{ .x86_vectorcall = .{} }) void;
+        export fn zig_vectorcall_check(a: c_int, b: f32, c: f64, d: *anyopaque, e: f32, f: f64, g: f64, h: f32, i: f32, j: c_int) callconv(.{ .x86_vectorcall = .{} }) void {
+            if (a != 1) @panic("test failure");
+            if (b != 2.0) @panic("test failure");
+            if (c != 3.0) @panic("test failure");
+            if (@intFromPtr(d) != 4) @panic("test failure");
+            if (e != 5.0) @panic("test failure");
+            if (f != 6.0) @panic("test failure");
+            if (g != 7.0) @panic("test failure");
+            if (h != 8.0) @panic("test failure");
+            if (i != 9.0) @panic("test failure");
+            if (j != 10) @panic("test failure");
+        }
+    };
+    static.c_vectorcall_check(1, 2.0, 3.0, @ptrFromInt(4), 5.0, 6.0, 7.0, 8.0, 9.0, 10);
 }

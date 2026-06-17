@@ -26,6 +26,7 @@ const EnumFromIntNumber = enum { Zero, One, Two, Three, Four };
 
 test "int to enum" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     try testEnumFromIntEval(3);
 }
@@ -644,12 +645,12 @@ test "non-exhaustive enum" {
                 else => true,
             });
 
-            try expect(@typeInfo(E).@"enum".fields.len == 2);
+            try expect(@typeInfo(E).@"enum".field_names.len == 2);
             e = @as(E, @enumFromInt(12));
             try expect(@intFromEnum(e) == 12);
             e = @as(E, @enumFromInt(y));
             try expect(@intFromEnum(e) == 52);
-            try expect(@typeInfo(E).@"enum".is_exhaustive == false);
+            try expect(@typeInfo(E).@"enum".mode == .nonexhaustive);
         }
     };
     try S.doTheTest(52);
@@ -668,8 +669,9 @@ test "empty non-exhaustive enum" {
             });
             try expect(@intFromEnum(e) == y);
 
-            try expect(@typeInfo(E).@"enum".fields.len == 0);
-            try expect(@typeInfo(E).@"enum".is_exhaustive == false);
+            try expect(@typeInfo(E).@"enum".field_names.len == 0);
+            try expect(@typeInfo(E).@"enum".field_values.len == 0);
+            try expect(@typeInfo(E).@"enum".mode == .nonexhaustive);
         }
     };
     try S.doTheTest(42);
@@ -704,8 +706,9 @@ test "single field non-exhaustive enum" {
             });
 
             try expect(@intFromEnum(@as(E, @enumFromInt(y))) == y);
-            try expect(@typeInfo(E).@"enum".fields.len == 1);
-            try expect(@typeInfo(E).@"enum".is_exhaustive == false);
+            try expect(@typeInfo(E).@"enum".field_names.len == 1);
+            try expect(@typeInfo(E).@"enum".field_values.len == 1);
+            try expect(@typeInfo(E).@"enum".mode == .nonexhaustive);
         }
     };
     try S.doTheTest(23);
@@ -1057,6 +1060,7 @@ test "tag name with signed enum values" {
 test "tag name with large enum values" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const Kdf = enum(u128) {
         aes_kdf = 0xea4f8ac1080d74bf60448a629af3d9c9,
@@ -1076,6 +1080,7 @@ test "tag name with large enum values" {
 test "@tagName with exotic integer enum types" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const S = struct {
         fn testEnumSigned(comptime T: type) !void {
@@ -1278,6 +1283,7 @@ test "tag name functions are unique" {
 
 test "size of enum with only one tag which has explicit integer tag type" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const E = enum(u8) { nope = 10 };
     const S0 = struct { e: E };
@@ -1309,6 +1315,24 @@ test "switch on an extern enum with negative value" {
     switch (v) {
         Foo.Bar => return,
     }
+}
+
+test "switch on an enum with small signed tag type" {
+    const E = enum(i3) {
+        y = -2,
+        z = -1,
+        a = 0,
+        b = 1,
+        c = 2,
+    };
+
+    var runtime: E = .c;
+    _ = &runtime;
+    const result: u8 = switch (runtime) {
+        .y, .z, .a, .b => 0,
+        .c => 1,
+    };
+    try expect(result == 1);
 }
 
 test "Non-exhaustive enum with nonstandard int size behaves correctly" {

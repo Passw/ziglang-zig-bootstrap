@@ -175,7 +175,7 @@ test "generic fn keeps non-generic parameter types" {
 
     const S = struct {
         fn f(comptime T: type, s: []T) !void {
-            try expect(A != @typeInfo(@TypeOf(s)).pointer.alignment);
+            try expect(A != @typeInfo(@TypeOf(s)).pointer.attrs.@"align");
         }
     };
 
@@ -255,10 +255,13 @@ test "generic function instantiation turns into comptime call" {
         }
 
         pub fn fieldInfo(comptime T: type, comptime field: FieldEnum(T)) switch (@typeInfo(T)) {
-            .@"enum" => std.builtin.Type.EnumField,
+            .@"enum" => struct { name: [:0]const u8, value: comptime_int },
             else => void,
         } {
-            return @typeInfo(T).@"enum".fields[@intFromEnum(field)];
+            return .{
+                .name = @typeInfo(T).@"enum".field_names[@intFromEnum(field)],
+                .value = @typeInfo(T).@"enum".field_values[@intFromEnum(field)],
+            };
         }
 
         pub fn FieldEnum(comptime T: type) type {
@@ -436,6 +439,8 @@ test "return type of generic function is function pointer" {
 }
 
 test "coerced function body has inequal value with its uncoerced body" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const S = struct {
         const A = B(i32, c);
         fn c() !i32 {
@@ -518,6 +523,7 @@ test "call generic function with from function called by the generic function" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const GET = struct {
         key: []const u8,

@@ -23,14 +23,14 @@ const ModuleInfo = struct {
         /// The set of (result-id's of) invocation globals that are accessed
         /// in this function, or after resolution, that are accessed in this
         /// function or any of it's callees.
-        invocation_globals: std.AutoArrayHashMapUnmanaged(ResultId, void),
+        invocation_globals: std.array_hash_map.Auto(ResultId, void),
     };
 
     /// Information about a particular invocation global
     const InvocationGlobal = struct {
         /// The list of invocation globals that this invocation global
         /// depends on.
-        dependencies: std.AutoArrayHashMapUnmanaged(ResultId, void),
+        dependencies: std.array_hash_map.Auto(ResultId, void),
         /// The invocation global's type
         ty: ResultId,
         /// Initializer function. May be `none`.
@@ -39,13 +39,18 @@ const ModuleInfo = struct {
     };
 
     /// Maps function result-id -> Fn information structure.
-    functions: std.AutoArrayHashMapUnmanaged(ResultId, Fn),
+    functions: std.array_hash_map.Auto(ResultId, Fn),
     /// Set of OpFunction result-ids in this module.
-    entry_points: std.AutoArrayHashMapUnmanaged(ResultId, void),
+    entry_points: std.array_hash_map.Auto(ResultId, void),
     /// For each function, a list of function result-ids that it calls.
     callee_store: []const ResultId,
     /// Maps each invocation global result-id to a type-id.
-    invocation_globals: std.AutoArrayHashMapUnmanaged(ResultId, InvocationGlobal),
+    invocation_globals: std.array_hash_map.Auto(ResultId, InvocationGlobal),
+    /// Subset of `invocation_globals` reachable from any entry point.
+    live_invocation_globals: std.array_hash_map.Auto(ResultId, void),
+    /// Initializer functions of unreachable invocation globals. Their
+    /// OpFunction...OpFunctionEnd ranges are skipped during rewriteFunctions.
+    dead_initializers: std.array_hash_map.Auto(ResultId, void),
 
     /// Fetch the list of callees per function. Guaranteed to contain only unique IDs.
     fn callees(self: ModuleInfo, fn_id: ResultId) []const ResultId {
@@ -196,6 +201,8 @@ const ModuleInfo = struct {
             .entry_points = entry_points,
             .callee_store = callee_store.items,
             .invocation_globals = invocation_globals,
+            .live_invocation_globals = .empty,
+            .dead_initializers = .empty,
         };
     }
 
@@ -203,12 +210,31 @@ const ModuleInfo = struct {
     fn resolve(self: *ModuleInfo, arena: Allocator) !void {
         try self.resolveInvocationGlobalUsage(arena);
         try self.resolveInvocationGlobalDependencies(arena);
+        try self.resolveLiveSet(arena);
+    }
+
+    fn resolveLiveSet(self: *ModuleInfo, arena: Allocator) !void {
+        for (self.entry_points.keys()) |ep_id| {
+            const ep_info = self.functions.get(ep_id) orelse continue;
+            for (ep_info.invocation_globals.keys()) |g| {
+                try self.live_invocation_globals.put(arena, g, {});
+                const g_info = self.invocation_globals.get(g).?;
+                for (g_info.dependencies.keys()) |dep| {
+                    try self.live_invocation_globals.put(arena, dep, {});
+                }
+            }
+        }
+        for (self.invocation_globals.keys(), self.invocation_globals.values()) |g, info| {
+            if (info.initializer == .none) continue;
+            if (self.live_invocation_globals.contains(g)) continue;
+            try self.dead_initializers.put(arena, info.initializer, {});
+        }
     }
 
     /// For each function, extend the list of `invocation_globals` with the
     /// invocation globals that ALL of its dependencies use.
     fn resolveInvocationGlobalUsage(self: *ModuleInfo, arena: Allocator) !void {
-        var seen = try std.DynamicBitSetUnmanaged.initEmpty(arena, self.functions.count());
+        var seen: std.bit_set.Dynamic = try .initEmpty(arena, self.functions.count());
 
         for (self.functions.keys()) |id| {
             try self.resolveInvocationGlobalUsageStep(arena, id, &seen);
@@ -219,7 +245,7 @@ const ModuleInfo = struct {
         self: *ModuleInfo,
         arena: Allocator,
         id: ResultId,
-        seen: *std.DynamicBitSetUnmanaged,
+        seen: *std.bit_set.Dynamic,
     ) !void {
         const index = self.functions.getIndex(id) orelse {
             log.err("function calls invalid function {f}", .{id});
@@ -247,7 +273,7 @@ const ModuleInfo = struct {
         self: *ModuleInfo,
         arena: Allocator,
     ) !void {
-        var seen = try std.DynamicBitSetUnmanaged.initEmpty(arena, self.invocation_globals.count());
+        var seen: std.bit_set.Dynamic = try .initEmpty(arena, self.invocation_globals.count());
 
         for (self.invocation_globals.keys()) |id| {
             try self.resolveInvocationGlobalDependenciesStep(arena, id, &seen);
@@ -258,7 +284,7 @@ const ModuleInfo = struct {
         self: *ModuleInfo,
         arena: Allocator,
         id: ResultId,
-        seen: *std.DynamicBitSetUnmanaged,
+        seen: *std.bit_set.Dynamic,
     ) !void {
         const index = self.invocation_globals.getIndex(id) orelse {
             log.err("invalid invocation global {f}", .{id});
@@ -342,9 +368,9 @@ const ModuleBuilder = struct {
     entry_point_new_id_base: u32,
     /// A set of all function types in the new program. SPIR-V mandates that these are unique,
     /// and until a general type deduplication pass is programmed, we just handle it here via this.
-    function_types: std.ArrayHashMapUnmanaged(FunctionType, ResultId, FunctionType.Context, true) = .empty,
+    function_types: std.array_hash_map.Custom(FunctionType, ResultId, FunctionType.Context, true) = .empty,
     /// Maps functions to new information required for creating the module
-    function_new_info: std.AutoArrayHashMapUnmanaged(ResultId, FunctionNewInfo) = .empty,
+    function_new_info: std.array_hash_map.Auto(ResultId, FunctionNewInfo) = .empty,
     /// Offset of the functions section in the new binary.
     new_functions_section: ?usize,
 
@@ -385,6 +411,7 @@ const ModuleBuilder = struct {
                 .OpName => {
                     const id: ResultId = @enumFromInt(inst.operands[0]);
                     if (info.invocation_globals.contains(id)) continue;
+                    if (info.dead_initializers.contains(id)) continue;
                 },
                 .OpExtInstImport => {
                     const set_id: ResultId = @enumFromInt(inst.operands[0]);
@@ -502,9 +529,14 @@ const ModuleBuilder = struct {
         var operands = std.array_list.Managed(u32).init(self.arena);
 
         var maybe_current_function: ?ResultId = null;
+        var skip_until_end: bool = false;
         var it = binary.iterateInstructionsFrom(binary.sections.functions);
         self.new_functions_section = self.section.instructions.items.len;
         while (it.next()) |inst| {
+            if (skip_until_end) {
+                if (inst.opcode == .OpFunctionEnd) skip_until_end = false;
+                continue;
+            }
             result_id_offsets.items.len = 0;
             try parser.parseInstructionResultIds(binary, inst, &result_id_offsets);
 
@@ -527,6 +559,10 @@ const ModuleBuilder = struct {
                 .OpFunction => {
                     // Re-declare the function with the new parameters.
                     const func: ResultId = @enumFromInt(operands.items[1]);
+                    if (info.dead_initializers.contains(func)) {
+                        skip_until_end = true;
+                        continue;
+                    }
                     const fn_info = info.functions.get(func).?;
                     const new_info = self.function_new_info.get(func).?;
 

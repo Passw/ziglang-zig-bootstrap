@@ -35,8 +35,8 @@ inst: struct {
         return null;
     }
 } = .{},
-value_map: std.StringArrayHashMapUnmanaged(AsmValue) = .{},
-inst_map: std.StringArrayHashMapUnmanaged(void) = .empty,
+value_map: std.array_hash_map.String(AsmValue) = .{},
+inst_map: std.array_hash_map.String(void) = .empty,
 
 const Operand = union(enum) {
     /// Any 'simple' 32-bit value. This could be a mask or
@@ -212,7 +212,7 @@ fn processTypeInstruction(ass: *Assembler) !AsmValue {
         .OpTypeVoid => try module.voidType(),
         .OpTypeBool => try module.boolType(),
         .OpTypeInt => blk: {
-            const signedness: std.builtin.Signedness = switch (operands[2].literal32) {
+            const signedness: std.lang.Signedness = switch (operands[2].literal32) {
                 0 => .unsigned,
                 1 => .signed,
                 else => {
@@ -269,7 +269,7 @@ fn processTypeInstruction(ass: *Assembler) !AsmValue {
             defer cg.id_scratch.shrinkRetainingCapacity(scratch_top);
             const ids = try cg.id_scratch.addManyAsSlice(gpa, operands[1..].len);
             for (operands[1..], ids) |op, *id| id.* = try ass.resolveRefId(op.ref_id);
-            break :blk try module.structType(ids, null, null, .none);
+            break :blk try module.structType(ids, null, .none);
         },
         .OpTypeImage => blk: {
             const sampled_type = try ass.resolveRefId(operands[1].ref_id);
@@ -766,7 +766,7 @@ fn parseContextDependentNumber(ass: *Assembler) !void {
     return ass.fail(tok.start, "cannot parse literal constant", .{});
 }
 
-fn parseContextDependentInt(ass: *Assembler, signedness: std.builtin.Signedness, width: u32) !void {
+fn parseContextDependentInt(ass: *Assembler, signedness: std.lang.Signedness, width: u32) !void {
     const gpa = ass.cg.module.gpa;
 
     const tok = ass.currentToken();
@@ -821,7 +821,7 @@ fn parseContextDependentFloat(ass: *Assembler, comptime width: u16) !void {
     const gpa = ass.cg.module.gpa;
 
     const Float = std.meta.Float(width);
-    const Int = std.meta.Int(.unsigned, width);
+    const Int = @Int(.unsigned, width);
 
     const tok = ass.currentToken();
     try ass.expectToken(.value);

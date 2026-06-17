@@ -434,6 +434,7 @@ pub fn genBody(self: *FuncGen, body: []const Air.Inst.Index, coverage_point: Air
             .work_item_id => try self.airWorkItemId(inst),
             .work_group_size => try self.airWorkGroupSize(inst),
             .work_group_id => try self.airWorkGroupId(inst),
+            .spirv_runtime_array_len => unreachable,
 
             // Instructions that are known to always be `noreturn` based on their tag.
             .br              => return self.airBr(inst),
@@ -567,7 +568,7 @@ const CallAttr = enum {
     AlwaysInline,
 };
 
-fn airCall(self: *FuncGen, inst: Air.Inst.Index, modifier: std.builtin.CallModifier) Allocator.Error!Builder.Value {
+fn airCall(self: *FuncGen, inst: Air.Inst.Index, modifier: std.lang.CallModifier) Allocator.Error!Builder.Value {
     const air_call = self.air.unwrapCall(inst);
     const args = air_call.args;
     const o = self.object;
@@ -767,17 +768,36 @@ fn airCall(self: *FuncGen, inst: Air.Inst.Index, modifier: std.builtin.CallModif
         },
     };
 
+    const cc_info = llvm.toLlvmCallConv(fn_info.cc, target).?;
+
     {
         // Add argument attributes.
         it = iterateParamTypes(o, fn_info);
         it.llvm_index += @intFromBool(sret);
         it.llvm_index += @intFromBool(err_return_tracing);
+        var remaining_inreg_int = cc_info.inreg_int_params;
+        var remaining_inreg_float = cc_info.inreg_float_params;
         while (try it.next()) |lowering| switch (lowering) {
             .byval => {
                 const param_index = it.zig_index - 1;
                 const param_ty = Type.fromInterned(fn_info.param_types.get(ip)[param_index]);
                 if (!isByRef(param_ty, zcu)) {
                     try o.addByValParamAttrs(pt, &attributes, param_ty, param_index, fn_info, it.llvm_index - 1);
+                }
+
+                if (remaining_inreg_int > 0 and
+                    (param_ty.isPtrAtRuntime(zcu) or
+                        (param_ty.isAbiInt(zcu) and param_ty.abiSize(zcu) <= Type.usize.abiSize(zcu))))
+                {
+                    try attributes.addParamAttr(it.llvm_index - 1, .inreg, &o.builder);
+                    remaining_inreg_int -= 1;
+                }
+
+                if (remaining_inreg_float > 0 and
+                    param_ty.zigTypeTag(zcu) == .float)
+                {
+                    try attributes.addParamAttr(it.llvm_index - 1, .inreg, &o.builder);
+                    remaining_inreg_float -= 1;
                 }
             },
             .byref => {
@@ -833,7 +853,7 @@ fn airCall(self: *FuncGen, inst: Air.Inst.Index, modifier: std.builtin.CallModif
             .always_tail => .musttail,
             .no_suspend, .always_inline, .compile_time => unreachable,
         },
-        llvm.toLlvmCallConvTag(fn_info.cc, target).?,
+        cc_info.llvm_cc,
         try attributes.finish(&o.builder),
         try o.lowerType(zig_fn_ty),
         llvm_fn,
@@ -891,7 +911,7 @@ fn buildSimplePanic(fg: *FuncGen, panic_id: Zcu.SimplePanicId) Allocator.Error!v
     const o = fg.object;
     const zcu = o.zcu;
     const target = zcu.getTarget();
-    const panic_func = zcu.funcInfo(zcu.builtin_decl_values.get(panic_id.toBuiltin()));
+    const panic_func = zcu.funcInfo(zcu.std_lang_decl_values.get(panic_id.toStdLangDecl()));
     const fn_info = zcu.typeToFunc(.fromInterned(panic_func.ty)).?;
     const llvm_panic_fn_ty = try o.lowerType(.fromInterned(panic_func.ty));
 
@@ -2493,7 +2513,7 @@ fn airAssembly(self: *FuncGen, inst: Air.Inst.Index) TodoError!Builder.Value {
     var llvm_param_i: usize = 0;
     var total_i: usize = 0;
 
-    var name_map: std.StringArrayHashMapUnmanaged(u16) = .empty;
+    var name_map: std.array_hash_map.String(u16) = .empty;
     try name_map.ensureUnusedCapacity(arena, max_param_count);
 
     var it = unwrapped_asm.iterateOutputs();
@@ -3981,7 +4001,7 @@ fn buildFloatOp(
     const scalar_llvm_ty = try o.lowerType(scalar_ty);
     const libc_fn = try o.getLibcFunction(
         fn_name,
-        ([1]Builder.Type{scalar_llvm_ty} ** 3)[0..params.len],
+        @as([3]Builder.Type, @splat(scalar_llvm_ty))[0..params.len],
         scalar_llvm_ty,
     );
     if (ty.zigTypeTag(zcu) == .vector) {
@@ -6017,14 +6037,14 @@ fn airPrefetch(self: *FuncGen, inst: Air.Inst.Index) Allocator.Error!Builder.Val
     const o = self.object;
     const prefetch = self.air.instructions.items(.data)[@intFromEnum(inst)].prefetch;
 
-    comptime assert(@intFromEnum(std.builtin.PrefetchOptions.Rw.read) == 0);
-    comptime assert(@intFromEnum(std.builtin.PrefetchOptions.Rw.write) == 1);
+    comptime assert(@intFromEnum(std.lang.PrefetchOptions.Rw.read) == 0);
+    comptime assert(@intFromEnum(std.lang.PrefetchOptions.Rw.write) == 1);
 
     comptime assert(prefetch.locality >= 0);
     comptime assert(prefetch.locality <= 3);
 
-    comptime assert(@intFromEnum(std.builtin.PrefetchOptions.Cache.instruction) == 0);
-    comptime assert(@intFromEnum(std.builtin.PrefetchOptions.Cache.data) == 1);
+    comptime assert(@intFromEnum(std.lang.PrefetchOptions.Cache.instruction) == 0);
+    comptime assert(@intFromEnum(std.lang.PrefetchOptions.Cache.data) == 1);
 
     // LLVM fails during codegen of instruction cache prefetchs for these architectures.
     // This is an LLVM bug as the prefetch intrinsic should be a noop if not supported
@@ -6924,6 +6944,7 @@ pub fn firstParamSRet(fn_info: InternPool.Key.FuncType, zcu: *Zcu, target: *cons
         .x86_64_win => x86_64_abi.classifyWindows(return_type, zcu, target, .ret) == .memory,
         .x86_sysv, .x86_win => isByRef(return_type, zcu),
         .x86_stdcall => !isScalar(zcu, return_type),
+        .x86_fastcall => firstParamSRetX86Fastcall(zcu, return_type),
         .wasm_mvp => wasm_c_abi.classifyType(return_type, zcu) == .indirect,
         .aarch64_aapcs,
         .aarch64_aapcs_darwin,
@@ -6941,6 +6962,20 @@ pub fn firstParamSRet(fn_info: InternPool.Key.FuncType, zcu: *Zcu, target: *cons
         },
         else => false, // TODO: investigate other targets/callconvs
     };
+}
+
+fn firstParamSRetX86Fastcall(zcu: *Zcu, ty: Type) bool {
+    if (isScalar(zcu, ty)) {
+        return false;
+    }
+    const tag = ty.zigTypeTag(zcu);
+    if (tag == .@"struct" or tag == .@"union") {
+        const size = ty.abiSize(zcu);
+        if (size == 1 or size == 2 or size == 4 or size == 8) {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn firstParamSRetSystemV(ty: Type, zcu: *Zcu, target: *const std.Target) bool {
@@ -6964,10 +6999,10 @@ pub fn lowerFnRetTy(o: *Object, fn_info: InternPool.Key.FuncType) Allocator.Erro
     switch (fn_info.cc) {
         .@"inline" => unreachable,
         .auto => return if (returnTypeByRef(zcu, target, return_type)) .void else o.lowerType(return_type),
-
         .x86_64_sysv => return lowerSystemVFnRetTy(o, fn_info),
         .x86_64_win => return lowerWin64FnRetTy(o, fn_info),
         .x86_stdcall => return if (isScalar(zcu, return_type)) o.lowerType(return_type) else .void,
+        .x86_fastcall => return lowerX86FastcallFnRetTy(o, zcu, return_type),
         .x86_sysv, .x86_win => return if (isByRef(return_type, zcu)) .void else o.lowerType(return_type),
         .aarch64_aapcs, .aarch64_aapcs_darwin, .aarch64_aapcs_win => switch (aarch64_c_abi.classifyType(return_type, zcu)) {
             .memory => return .void,
@@ -7016,6 +7051,20 @@ pub fn lowerFnRetTy(o: *Object, fn_info: InternPool.Key.FuncType) Allocator.Erro
         // TODO investigate other callconvs
         else => return o.lowerType(return_type),
     }
+}
+
+fn lowerX86FastcallFnRetTy(o: *Object, zcu: *Zcu, ty: Type) Allocator.Error!Builder.Type {
+    if (isScalar(zcu, ty)) {
+        return o.lowerType(ty);
+    }
+    const tag = ty.zigTypeTag(zcu);
+    if (tag == .@"struct" or tag == .@"union") {
+        const size = ty.abiSize(zcu);
+        if (size == 1 or size == 2 or size == 4 or size == 8) {
+            return o.builder.intType(@intCast(size * 8));
+        }
+    }
+    return .void;
 }
 
 fn lowerWin64FnRetTy(o: *Object, fn_info: InternPool.Key.FuncType) Allocator.Error!Builder.Type {
@@ -7103,20 +7152,22 @@ fn lowerSystemVFnRetTy(o: *Object, fn_info: InternPool.Key.FuncType) Allocator.E
 }
 
 /// This function deliberately does not handle `_BitInt` because it typically
-/// has different ABI than regular integer types, and there is no currently no
-/// way to determine whether a Zig integer type is meant to represent e.g. `int`
+/// has different ABI than regular integer types, and there is currently no way
+/// to determine whether a Zig integer type is meant to represent e.g. `int`
 /// or `_BitInt(32)`.
-pub fn ccAbiPromoteInt(cc: std.builtin.CallingConvention, zcu: *Zcu, ty: Type) ?std.builtin.Signedness {
+pub fn ccAbiPromoteInt(cc: std.lang.CallingConvention, zcu: *Zcu, ty: Type) ?std.lang.Signedness {
     switch (cc) {
         .auto, .@"inline", .async => return null,
         else => {},
     }
 
-    const int_info = switch (ty.zigTypeTag(zcu)) {
+    const ty_tag = ty.zigTypeTag(zcu);
+    const int_info = switch (ty_tag) {
         .bool => Type.u1.intInfo(zcu),
         else => if (ty.isAbiInt(zcu)) ty.intInfo(zcu) else return null,
     };
-    assert(int_info.bits >= 0);
+
+    assert(int_info.bits == 0 or (int_info.bits == 1 and ty_tag == .bool) or std.math.isPowerOfTwo(int_info.bits));
 
     const target = zcu.getTarget();
     return switch (target.cpu.arch) {
@@ -7124,7 +7175,7 @@ pub fn ccAbiPromoteInt(cc: std.builtin.CallingConvention, zcu: *Zcu, ty: Type) ?
         .aarch64_be,
         => switch (target.os.tag) {
             .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => switch (int_info.bits) {
-                8, 16 => int_info.signedness,
+                1, 8, 16 => int_info.signedness,
                 else => null,
             },
             else => null,
@@ -7132,7 +7183,7 @@ pub fn ccAbiPromoteInt(cc: std.builtin.CallingConvention, zcu: *Zcu, ty: Type) ?
 
         .avr,
         => switch (int_info.bits) {
-            8 => int_info.signedness,
+            1, 8 => int_info.signedness,
             else => null,
         },
 
@@ -7143,7 +7194,7 @@ pub fn ccAbiPromoteInt(cc: std.builtin.CallingConvention, zcu: *Zcu, ty: Type) ?
         .riscv64,
         .riscv64be,
         => switch (int_info.bits) {
-            8, 16 => int_info.signedness,
+            1, 8, 16 => int_info.signedness,
             32 => .signed,
             else => null,
         },
@@ -7153,7 +7204,7 @@ pub fn ccAbiPromoteInt(cc: std.builtin.CallingConvention, zcu: *Zcu, ty: Type) ?
         .mips64,
         .mips64el,
         => switch (int_info.bits) {
-            8, 16, 64 => int_info.signedness,
+            1, 8, 16, 64 => int_info.signedness,
             32 => .signed,
             else => null,
         },
@@ -7164,12 +7215,12 @@ pub fn ccAbiPromoteInt(cc: std.builtin.CallingConvention, zcu: *Zcu, ty: Type) ?
         .sparc64,
         .ve,
         => switch (int_info.bits) {
-            8, 16, 32 => int_info.signedness,
+            1, 8, 16, 32 => int_info.signedness,
             else => null,
         },
 
         else => switch (int_info.bits) {
-            8, 16 => int_info.signedness,
+            1, 8, 16 => int_info.signedness,
             else => null,
         },
     };
@@ -7234,6 +7285,7 @@ pub fn isByRef(ty: Type, zcu: *const Zcu) bool {
         .undefined,
         .null,
         .@"opaque",
+        .spirv,
         => unreachable,
 
         .noreturn,
@@ -7379,7 +7431,7 @@ fn intrinsicsAllowed(scalar_ty: Type, target: *const std.Target) bool {
     };
 }
 
-fn toLlvmAtomicOrdering(atomic_order: std.builtin.AtomicOrder) Builder.AtomicOrdering {
+fn toLlvmAtomicOrdering(atomic_order: std.lang.AtomicOrder) Builder.AtomicOrdering {
     return switch (atomic_order) {
         .unordered => .unordered,
         .monotonic => .monotonic,
@@ -7391,7 +7443,7 @@ fn toLlvmAtomicOrdering(atomic_order: std.builtin.AtomicOrder) Builder.AtomicOrd
 }
 
 fn toLlvmAtomicRmwBinOp(
-    op: std.builtin.AtomicRmwOp,
+    op: std.lang.AtomicRmwOp,
     is_signed: bool,
     is_float: bool,
 ) Builder.Function.Instruction.AtomicRmw.Operation {
@@ -7410,7 +7462,7 @@ fn toLlvmAtomicRmwBinOp(
 
 fn minIntConst(b: *Builder, min_ty: Type, as_ty: Builder.Type, zcu: *const Zcu) Allocator.Error!Builder.Constant {
     const info = min_ty.intInfo(zcu);
-    if (info.signedness == .unsigned or info.bits == 0) {
+    if (info.signedness == .unsigned) {
         return b.intConst(as_ty, 0);
     }
     if (std.math.cast(u6, info.bits - 1)) |shift| {

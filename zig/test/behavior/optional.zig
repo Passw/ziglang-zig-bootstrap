@@ -338,6 +338,7 @@ test "coerce an anon struct literal to optional struct" {
 test "0-bit child type coerced to optional return ptr result location" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const S = struct {
         fn doTheTest() !void {
@@ -428,6 +429,7 @@ test "optional pointer to zero bit optional payload" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const B = struct {
         fn foo(_: *@This()) void {}
@@ -512,6 +514,8 @@ test "mutable optional of noreturn" {
 }
 
 test "orelse on C pointer" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     // TODO https://github.com/ziglang/zig/issues/6597
     const foo: [*c]const u8 = "hey";
     const d = foo orelse @compileError("bad");
@@ -621,7 +625,7 @@ test "copied optional doesn't alias source" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
-    var opt_x: ?[3]f32 = [_]f32{0.0} ** 3;
+    var opt_x: ?[3]f32 = @splat(0.0);
 
     const x = opt_x.?;
     opt_x.?[0] = 15.0;
@@ -655,6 +659,8 @@ test "result location initialization of optional with OPV payload" {
 }
 
 test "global comptime only optional" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const S = struct {
         const @"null": ?*type = null;
         const @"void": ?*const type = &void;

@@ -948,6 +948,11 @@ test "@log2 with vectors" {
         builtin.cpu.arch == .aarch64 and
         builtin.os.tag == .windows) return error.SkipZigTest;
 
+    if (builtin.os.tag == .windows and builtin.cpu.arch == .x86) {
+        // https://codeberg.org/ziglang/zig/issues/35518
+        return error.SkipZigTest;
+    }
+
     try testLog2WithVectors();
     try comptime testLog2WithVectors();
 }
@@ -1537,6 +1542,18 @@ fn testNeg(comptime T: type) !void {
         &nan,
         &neg_nan,
     };
+}
+
+test "negate f80" {
+    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    var f: f80 = 0.0;
+    const a: u80 = @bitCast(f);
+    try expect(a == 0);
+    f = -f;
+    const b: u80 = @bitCast(f);
+    try expect(b == 0x8000_00000000_00000000);
 }
 
 test "eval @setFloatMode at compile-time" {

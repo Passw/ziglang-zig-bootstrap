@@ -125,14 +125,6 @@ pub const Id = if (InternPool.single_threaded) enum {
     }
 };
 
-pub fn activate(zcu: *Zcu, tid: Id) Zcu.PerThread {
-    zcu.intern_pool.activate();
-    return .{ .zcu = zcu, .tid = tid };
-}
-pub fn deactivate(pt: Zcu.PerThread) void {
-    pt.zcu.intern_pool.deactivate();
-}
-
 /// Called from `Compilation.performAllTheWork`. Performs one incremental update of the ZCU: detects
 /// changes to files, runs AstGen, and then enters the main semantic analysis loop, where we build
 /// up a graph of declarations, functions, etc, while also sending declarations and functions to
@@ -313,18 +305,22 @@ pub fn update(
     // `comptime` declarations, any declarations marked `export`, and `test` declarations in the
     // main module if this is a test compilation---become referenced, and so will be picked up
     // up by the main semantic analysis loop below.
-    for (zcu.analysisRoots()) |analysis_root_mod| {
-        const analysis_root_file = zcu.module_roots.get(analysis_root_mod).?.unwrap().?;
-        try pt.ensureFilePopulated(analysis_root_file);
+    {
+        const tracy_trace = traceNamed(@src(), "populate_sema_roots");
+        defer tracy_trace.end();
+        for (zcu.analysisRoots()) |analysis_root_mod| {
+            const analysis_root_file = zcu.module_roots.get(analysis_root_mod).?.unwrap().?;
+            try pt.ensureFilePopulated(analysis_root_file);
+        }
     }
+
+    const tracy_trace = traceNamed(@src(), "sema_loop");
+    defer tracy_trace.end();
 
     // This is the main semantic analysis loop, which is essentially the main loop of the whole
     // Zig compilation pipeline. It selects some `AnalUnit` which we know needs to be analyzed,
     // and analyzes it, which may in turn discover more `AnalUnit`s which we need to analyze.
     while (try zcu.findOutdatedToAnalyze()) |unit| {
-        const tracy_trace = traceNamed(@src(), "analyze_outdated");
-        defer tracy_trace.end();
-
         const maybe_err: Zcu.SemaError!void = switch (unit.unwrap()) {
             .@"comptime" => |cu| pt.ensureComptimeUnitUpToDate(cu),
             .nav_ty => |nav| pt.ensureNavTypeUpToDate(nav, null),
@@ -374,10 +370,10 @@ fn workerUpdateFile(
     const child_prog_node = prog_node.start(std.fs.path.basename(file.path.sub_path), 0);
     defer child_prog_node.end();
 
-    const pt: Zcu.PerThread = .activate(comp.zcu.?, tid);
-    defer pt.deactivate();
-    pt.updateFile(file_index, file) catch |err| {
-        pt.reportRetryableFileError(file_index, "unable to load '{s}': {s}", .{ std.fs.path.basename(file.path.sub_path), @errorName(err) }) catch |oom| switch (oom) {
+    const active = comp.zcu.?.activate(tid);
+    defer active.deactivate();
+    active.pt.updateFile(file_index, file) catch |err| {
+        active.pt.reportRetryableFileError(file_index, "unable to load '{s}': {s}", .{ std.fs.path.basename(file.path.sub_path), @errorName(err) }) catch |oom| switch (oom) {
             error.OutOfMemory => {
                 comp.mutex.lockUncancelable(io);
                 defer comp.mutex.unlock(io);
@@ -407,7 +403,7 @@ fn workerUpdateFile(
 
             const import_path = file.zir.?.nullTerminatedString(item.data.name);
 
-            if (pt.discoverImport(file.path, import_path)) |res| switch (res) {
+            if (active.pt.discoverImport(file.path, import_path)) |res| switch (res) {
                 .module, .existing_file => {},
                 .new_file => |new| {
                     group.async(io, workerUpdateFile, .{
@@ -439,13 +435,15 @@ fn workerUpdateEmbedFile(comp: *Compilation, ef_index: Zcu.EmbedFile.Index, ef: 
 fn detectEmbedFileUpdate(comp: *Compilation, tid: Zcu.PerThread.Id, ef_index: Zcu.EmbedFile.Index, ef: *Zcu.EmbedFile) !void {
     const io = comp.io;
     const zcu = comp.zcu.?;
-    const pt: Zcu.PerThread = .activate(zcu, tid);
-    defer pt.deactivate();
 
     const old_val = ef.val;
     const old_err = ef.err;
 
-    try pt.updateEmbedFile(ef, null);
+    {
+        const active = zcu.activate(tid);
+        defer active.deactivate();
+        try active.pt.updateEmbedFile(ef, null);
+    }
 
     if (ef.val != .none and ef.val == old_val) return; // success, value unchanged
     if (ef.val == .none and old_val == .none and ef.err == old_err) return; // failure, error unchanged
@@ -454,27 +452,6 @@ fn detectEmbedFileUpdate(comp: *Compilation, tid: Zcu.PerThread.Id, ef_index: Zc
     defer comp.mutex.unlock(io);
 
     try zcu.markDependeeOutdated(.not_marked_po, .{ .embed_file = ef_index });
-}
-
-fn deinitFile(pt: Zcu.PerThread, file_index: Zcu.File.Index) void {
-    const zcu = pt.zcu;
-    const gpa = zcu.gpa;
-    const file = zcu.fileByIndex(file_index);
-    log.debug("deinit File {f}", .{file.path.fmt(zcu.comp)});
-    file.path.deinit(gpa);
-    file.unload(gpa);
-    if (file.prev_zir) |prev_zir| {
-        prev_zir.deinit(gpa);
-        gpa.destroy(prev_zir);
-    }
-    file.* = undefined;
-}
-
-pub fn destroyFile(pt: Zcu.PerThread, file_index: Zcu.File.Index) void {
-    const gpa = pt.zcu.gpa;
-    const file = pt.zcu.fileByIndex(file_index);
-    pt.deinitFile(file_index);
-    gpa.destroy(file);
 }
 
 /// Ensures that `file` has up-to-date ZIR. If not, loads the ZIR cache or runs
@@ -810,7 +787,7 @@ const UpdatedFile = struct {
     inst_map: std.AutoHashMapUnmanaged(Zir.Inst.Index, Zir.Inst.Index),
 };
 
-fn cleanupUpdatedFiles(gpa: Allocator, updated_files: *std.AutoArrayHashMapUnmanaged(Zcu.File.Index, UpdatedFile)) void {
+fn cleanupUpdatedFiles(gpa: Allocator, updated_files: *std.array_hash_map.Auto(Zcu.File.Index, UpdatedFile)) void {
     for (updated_files.values()) |*elem| elem.inst_map.deinit(gpa);
     updated_files.deinit(gpa);
 }
@@ -823,9 +800,12 @@ fn updateZirRefs(pt: Zcu.PerThread) (Io.Cancelable || Allocator.Error)!void {
     const gpa = comp.gpa;
     const io = comp.io;
 
+    const tracy_trace = trace(@src());
+    defer tracy_trace.end();
+
     // We need to visit every updated File for every TrackedInst in InternPool.
     // This only includes Zig files; ZON files are omitted.
-    var updated_files: std.AutoArrayHashMapUnmanaged(Zcu.File.Index, UpdatedFile) = .empty;
+    var updated_files: std.array_hash_map.Auto(Zcu.File.Index, UpdatedFile) = .empty;
     defer cleanupUpdatedFiles(gpa, &updated_files);
 
     for (zcu.import_table.keys()) |file_index| {
@@ -927,7 +907,7 @@ fn updateZirRefs(pt: Zcu.PerThread) (Io.Cancelable || Allocator.Error)!void {
             if (!has_namespace) continue;
 
             // Value is whether the declaration is `pub`.
-            var old_names: std.AutoArrayHashMapUnmanaged(InternPool.NullTerminatedString, bool) = .empty;
+            var old_names: std.array_hash_map.Auto(InternPool.NullTerminatedString, bool) = .empty;
             defer old_names.deinit(zcu.gpa);
             for (old_zir.typeDecls(old_inst)) |decl_inst| {
                 const old_decl = old_zir.getDeclaration(decl_inst);
@@ -1008,9 +988,6 @@ fn updateZirRefs(pt: Zcu.PerThread) (Io.Cancelable || Allocator.Error)!void {
 pub fn ensureFilePopulated(pt: Zcu.PerThread, file_index: Zcu.File.Index) (Allocator.Error || Io.Cancelable)!void {
     dev.check(.sema);
 
-    const tracy_trace = trace(@src());
-    defer tracy_trace.end();
-
     const zcu = pt.zcu;
     const comp = zcu.comp;
     const io = comp.io;
@@ -1018,6 +995,9 @@ pub fn ensureFilePopulated(pt: Zcu.PerThread, file_index: Zcu.File.Index) (Alloc
     const ip = &zcu.intern_pool;
 
     if (zcu.fileRootType(file_index) != .none) return; // already good
+
+    const tracy_trace = traceNamed(@src(), "create_file_struct");
+    defer tracy_trace.end();
 
     if (zcu.comp.time_report) |*tr| tr.stats.n_imported_files += 1;
 
@@ -1065,9 +1045,6 @@ pub fn ensureMemoizedStateUpToDate(
     /// `null` is valid only for the "root" analysis, i.e. called from `Compilation.processOneJob`.
     reason: ?*const Zcu.DependencyReason,
 ) Zcu.SemaError!void {
-    const tracy_trace = trace(@src());
-    defer tracy_trace.end();
-
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
 
@@ -1083,13 +1060,13 @@ pub fn ensureMemoizedStateUpToDate(
     } else {
         if (prev_failed) return error.AnalysisFail;
         // We use an arbitrary element to check if the state has been resolved yet.
-        const to_check: Zcu.BuiltinDecl = switch (stage) {
+        const to_check: Zcu.StdLangDecl = switch (stage) {
             .main => .Type,
             .panic => .panic,
             .va_list => .VaList,
             .assembly => .assembly,
         };
-        if (zcu.builtin_decl_values.get(to_check) != .none) return;
+        if (zcu.std_lang_decl_values.get(to_check) != .none) return;
     }
 
     if (zcu.comp.debugIncremental()) {
@@ -1142,6 +1119,10 @@ fn analyzeMemoizedState(
 
     log.debug("analyzeMemoizedState({t})", .{stage});
 
+    const tracy_trace = trace(@src());
+    defer tracy_trace.end();
+    tracy_trace.addText(@tagName(stage));
+
     const unit: AnalUnit = .wrap(.{ .memoized_state = stage });
 
     try zcu.analysis_in_progress.putNoClobber(gpa, unit, reason);
@@ -1174,9 +1155,6 @@ fn analyzeMemoizedState(
 /// if necessary. Returns `error.AnalysisFail` if an analysis error is encountered; the caller is
 /// free to ignore this, since the error is already registered.
 pub fn ensureComptimeUnitUpToDate(pt: Zcu.PerThread, cu_id: InternPool.ComptimeUnit.Id) Zcu.SemaError!void {
-    const tracy_trace = trace(@src());
-    defer tracy_trace.end();
-
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
 
@@ -1257,6 +1235,10 @@ fn analyzeComptimeUnit(pt: Zcu.PerThread, cu_id: InternPool.ComptimeUnit.Id) Zcu
 
     log.debug("analyzeComptimeUnit {f}", .{zcu.fmtAnalUnit(anal_unit)});
 
+    const tracy_trace = trace(@src());
+    defer tracy_trace.end();
+    tracy_trace.addTextFmt("cu_id={d}", .{cu_id});
+
     const inst_resolved = comptime_unit.zir_index.resolveFull(ip) orelse return error.AnalysisFail;
     const file = zcu.fileByIndex(inst_resolved.file);
     const zir = file.zir.?;
@@ -1333,9 +1315,6 @@ pub fn ensureTypeLayoutUpToDate(
     /// `null` is valid only for the "root" analysis, i.e. called from `Compilation.processOneJob`.
     reason: ?*const Zcu.DependencyReason,
 ) Zcu.SemaError!void {
-    const tracy_trace = trace(@src());
-    defer tracy_trace.end();
-
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
     const comp = zcu.comp;
@@ -1464,9 +1443,6 @@ pub fn ensureStructDefaultsUpToDate(
     /// `null` is valid only for the "root" analysis, i.e. called from `Compilation.processOneJob`.
     reason: ?*const Zcu.DependencyReason,
 ) Zcu.SemaError!void {
-    const tracy_trace = trace(@src());
-    defer tracy_trace.end();
-
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
     const comp = zcu.comp;
@@ -1572,9 +1548,6 @@ pub fn ensureNavValUpToDate(
     /// `null` is valid only for the "root" analysis, i.e. called from `Compilation.processOneJob`.
     reason: ?*const Zcu.DependencyReason,
 ) Zcu.SemaError!void {
-    const tracy_trace = trace(@src());
-    defer tracy_trace.end();
-
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
     const ip = &zcu.intern_pool;
@@ -1676,6 +1649,11 @@ fn analyzeNavVal(
     const old_nav = ip.getNav(nav_id);
 
     log.debug("analyzeNavVal {f}", .{zcu.fmtAnalUnit(anal_unit)});
+
+    const tracy_trace = trace(@src());
+    defer tracy_trace.end();
+    tracy_trace.addText(old_nav.fqn.toSlice(ip));
+    tracy_trace.addTextFmt("nav_id={d}", .{nav_id});
 
     const inst_resolved = old_nav.analysis.?.zir_index.resolveFull(ip) orelse return error.AnalysisFail;
     const file = zcu.fileByIndex(inst_resolved.file);
@@ -1872,15 +1850,22 @@ fn analyzeNavVal(
     // that case and invalidate the dependee right now.
     if (zcu.clearOutdatedState(.wrap(.{ .nav_ty = nav_id }))) {
         assert(zir_decl.type_body == null); // otherwise we already resolved it with `Sema.ensureNavResolved`
-        zcu.resetUnit(.wrap(.{ .nav_ty = nav_id }));
-        try pt.addDependency(.wrap(.{ .nav_ty = nav_id }), .{ .nav_val = nav_id }); // inferred type depends on the value (that's us!)
+        const type_unit: AnalUnit = .wrap(.{ .nav_ty = nav_id });
+        const prev_type_failed = zcu.failed_analysis.contains(type_unit) or
+            zcu.transitive_failed_analysis.contains(type_unit);
+        zcu.resetUnit(type_unit);
+        try pt.addDependency(type_unit, .{ .nav_val = nav_id }); // inferred type depends on the value (that's us!)
         if (comp.debugIncremental()) {
-            const info = try zcu.incremental_debug_state.getUnitInfo(gpa, .wrap(.{ .nav_ty = nav_id }));
+            const info = try zcu.incremental_debug_state.getUnitInfo(gpa, type_unit);
             info.last_update_gen = zcu.generation;
             info.deps.clearRetainingCapacity();
         }
-        const type_changed: bool = if (old_nav.resolved) |r| r.type != nav_ty.toIntern() else true;
-        if (type_changed) {
+        const type_outdated: bool = type_outdated: {
+            if (prev_type_failed) break :type_outdated true;
+            const r = old_nav.resolved orelse break :type_outdated true;
+            break :type_outdated r.type != nav_ty.toIntern();
+        };
+        if (type_outdated) {
             try zcu.markDependeeOutdated(.marked_po, .{ .nav_ty = nav_id });
         } else {
             try zcu.markPoDependeeUpToDate(.{ .nav_ty = nav_id });
@@ -1932,9 +1917,6 @@ pub fn ensureNavTypeUpToDate(
     /// `null` is valid only for the "root" analysis, i.e. called from `Compilation.processOneJob`.
     reason: ?*const Zcu.DependencyReason,
 ) Zcu.SemaError!void {
-    const tracy_trace = trace(@src());
-    defer tracy_trace.end();
-
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
     const ip = &zcu.intern_pool;
@@ -2036,6 +2018,11 @@ fn analyzeNavType(
     const old_nav = ip.getNav(nav_id);
 
     log.debug("analyzeNavType {f}", .{zcu.fmtAnalUnit(anal_unit)});
+
+    const tracy_trace = trace(@src());
+    defer tracy_trace.end();
+    tracy_trace.addText(old_nav.fqn.toSlice(ip));
+    tracy_trace.addTextFmt("nav_id={d}", .{nav_id});
 
     const inst_resolved = old_nav.analysis.?.zir_index.resolveFull(ip) orelse return error.AnalysisFail;
     const file = zcu.fileByIndex(inst_resolved.file);
@@ -2176,9 +2163,6 @@ pub fn ensureFuncBodyUpToDate(
 ) Zcu.SemaError!void {
     dev.check(.sema);
 
-    const tracy_trace = trace(@src());
-    defer tracy_trace.end();
-
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
     const ip = &zcu.intern_pool;
@@ -2275,6 +2259,11 @@ fn analyzeFuncBody(
         .none;
 
     log.debug("analyzeFuncBody {f}", .{zcu.fmtAnalUnit(anal_unit)});
+
+    const tracy_trace = trace(@src());
+    defer tracy_trace.end();
+    tracy_trace.addText(ip.getNav(func.owner_nav).fqn.toSlice(ip));
+    tracy_trace.addTextFmt("func_ip_index={d}", .{func_index});
 
     var air = try pt.analyzeFuncBodyInner(func_index, reason);
     var air_owned = true;
@@ -2584,6 +2573,9 @@ fn computeAliveFiles(pt: Zcu.PerThread) Allocator.Error!bool {
     const zcu = pt.zcu;
     const comp = zcu.comp;
     const gpa = zcu.gpa;
+
+    const tracy_trace = trace(@src());
+    defer tracy_trace.end();
 
     var any_fatal_files = false;
     zcu.multi_module_err = null;
@@ -3021,13 +3013,15 @@ pub fn scanNamespace(
     namespace_index: Zcu.Namespace.Index,
     decls: []const Zir.Inst.Index,
 ) Allocator.Error!void {
-    const tracy_trace = trace(@src());
-    defer tracy_trace.end();
-
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
     const gpa = zcu.gpa;
     const namespace = zcu.namespacePtr(namespace_index);
+
+    const tracy_trace = trace(@src());
+    defer tracy_trace.end();
+    tracy_trace.addText(Type.fromInterned(namespace.owner_type).containerTypeName(ip).toSlice(ip));
+    tracy_trace.addTextFmt("type_ip_index={d}", .{namespace.owner_type});
 
     const tracked_unit = zcu.trackUnitSema(
         Type.fromInterned(namespace.owner_type).containerTypeName(ip).toSlice(ip),
@@ -3240,9 +3234,6 @@ fn analyzeFuncBodyInner(
     func_index: InternPool.Index,
     reason: ?*const Zcu.DependencyReason,
 ) Zcu.SemaError!Air {
-    const tracy_trace = trace(@src());
-    defer tracy_trace.end();
-
     const zcu = pt.zcu;
     const comp = zcu.comp;
     const gpa = comp.gpa;
@@ -3337,7 +3328,7 @@ fn analyzeFuncBodyInner(
     ip.funcSetHasErrorTrace(io, func_index, fn_ty_info.cc == .auto);
 
     // First few indexes of extra are reserved and set at the end.
-    const reserved_count = @typeInfo(Air.ExtraIndex).@"enum".fields.len;
+    const reserved_count = @typeInfo(Air.ExtraIndex).@"enum".field_names.len;
     try sema.air_extra.ensureTotalCapacity(gpa, reserved_count);
     sema.air_extra.items.len += reserved_count;
 
@@ -3470,7 +3461,7 @@ fn analyzeFuncBodyInner(
     }
 
     // Copy the block into place and mark that as the main block.
-    try sema.air_extra.ensureUnusedCapacity(gpa, @typeInfo(Air.Block).@"struct".fields.len +
+    try sema.air_extra.ensureUnusedCapacity(gpa, @typeInfo(Air.Block).@"struct".field_names.len +
         inner_block.instructions.items.len);
     const main_block_index = sema.addExtraAssumeCapacity(Air.Block{
         .body_len = @intCast(inner_block.instructions.items.len),
@@ -3577,8 +3568,8 @@ pub fn processExports(pt: Zcu.PerThread) !void {
     }
 
     // First, construct a mapping of every exported value and Nav to the indices of all its different exports.
-    var nav_exports: std.AutoArrayHashMapUnmanaged(InternPool.Nav.Index, std.ArrayList(Zcu.Export.Index)) = .empty;
-    var uav_exports: std.AutoArrayHashMapUnmanaged(InternPool.Index, std.ArrayList(Zcu.Export.Index)) = .empty;
+    var nav_exports: std.array_hash_map.Auto(InternPool.Nav.Index, std.ArrayList(Zcu.Export.Index)) = .empty;
+    var uav_exports: std.array_hash_map.Auto(InternPool.Index, std.ArrayList(Zcu.Export.Index)) = .empty;
     defer {
         for (nav_exports.values()) |*exports| {
             exports.deinit(gpa);
@@ -3674,7 +3665,7 @@ pub fn processExports(pt: Zcu.PerThread) !void {
     }
 }
 
-const SymbolExports = std.AutoArrayHashMapUnmanaged(InternPool.NullTerminatedString, Zcu.Export.Index);
+const SymbolExports = std.array_hash_map.Auto(InternPool.NullTerminatedString, Zcu.Export.Index);
 
 fn processExportsInner(
     pt: Zcu.PerThread,
@@ -3682,7 +3673,7 @@ fn processExportsInner(
     exported: Zcu.Exported,
     export_indices: []const Zcu.Export.Index,
     skip_linker_work: bool,
-) error{OutOfMemory}!void {
+) error{ OutOfMemory, Canceled }!void {
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
     const ip = &zcu.intern_pool;
@@ -3751,7 +3742,7 @@ pub fn populateTestFunctions(pt: Zcu.PerThread) Allocator.Error!void {
 
     // Our job is to correctly set the value of the `test_functions` declaration if it has been
     // analyzed and sent to codegen, It usually will have been, because the test runner will
-    // reference it, and `std.builtin` shouldn't have type errors. However, if it hasn't been
+    // reference it, and `std.lang` shouldn't have type errors. However, if it hasn't been
     // analyzed, we will just terminate early, since clearly the test runner hasn't referenced
     // `test_functions` so there's no point populating it. More to the the point, we potentially
     // *can't* populate it without doing some type resolution, and... let's try to leave Sema in
@@ -3965,7 +3956,7 @@ pub fn getCoerced(pt: Zcu.PerThread, val: Value, new_ty: Type) Allocator.Error!V
     return .fromInterned(try ip.getCoerced(gpa, io, pt.tid, val.toIntern(), new_ty.toIntern()));
 }
 
-pub fn intType(pt: Zcu.PerThread, signedness: std.builtin.Signedness, bits: u16) Allocator.Error!Type {
+pub fn intType(pt: Zcu.PerThread, signedness: std.lang.Signedness, bits: u16) Allocator.Error!Type {
     return Type.fromInterned(try pt.intern(.{ .int_type = .{
         .signedness = signedness,
         .bits = bits,
@@ -4515,7 +4506,7 @@ pub fn runCodegen(pt: Zcu.PerThread, func_index: InternPool.Index, air: *Air) Ru
     return codegen_result catch |err| {
         switch (err) {
             error.OutOfMemory => comp.setAllocFailure(),
-            error.CodegenFail => zcu.assertCodegenFailed(zcu.funcInfo(func_index).owner_nav),
+            error.AlreadyReported => {},
             error.NoLinkFile => assert(comp.bin_file == null),
             error.BackendDoesNotProduceMir => switch (target_util.zigBackend(
                 &zcu.root_mod.resolved_target.result,
@@ -4534,7 +4525,7 @@ pub fn runCodegen(pt: Zcu.PerThread, func_index: InternPool.Index, air: *Air) Ru
 fn runCodegenInner(pt: Zcu.PerThread, func_index: InternPool.Index, air: *Air) error{
     OutOfMemory,
     Canceled,
-    CodegenFail,
+    AlreadyReported,
     NoLinkFile,
     BackendDoesNotProduceMir,
 }!codegen.AnyMir {
@@ -4548,6 +4539,11 @@ fn runCodegenInner(pt: Zcu.PerThread, func_index: InternPool.Index, air: *Air) e
 
     const codegen_prog_node = zcu.codegen_prog_node.start(fqn.toSlice(ip), 0);
     defer codegen_prog_node.end();
+
+    const tracy_trace = trace(@src());
+    defer tracy_trace.end();
+    tracy_trace.addText(fqn.toSlice(ip));
+    tracy_trace.addTextFmt("func_ip_index={d}", .{func_index});
 
     if (codegen.legalizeFeatures(pt, nav)) |features| {
         try air.legalize(pt, features);
@@ -4605,19 +4601,12 @@ fn runCodegenInner(pt: Zcu.PerThread, func_index: InternPool.Index, air: *Air) e
             switch (err) {
                 error.OutOfMemory => comp.link_diags.setAllocFailure(),
             }
-            return error.CodegenFail;
+            return error.AlreadyReported;
         };
         return error.BackendDoesNotProduceMir;
     }
 
-    return codegen.generateFunction(lf, pt, zcu.navSrcLoc(nav), func_index, air, &liveness) catch |err| switch (err) {
-        error.OutOfMemory,
-        error.CodegenFail,
-        => |e| return e,
-        error.Overflow,
-        error.RelocationNotByteAligned,
-        => return zcu.codegenFail(nav, "unable to codegen: {s}", .{@errorName(err)}),
-    };
+    return codegen.generateFunction(lf, pt, func_index, air, &liveness);
 }
 
 fn printVerboseAir(

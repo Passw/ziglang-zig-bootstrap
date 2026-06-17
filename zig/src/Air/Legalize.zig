@@ -853,14 +853,24 @@ fn legalizeBody(l: *Legalize, body_start: usize, body_len: usize) Error!void {
                     .@"union" => unreachable,
                     .@"struct" => switch (agg_ty.containerLayout(zcu)) {
                         .auto, .@"extern" => {},
-                        .@"packed" => switch (agg_ty.structFieldCount(zcu)) {
-                            0 => unreachable,
-                            // An `aggregate_init` of a packed struct with 1 field is just a fancy bitcast.
-                            1 => continue :inst l.replaceInst(inst, .bitcast, .{ .ty_op = .{
-                                .ty = .fromType(agg_ty),
-                                .operand = @enumFromInt(l.air_extra.items[ty_pl.payload]),
-                            } }),
-                            else => continue :inst l.replaceInst(inst, .block, try l.packedAggregateInitBlockPayload(inst)),
+                        .@"packed" => {
+                            // If any field accounts for the full bit size of the struct, this init
+                            // is just equivalent to a bitcast of that field. This usually means the
+                            // field count is 1, but not always, as there could be zero-bit fields.
+                            const struct_bits = agg_ty.bitSize(zcu);
+                            for (0..agg_ty.structFieldCount(zcu)) |field_index| {
+                                const field_bits = agg_ty.fieldType(field_index, zcu).bitSize(zcu);
+                                if (field_bits == struct_bits) {
+                                    // Just bitcast this field.
+                                    continue :inst l.replaceInst(inst, .bitcast, .{ .ty_op = .{
+                                        .ty = .fromType(agg_ty),
+                                        .operand = @enumFromInt(l.air_extra.items[ty_pl.payload + field_index]),
+                                    } });
+                                }
+                            }
+                            // Otherwise, we will need to use a sequence of bitcasts and shifts to
+                            // combine multiple values' bits.
+                            continue :inst l.replaceInst(inst, .block, try l.packedAggregateInitBlockPayload(inst));
                         },
                     },
                 }
@@ -898,6 +908,7 @@ fn legalizeBody(l: *Legalize, body_start: usize, body_len: usize) Error!void {
             .legalize_vec_elem_val,
             .legalize_vec_store_elem,
             .legalize_compiler_rt_call,
+            .spirv_runtime_array_len,
             => {},
         }
     }
@@ -2513,8 +2524,10 @@ fn packedAggregateInitBlockPayload(l: *Legalize, orig_inst: Air.Inst.Index) Erro
     while (field_idx > 0) {
         field_idx -= 1;
         const field_ty = agg_ty.fieldType(field_idx, zcu);
-        const field_uint_ty = try pt.intType(.unsigned, @intCast(field_ty.bitSize(zcu)));
-        const field_bit_size_ref: Air.Inst.Ref = .fromValue(try pt.intValue(shift_ty, field_ty.bitSize(zcu)));
+        const field_bits: u16 = @intCast(field_ty.bitSize(zcu));
+        assert(field_bits < num_bits);
+        const field_uint_ty = try pt.intType(.unsigned, field_bits);
+        const field_bit_size_ref: Air.Inst.Ref = .fromValue(try pt.intValue(shift_ty, field_bits));
         const field_val: Air.Inst.Ref = @enumFromInt(l.air_extra.items[orig_ty_pl.payload + field_idx]);
 
         const shifted = main_block.addBinOp(l, .shl_exact, cur_uint, field_bit_size_ref).toRef();
@@ -2623,7 +2636,7 @@ const Block = struct {
             .data = .{ .legalize_compiler_rt_call = .{
                 .func = func,
                 .payload = payload: {
-                    const extra_len = @typeInfo(Air.Call).@"struct".fields.len + args.len;
+                    const extra_len = @typeInfo(Air.Call).@"struct".field_names.len + args.len;
                     try l.air_extra.ensureUnusedCapacity(l.pt.zcu.gpa, extra_len);
                     const index = l.addExtra(Air.Call, .{ .args_len = @intCast(args.len) }) catch unreachable;
                     l.air_extra.appendSliceAssumeCapacity(@ptrCast(args));
@@ -2644,7 +2657,7 @@ const Block = struct {
             });
             return;
         }
-        const panic_fn_val = zcu.builtin_decl_values.get(panic_id.toBuiltin());
+        const panic_fn_val = zcu.std_lang_decl_values.get(panic_id.toStdLangDecl());
         _ = b.add(l, .{
             .tag = .call,
             .data = .{ .pl_op = .{
@@ -2901,12 +2914,12 @@ fn addInstAssumeCapacity(l: *Legalize, inst: Air.Inst) Air.Inst.Index {
 }
 
 fn addExtra(l: *Legalize, comptime Extra: type, extra: Extra) Error!u32 {
-    const extra_fields = @typeInfo(Extra).@"struct".fields;
-    try l.air_extra.ensureUnusedCapacity(l.pt.zcu.gpa, extra_fields.len);
-    defer inline for (extra_fields) |field| l.air_extra.appendAssumeCapacity(switch (field.type) {
-        u32 => @field(extra, field.name),
-        Air.Inst.Ref => @intFromEnum(@field(extra, field.name)),
-        else => @compileError(@typeName(field.type)),
+    const extra_info = @typeInfo(Extra).@"struct";
+    try l.air_extra.ensureUnusedCapacity(l.pt.zcu.gpa, extra_info.field_names.len);
+    defer inline for (extra_info.field_names, extra_info.field_types) |field_name, field_type| l.air_extra.appendAssumeCapacity(switch (field_type) {
+        u32 => @field(extra, field_name),
+        Air.Inst.Ref => @intFromEnum(@field(extra, field_name)),
+        else => @compileError(@typeName(field_type)),
     });
     return @intCast(l.air_extra.items.len);
 }
@@ -2942,7 +2955,7 @@ fn compilerRtCall(
     const func_ret_ty = func.returnType();
 
     if (func_ret_ty.toIntern() == result_ty.toIntern()) {
-        try l.air_extra.ensureUnusedCapacity(gpa, @typeInfo(Air.Call).@"struct".fields.len + args.len);
+        try l.air_extra.ensureUnusedCapacity(gpa, @typeInfo(Air.Call).@"struct".field_names.len + args.len);
         const payload = l.addExtra(Air.Call, .{ .args_len = @intCast(args.len) }) catch unreachable;
         l.air_extra.appendSliceAssumeCapacity(@ptrCast(args));
         return l.replaceInst(orig_inst, .legalize_compiler_rt_call, .{ .legalize_compiler_rt_call = .{

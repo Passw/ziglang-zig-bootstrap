@@ -918,6 +918,11 @@ pub const Inst = struct {
         /// Uses the `ty` field.
         c_va_start,
 
+        /// Implements `.len` field for `@SpirvType(.{ .runtime_array = T })`.
+        /// Result type is always `u32`.
+        /// Uses the `ty_pl` field, payload is `StructField`.
+        spirv_runtime_array_len,
+
         /// Implements @workItemId builtin.
         /// Result type is always `u32`
         /// Uses the `pl_op` field, payload is the dimension to get the work item id for.
@@ -1032,7 +1037,6 @@ pub const Inst = struct {
     /// The ref `none` is an exception: it has the tag bit set but refers to the InternPool.
     pub const Ref = enum(u32) {
         u0_type = @intFromEnum(InternPool.Index.u0_type),
-        i0_type = @intFromEnum(InternPool.Index.i0_type),
         u1_type = @intFromEnum(InternPool.Index.u1_type),
         u8_type = @intFromEnum(InternPool.Index.u8_type),
         i8_type = @intFromEnum(InternPool.Index.i8_type),
@@ -1261,17 +1265,17 @@ pub const Inst = struct {
         },
         atomic_load: struct {
             ptr: Ref,
-            order: std.builtin.AtomicOrder,
+            order: std.lang.AtomicOrder,
         },
         prefetch: struct {
             ptr: Ref,
-            rw: std.builtin.PrefetchOptions.Rw,
+            rw: std.lang.PrefetchOptions.Rw,
             locality: u2,
-            cache: std.builtin.PrefetchOptions.Cache,
+            cache: std.lang.PrefetchOptions.Cache,
         },
         reduce: struct {
             operand: Ref,
-            operation: std.builtin.ReduceOp,
+            operation: std.lang.ReduceOp,
         },
         ty_nav: struct {
             ty: InternPool.Index,
@@ -1333,8 +1337,8 @@ pub const CondBr = struct {
     else_body_len: u32,
     branch_hints: BranchHints,
     pub const BranchHints = packed struct(u32) {
-        true: std.builtin.BranchHint = .none,
-        false: std.builtin.BranchHint = .none,
+        true: std.lang.BranchHint = .none,
+        false: std.lang.BranchHint = .none,
         then_cov: CoveragePoint = .none,
         else_cov: CoveragePoint = .none,
         _: u24 = 0,
@@ -1482,7 +1486,7 @@ pub const Asm = struct {
     /// Length of the assembly source in bytes.
     source_len: u32,
     inputs_len: u32,
-    /// A comptime `std.builtin.assembly.Clobbers` value for the target architecture.
+    /// A comptime `std.lang.assembly.Clobbers` value for the target architecture.
     clobbers: InternPool.Index,
     flags: Flags,
 
@@ -1500,11 +1504,11 @@ pub const Cmpxchg = struct {
     /// 0b00000000000000000000000000XXX000 - failure_order
     flags: u32,
 
-    pub fn successOrder(self: Cmpxchg) std.builtin.AtomicOrder {
+    pub fn successOrder(self: Cmpxchg) std.lang.AtomicOrder {
         return @enumFromInt(@as(u3, @truncate(self.flags)));
     }
 
-    pub fn failureOrder(self: Cmpxchg) std.builtin.AtomicOrder {
+    pub fn failureOrder(self: Cmpxchg) std.lang.AtomicOrder {
         return @enumFromInt(@as(u3, @intCast(self.flags >> 3)));
     }
 };
@@ -1515,11 +1519,11 @@ pub const AtomicRmw = struct {
     /// 0b0000000000000000000000000XXXX000 - op
     flags: u32,
 
-    pub fn ordering(self: AtomicRmw) std.builtin.AtomicOrder {
+    pub fn ordering(self: AtomicRmw) std.lang.AtomicOrder {
         return @enumFromInt(@as(u3, @truncate(self.flags)));
     }
 
-    pub fn op(self: AtomicRmw) std.builtin.AtomicRmwOp {
+    pub fn op(self: AtomicRmw) std.lang.AtomicRmwOp {
         return @enumFromInt(@as(u4, @intCast(self.flags >> 3)));
     }
 };
@@ -1794,6 +1798,7 @@ pub fn typeOfIndex(air: *const Air, inst: Air.Inst.Index, ip: *const InternPool)
         .work_item_id,
         .work_group_size,
         .work_group_id,
+        .spirv_runtime_array_len,
         => return .u32,
 
         .legalize_compiler_rt_call => return datas[@intFromEnum(inst)].legalize_compiler_rt_call.func.returnType(),
@@ -1806,15 +1811,15 @@ pub fn typeOfIndex(air: *const Air, inst: Air.Inst.Index, ip: *const InternPool)
 /// Returns the requested data, as well as the new index which is at the start of the
 /// trailers for the object.
 pub fn extraData(air: Air, comptime T: type, index: usize) struct { data: T, end: usize } {
-    const fields = std.meta.fields(T);
+    const info = @typeInfo(T).@"struct";
     var i: usize = index;
     var result: T = undefined;
-    inline for (fields) |field| {
-        @field(result, field.name) = switch (field.type) {
+    inline for (info.field_names, info.field_types) |field_name, field_type| {
+        @field(result, field_name) = switch (field_type) {
             u32 => air.extra.items[i],
             InternPool.Index, Inst.Ref => @enumFromInt(air.extra.items[i]),
             i32, CondBr.BranchHints, Asm.Flags => @bitCast(air.extra.items[i]),
-            else => @compileError("bad field type: " ++ @typeName(field.type)),
+            else => @compileError("bad field type: " ++ @typeName(field_type)),
         };
         i += 1;
     }
@@ -2057,6 +2062,7 @@ pub fn mustLower(air: Air, inst: Air.Inst.Index, ip: *const InternPool) bool {
         .work_group_size,
         .work_group_id,
         .legalize_vec_elem_val,
+        .spirv_runtime_array_len,
         => false,
 
         .is_non_null_ptr, .is_null_ptr, .is_non_err_ptr, .is_err_ptr => air.typeOf(data.un_op, ip).isVolatilePtrIp(ip),
@@ -2078,14 +2084,14 @@ pub const UnwrappedSwitch = struct {
     cases_start: u32,
 
     /// Asserts that `case_idx < us.cases_len`.
-    pub fn getHint(us: UnwrappedSwitch, case_idx: u32) std.builtin.BranchHint {
+    pub fn getHint(us: UnwrappedSwitch, case_idx: u32) std.lang.BranchHint {
         assert(case_idx < us.cases_len);
         return us.getHintInner(case_idx);
     }
-    pub fn getElseHint(us: UnwrappedSwitch) std.builtin.BranchHint {
+    pub fn getElseHint(us: UnwrappedSwitch) std.lang.BranchHint {
         return us.getHintInner(us.cases_len);
     }
-    fn getHintInner(us: UnwrappedSwitch, idx: u32) std.builtin.BranchHint {
+    fn getHintInner(us: UnwrappedSwitch, idx: u32) std.lang.BranchHint {
         const bag = us.air.extra.items[us.branch_hints_start..][idx / 10];
         const bits: u3 = @truncate(bag >> @intCast(3 * (idx % 10)));
         return @enumFromInt(bits);
@@ -2631,7 +2637,7 @@ pub const CompilerRtFunc = enum(u32) {
         };
     }
 
-    pub fn @"callconv"(f: CompilerRtFunc, target: *const std.Target) std.builtin.CallingConvention {
+    pub fn @"callconv"(f: CompilerRtFunc, target: *const std.Target) std.lang.CallingConvention {
         const use_gnu_f16_abi = switch (target.cpu.arch) {
             .wasm32,
             .wasm64,

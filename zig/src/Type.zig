@@ -19,7 +19,7 @@ const Type = @This();
 
 ip_index: InternPool.Index,
 
-pub fn zigTypeTag(ty: Type, zcu: *const Zcu) std.builtin.TypeId {
+pub fn zigTypeTag(ty: Type, zcu: *const Zcu) std.lang.TypeId {
     return zcu.intern_pool.zigTypeTag(ty.toIntern());
 }
 
@@ -170,6 +170,7 @@ pub fn classify(start_ty: Type, zcu: *const Zcu) Class {
 
         .func_type => .fully_comptime,
 
+        .spirv_type => if (cur_ty.isSpirvRuntimeArray(zcu)) .runtime else .no_possible_value,
         .opaque_type => .no_possible_value,
 
         .error_union_type => |eu| {
@@ -323,6 +324,7 @@ pub fn isSelfComparable(ty: Type, zcu: *const Zcu, is_equality_cmp: bool) bool {
         .error_set,
         .@"fn",
         .@"opaque",
+        .spirv,
         .@"anyframe",
         .@"enum",
         .enum_literal,
@@ -383,8 +385,7 @@ pub fn ptrInfo(ty: Type, zcu: *const Zcu) InternPool.Key.PtrType {
     };
 }
 
-pub fn eql(a: Type, b: Type, zcu: *const Zcu) bool {
-    _ = zcu; // TODO: remove this parameter
+pub fn eql(a: Type, b: Type) bool {
     // The InternPool data structure hashes based on Key to make interned objects
     // unique. An Index can be treated simply as u32 value for the
     // purpose of Type/Value hashing and equality.
@@ -617,6 +618,10 @@ pub fn print(ty: Type, writer: *std.Io.Writer, pt: Zcu.PerThread, ctx: ?*Compari
             const name = ip.loadEnumType(ty.toIntern()).name;
             try writer.print("{f}", .{name.fmt(ip)});
         },
+        .spirv_type => {
+            const name = ip.loadSpirvType(ty.toIntern()).name;
+            try writer.print("{f}", .{name.fmt(ip)});
+        },
         .func_type => |fn_info| {
             if (fn_info.is_noinline) {
                 try writer.writeAll("noinline ");
@@ -704,6 +709,14 @@ pub fn toIntern(ty: Type) InternPool.Index {
     return ty.ip_index;
 }
 
+pub fn isSpirvRuntimeArray(ty: Type, zcu: *const Zcu) bool {
+    const ip = &zcu.intern_pool;
+    return switch (ip.indexToKey(ty.toIntern())) {
+        .spirv_type => ip.loadSpirvType(ty.toIntern()).flags.tag == .runtime_array,
+        else => false,
+    };
+}
+
 pub fn toValue(self: Type) Value {
     return .fromInterned(self.toIntern());
 }
@@ -751,6 +764,7 @@ pub fn hasWellDefinedLayout(ty: Type, zcu: *const Zcu) bool {
         .error_set_type,
         .inferred_error_set_type,
         .tuple_type,
+        .spirv_type,
         .opaque_type,
         .anyframe_type,
         // These are function bodies, not function pointers.
@@ -903,7 +917,7 @@ pub fn ptrAlignment(ptr_ty: Type, zcu: *Zcu) Alignment {
     return Type.fromInterned(ptr_key.child).abiAlignment(zcu);
 }
 
-pub fn ptrAddressSpace(ty: Type, zcu: *const Zcu) std.builtin.AddressSpace {
+pub fn ptrAddressSpace(ty: Type, zcu: *const Zcu) std.lang.AddressSpace {
     return switch (zcu.intern_pool.indexToKey(ty.toIntern())) {
         .ptr_type => |ptr_type| ptr_type.flags.address_space,
         .opt_type => |child| zcu.intern_pool.indexToKey(child).ptr_type.flags.address_space,
@@ -935,7 +949,7 @@ pub fn abiAlignment(ty: Type, zcu: *const Zcu) Alignment {
                     const bytes = ((elem_bits * vector_type.len) + 7) / 8;
                     return .fromByteUnits(std.math.ceilPowerOfTwoAssert(u32, bytes));
                 },
-                .stage2_c, .stage2_wasm => return Type.fromInterned(vector_type.child).abiAlignment(zcu),
+                .stage2_c, .stage2_wasm => return Type.fromInterned(vector_type.child).defaultStructFieldAlignment(.auto, zcu),
                 .stage2_x86_64 => {
                     if (vector_type.child == .bool_type) {
                         if (vector_type.len > 256 and target.cpu.has(.x86, .avx512f)) return .@"64";
@@ -1038,6 +1052,7 @@ pub fn abiAlignment(ty: Type, zcu: *const Zcu) Alignment {
             }
         },
         .enum_type => Type.fromInterned(ip.loadEnumType(ty.toIntern()).int_tag_type).abiAlignment(zcu),
+        .spirv_type => if (ty.isSpirvRuntimeArray(zcu)) ty.childType(zcu).abiAlignment(zcu) else .@"1",
         .opaque_type => .@"1",
 
         // values, not types
@@ -1094,13 +1109,18 @@ pub fn abiSize(ty: Type, zcu: *const Zcu) u64 {
         },
         .opt_type => |child_ty_ip| {
             const child_ty: Type = .fromInterned(child_ty_ip);
-            if (child_ty.classify(zcu) == .no_possible_value) return 0;
-            if (ty.optionalReprIsPayload(zcu)) return child_ty.abiSize(zcu);
-            // Optional types are represented as a struct with the child type as the first
-            // field and a boolean as the second. Since the child type's abi alignment is
-            // guaranteed to be >= that of bool's (1 byte) the added size is exactly equal
-            // to the child type's ABI alignment.
-            return child_ty.abiSize(zcu) + child_ty.abiAlignment(zcu).toByteUnits().?;
+            switch (child_ty.classify(zcu)) {
+                .no_possible_value => return 0, // we are OPV
+                .fully_comptime => return 0, // we are also fully_comptime (same justification as error unions, see below)
+                .one_possible_value, .partially_comptime, .runtime => {
+                    if (ty.optionalReprIsPayload(zcu)) return child_ty.abiSize(zcu);
+                    // Optional types are represented as a struct with the child type as the first
+                    // field and a boolean as the second. Since the child type's abi alignment is
+                    // guaranteed to be >= that of bool's (1 byte) the added size is exactly equal
+                    // to the child type's ABI alignment.
+                    return child_ty.abiSize(zcu) + child_ty.abiAlignment(zcu).toByteUnits().?;
+                },
+            }
         },
         .error_set_type, .inferred_error_set_type => errorAbiSize(zcu),
         .error_union_type => |error_union| {
@@ -1178,6 +1198,7 @@ pub fn abiSize(ty: Type, zcu: *const Zcu) u64 {
             }
         },
         .enum_type => Type.fromInterned(ip.loadEnumType(ty.toIntern()).int_tag_type).abiSize(zcu),
+        .spirv_type => unreachable,
         .opaque_type => unreachable,
 
         // values, not types
@@ -1304,7 +1325,7 @@ pub fn bitSize(ty: Type, zcu: *const Zcu) u64 {
         .tuple_type,
         => ty.abiSize(zcu) * 8,
 
-        .opaque_type => unreachable,
+        .opaque_type, .spirv_type => unreachable,
 
         // values, not types
         .undef,
@@ -1337,12 +1358,12 @@ pub fn isSinglePointer(ty: Type, zcu: *const Zcu) bool {
 }
 
 /// Asserts `ty` is a pointer.
-pub fn ptrSize(ty: Type, zcu: *const Zcu) std.builtin.Type.Pointer.Size {
+pub fn ptrSize(ty: Type, zcu: *const Zcu) std.lang.Type.Pointer.Size {
     return ty.ptrSizeOrNull(zcu).?;
 }
 
 /// Returns `null` if `ty` is not a pointer.
-pub fn ptrSizeOrNull(ty: Type, zcu: *const Zcu) ?std.builtin.Type.Pointer.Size {
+pub fn ptrSizeOrNull(ty: Type, zcu: *const Zcu) ?std.lang.Type.Pointer.Size {
     return switch (zcu.intern_pool.indexToKey(ty.toIntern())) {
         .ptr_type => |ptr_info| ptr_info.flags.size,
         else => null,
@@ -1506,14 +1527,17 @@ pub fn nullablePtrElem(ty: Type, zcu: *const Zcu) Type {
 /// * `[]T`
 /// * `[*]T`
 /// * `[*c]T`
+/// * `@SpirvType(.{ .runtime_array = T })`
 pub fn indexableElem(ty: Type, zcu: *const Zcu) Type {
     const ip = &zcu.intern_pool;
     return switch (ip.indexToKey(ty.toIntern())) {
         inline .array_type, .vector_type => |arr| .fromInterned(arr.child),
+        .spirv_type => ty.childType(zcu),
         .ptr_type => |ptr_type| switch (ptr_type.flags.size) {
             .many, .slice, .c => .fromInterned(ptr_type.child),
             .one => switch (ip.indexToKey(ptr_type.child)) {
                 inline .array_type, .vector_type => |arr| .fromInterned(arr.child),
+                .spirv_type => Type.fromInterned(ptr_type.child).childType(zcu),
                 else => unreachable,
             },
         },
@@ -1627,7 +1651,7 @@ pub fn unionGetLayout(ty: Type, zcu: *const Zcu) Zcu.UnionLayout {
     return Type.getUnionLayout(union_obj, zcu);
 }
 
-pub fn containerLayout(ty: Type, zcu: *const Zcu) std.builtin.Type.ContainerLayout {
+pub fn containerLayout(ty: Type, zcu: *const Zcu) std.lang.Type.ContainerLayout {
     const ip = &zcu.intern_pool;
     return switch (ip.indexToKey(ty.toIntern())) {
         .tuple_type => .auto,
@@ -1859,6 +1883,7 @@ pub fn intInfo(starting_ty: Type, zcu: *const Zcu) InternPool.Key.IntType {
             .func_type => unreachable,
             .simple_type => unreachable, // handled via Index enum tag above
 
+            .spirv_type => unreachable,
             .opaque_type => unreachable,
 
             // values, not types
@@ -1949,7 +1974,7 @@ pub fn fnReturnType(ty: Type, zcu: *const Zcu) Type {
 }
 
 /// Asserts the type is a function.
-pub fn fnCallingConvention(ty: Type, zcu: *const Zcu) std.builtin.CallingConvention {
+pub fn fnCallingConvention(ty: Type, zcu: *const Zcu) std.lang.CallingConvention {
     return zcu.intern_pool.indexToKey(ty.toIntern()).func_type.cc;
 }
 
@@ -2027,6 +2052,7 @@ pub fn onePossibleValue(ty: Type, pt: Zcu.PerThread) !?Value {
         .error_set_type,
         .inferred_error_set_type,
         .opaque_type,
+        .spirv_type,
         => null,
 
         .simple_type => |t| switch (t) {
@@ -2214,10 +2240,12 @@ pub fn isIndexable(ty: Type, zcu: *const Zcu) bool {
             .one => switch (ty.childType(zcu).zigTypeTag(zcu)) {
                 .array, .vector => true,
                 .@"struct" => ty.childType(zcu).isTuple(zcu),
+                .spirv => ty.childType(zcu).isSpirvRuntimeArray(zcu),
                 else => false,
             },
         },
         .@"struct" => ty.isTuple(zcu),
+        .spirv => ty.isSpirvRuntimeArray(zcu),
         else => false,
     };
 }
@@ -2272,7 +2300,7 @@ pub fn minInt(ty: Type, pt: Zcu.PerThread, dest_ty: Type) !Value {
 pub fn minIntScalar(ty: Type, pt: Zcu.PerThread, dest_ty: Type) !Value {
     const zcu = pt.zcu;
     const info = ty.intInfo(zcu);
-    if (info.signedness == .unsigned or info.bits == 0) return pt.intValue(dest_ty, 0);
+    if (info.signedness == .unsigned) return pt.intValue(dest_ty, 0);
 
     if (std.math.cast(u6, info.bits - 1)) |shift| {
         const n = @as(i64, std.math.minInt(i64)) >> (63 - shift);
@@ -2477,7 +2505,7 @@ pub fn explicitFieldAlignment(ty: Type, index: usize, zcu: *const Zcu) Alignment
 /// Asserts that the layout of `field_ty` is resolved. Asserts that `layout` is not `.@"packed"`.
 pub fn defaultStructFieldAlignment(
     field_ty: Type,
-    layout: std.builtin.Type.ContainerLayout,
+    layout: std.lang.Type.ContainerLayout,
     zcu: *const Zcu,
 ) Alignment {
     const overalign_big_int = switch (layout) {
@@ -2487,8 +2515,13 @@ pub fn defaultStructFieldAlignment(
     };
     const abi_align = field_ty.abiAlignment(zcu);
     assert(abi_align != .none);
-    if (overalign_big_int and field_ty.isAbiInt(zcu) and field_ty.intInfo(zcu).bits >= 128) {
-        return abi_align.maxStrict(.@"16");
+    // We check for anything over 64 here, because the C backend will lower e.g. u64 to a 128-bit
+    // integer, which has 16-byte alignment.
+    if (overalign_big_int and
+        ((field_ty.isAbiInt(zcu) and field_ty.intInfo(zcu).bits > 64) or
+            (field_ty.toIntern() == .f80_type and zcu.getTarget().cTypeBitSize(.longdouble) != 80)))
+    {
+        return abi_align.maxStrict(if (zcu.getTarget().cpu.arch == .s390x) .@"8" else .@"16");
     }
     return abi_align;
 }
@@ -2834,6 +2867,7 @@ pub fn elemPtrType(ptr_ty: Type, index: ?u64, pt: Zcu.PerThread) Allocator.Error
         .slice, .many, .c => .fromInterned(ptr_info.child),
         .one => switch (ip.indexToKey(ptr_info.child)) {
             .array_type => |array_type| .fromInterned(array_type.child),
+            .spirv_type => Type.fromInterned(ptr_info.child).childType(zcu),
             else => unreachable,
         },
     };
@@ -3085,6 +3119,7 @@ pub fn unpackable(ty: Type, zcu: *const Zcu) ?UnpackableReason {
 
         .noreturn,
         .@"opaque",
+        .spirv,
         .error_union,
         .error_set,
         .frame,
@@ -3160,6 +3195,7 @@ pub fn validateExtern(ty: Type, position: ExternPosition, zcu: *const Zcu) bool 
         .noreturn => position == .ret_ty,
 
         .@"opaque",
+        .spirv,
         .bool,
         .float,
         .@"anyframe",
@@ -3227,7 +3263,7 @@ pub fn validateExtern(ty: Type, position: ExternPosition, zcu: *const Zcu) bool 
         .optional => ty.isPtrLikeOptional(zcu),
     };
 }
-fn validateExternCallconv(cc: std.builtin.CallingConvention) bool {
+fn validateExternCallconv(cc: std.lang.CallingConvention) bool {
     return switch (cc) {
         // For now we want to authorize PTX kernel to use zig objects, even if we end up exposing the ABI.
         // The goal is to experiment with more integrated CPU/GPU code.
@@ -3251,6 +3287,7 @@ pub fn assertHasLayout(ty: Type, zcu: *const Zcu) void {
         .simple_type,
         .opaque_type,
         .error_set_type,
+        .spirv_type,
         .inferred_error_set_type,
         => {},
         .func_type => |func_type| {
@@ -3303,7 +3340,7 @@ pub fn assertHasLayout(ty: Type, zcu: *const Zcu) void {
 }
 
 /// Recursively walks the type and marks for each subtype how many times it has been seen
-fn collectSubtypes(ty: Type, pt: Zcu.PerThread, visited: *std.AutoArrayHashMapUnmanaged(Type, u16)) error{OutOfMemory}!void {
+fn collectSubtypes(ty: Type, pt: Zcu.PerThread, visited: *std.array_hash_map.Auto(Type, u16)) error{OutOfMemory}!void {
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
 
@@ -3352,6 +3389,7 @@ fn collectSubtypes(ty: Type, pt: Zcu.PerThread, visited: *std.AutoArrayHashMapUn
         .union_type,
         .opaque_type,
         .enum_type,
+        .spirv_type,
         .simple_type,
         .int_type,
         => {},
@@ -3417,8 +3455,8 @@ fn shouldDedupeType(ty: Type, ctx: *Comparison, pt: Zcu.PerThread) error{OutOfMe
 /// the subtype length and number of occurences. Placeholders are then found by
 /// iterating `type_dedupe_cache` which caches the inline/placeholder decisions.
 pub const Comparison = struct {
-    type_occurrences: std.AutoArrayHashMapUnmanaged(Type, u16),
-    type_dedupe_cache: std.AutoArrayHashMapUnmanaged(Type, DedupeEntry),
+    type_occurrences: std.array_hash_map.Auto(Type, u16),
+    type_dedupe_cache: std.array_hash_map.Auto(Type, DedupeEntry),
     placeholder_index: u8,
 
     pub const Placeholder = struct {

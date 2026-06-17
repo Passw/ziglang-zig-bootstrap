@@ -59,14 +59,14 @@ pub const Mir = struct {
     /// Key is the value of the UAV; value is the UAV's alignment, or
     /// `.none` for natural alignment. The specified alignment is never
     /// less than the natural alignment.
-    need_uavs: std.AutoArrayHashMapUnmanaged(InternPool.Index, Alignment),
+    need_uavs: std.array_hash_map.Auto(InternPool.Index, Alignment),
     ctype_deps: CType.Dependencies,
     /// Key is an enum type for which we need a generated `@tagName` function.
-    need_tag_name_funcs: std.AutoArrayHashMapUnmanaged(InternPool.Index, void),
+    need_tag_name_funcs: std.array_hash_map.Auto(InternPool.Index, void),
     /// Key is a function Nav for which we need a generated `zig_never_tail` wrapper.
-    need_never_tail_funcs: std.AutoArrayHashMapUnmanaged(InternPool.Nav.Index, void),
+    need_never_tail_funcs: std.array_hash_map.Auto(InternPool.Nav.Index, void),
     /// Key is a function Nav for which we need a generated `zig_never_inline` wrapper.
-    need_never_inline_funcs: std.AutoArrayHashMapUnmanaged(InternPool.Nav.Index, void),
+    need_never_inline_funcs: std.array_hash_map.Auto(InternPool.Nav.Index, void),
 
     pub fn deinit(mir: *Mir, gpa: Allocator) void {
         gpa.free(mir.fwd_decl);
@@ -80,7 +80,7 @@ pub const Mir = struct {
     }
 };
 
-pub const Error = Writer.Error || Allocator.Error || error{AnalysisFail};
+pub const Error = Writer.Error || Allocator.Error || error{AlreadyReported};
 
 pub const CType = @import("c/type.zig").CType;
 
@@ -164,8 +164,8 @@ const LocalType = struct {
 };
 
 const LocalIndex = u16;
-const LocalsList = std.AutoArrayHashMapUnmanaged(LocalIndex, void);
-const LocalsMap = std.AutoArrayHashMapUnmanaged(LocalType, LocalsList);
+const LocalsList = std.array_hash_map.Auto(LocalIndex, void);
+const LocalsMap = std.array_hash_map.Auto(LocalType, LocalsList);
 
 const ValueRenderLocation = enum {
     initializer,
@@ -391,11 +391,11 @@ pub const Function = struct {
     code: Writer.Allocating,
     indent_counter: usize,
     /// Key is an enum type for which we need a generated `@tagName` function.
-    need_tag_name_funcs: std.AutoArrayHashMapUnmanaged(InternPool.Index, void),
+    need_tag_name_funcs: std.array_hash_map.Auto(InternPool.Index, void),
     /// Key is a function Nav for which we need a generated `zig_never_tail` wrapper.
-    need_never_tail_funcs: std.AutoArrayHashMapUnmanaged(InternPool.Nav.Index, void),
+    need_never_tail_funcs: std.array_hash_map.Auto(InternPool.Nav.Index, void),
     /// Key is a function Nav for which we need a generated `zig_never_inline` wrapper.
-    need_never_inline_funcs: std.AutoArrayHashMapUnmanaged(InternPool.Nav.Index, void),
+    need_never_inline_funcs: std.array_hash_map.Auto(InternPool.Nav.Index, void),
     func_index: InternPool.Index,
     /// All the locals, to be emitted at the top of the function.
     locals: std.ArrayList(LocalType) = .empty,
@@ -407,7 +407,7 @@ pub const Function = struct {
     /// of variable declarations at the top of a function, sorted descending
     /// by type alignment.
     /// The value is whether the alloc needs to be emitted in the header.
-    allocs: std.AutoArrayHashMapUnmanaged(LocalIndex, bool) = .empty,
+    allocs: std.array_hash_map.Auto(LocalIndex, bool) = .empty,
     /// Maps from `loop_switch_br` instructions to the allocated local used
     /// for the switch cond. Dispatches should set this local to the new cond.
     loop_switch_conds: std.AutoHashMapUnmanaged(Air.Inst.Index, LocalIndex) = .empty,
@@ -445,7 +445,7 @@ pub const Function = struct {
     }
 
     fn wantSafety(f: *Function) bool {
-        return switch (f.dg.pt.zcu.optimizeMode()) {
+        return switch (f.dg.mod.optimize_mode) {
             .Debug, .ReleaseSafe => true,
             .ReleaseFast, .ReleaseSmall => false,
         };
@@ -637,21 +637,17 @@ pub const DeclGen = struct {
     owner_nav: InternPool.Nav.Index.Optional,
     is_naked_fn: bool,
     expected_block: ?u32,
-    error_msg: ?*Zcu.ErrorMsg,
     ctype_deps: CType.Dependencies,
     /// This map contains all the UAVs we saw generating this function.
     /// `link.C` will merge them into its `uavs`/`aligned_uavs` fields.
     /// Key is the value of the UAV; value is the UAV's alignment, or
     /// `.none` for natural alignment. The specified alignment is never
     /// less than the natural alignment.
-    uavs: std.AutoArrayHashMapUnmanaged(InternPool.Index, Alignment),
+    uavs: std.array_hash_map.Auto(InternPool.Index, Alignment),
 
     fn fail(dg: *DeclGen, comptime format: []const u8, args: anytype) Error {
         @branchHint(.cold);
-        const zcu = dg.pt.zcu;
-        const src_loc = zcu.navSrcLoc(dg.owner_nav.unwrap().?);
-        dg.error_msg = try Zcu.ErrorMsg.create(dg.gpa, src_loc, format, args);
-        return error.AnalysisFail;
+        return dg.pt.zcu.codegenFail(dg.owner_nav.unwrap().?, format, args);
     }
 
     fn renderUav(
@@ -906,6 +902,7 @@ pub const DeclGen = struct {
             .tuple_type,
             .union_type,
             .opaque_type,
+            .spirv_type,
             .enum_type,
             .func_type,
             .error_set_type,
@@ -1123,7 +1120,7 @@ pub const DeclGen = struct {
                     }
                     try w.writeByte('{');
                     const ai = ty.arrayInfo(zcu);
-                    if (ai.elem_type.eql(.u8, zcu)) {
+                    if (ai.elem_type.eql(.u8)) {
                         var literal: StringLiteral = .init(w, @intCast(ty.arrayLenIncludingSentinel(zcu)));
                         try literal.start();
                         var index: usize = 0;
@@ -1301,7 +1298,7 @@ pub const DeclGen = struct {
             else => .initializer,
         };
 
-        const safety_on = switch (zcu.optimizeMode()) {
+        const safety_on = switch (dg.mod.optimize_mode) {
             .Debug, .ReleaseSafe => true,
             .ReleaseFast, .ReleaseSmall => false,
         };
@@ -1542,7 +1539,7 @@ pub const DeclGen = struct {
                     }
                     try w.writeByte('{');
                     const ai = ty.arrayInfo(zcu);
-                    if (ai.elem_type.eql(.u8, zcu)) {
+                    if (ai.elem_type.eql(.u8)) {
                         var literal: StringLiteral = .init(w, @intCast(ty.arrayLenIncludingSentinel(zcu)));
                         try literal.start();
                         var index: u64 = 0;
@@ -1569,6 +1566,7 @@ pub const DeclGen = struct {
                 },
                 .anyframe_type,
                 .opaque_type,
+                .spirv_type,
                 .func_type,
                 => unreachable,
 
@@ -1979,9 +1977,9 @@ pub const DeclGen = struct {
         }
         switch (CType.classifyInt(ty, zcu)) {
             .void => unreachable, // opv
-            .small => try w.print("{c}{d}", .{
+            .small => |s| try w.print("{c}{d}", .{
                 signAbbrev(ty.intInfo(zcu).signedness),
-                ty.abiSize(zcu) * 8,
+                s.bits(zcu.getTarget()),
             }),
             .big => try w.writeAll("big"),
         }
@@ -1997,7 +1995,7 @@ pub const DeclGen = struct {
             .bits => {},
         }
 
-        const int_info: std.builtin.Type.Int = if (ty.isAbiInt(zcu)) ty.intInfo(zcu) else .{
+        const int_info: std.lang.Type.Int = if (ty.isAbiInt(zcu)) ty.intInfo(zcu) else .{
             .signedness = .unsigned,
             .bits = @intCast(ty.bitSize(zcu)),
         };
@@ -2184,15 +2182,13 @@ pub fn genLazyCallModifierFn(
 pub fn generate(
     lf: *link.File,
     pt: Zcu.PerThread,
-    src_loc: Zcu.LazySrcLoc,
     func_index: InternPool.Index,
     air: *const Air,
     liveness: *const ?Air.Liveness,
-) @import("../codegen.zig").CodeGenError!Mir {
+) @import("../codegen.zig").Error!Mir {
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
 
-    _ = src_loc;
     assert(lf.tag == .c);
 
     const func = zcu.funcInfo(func_index);
@@ -2210,7 +2206,6 @@ pub fn generate(
             .arena = arena.allocator(),
             .pt = pt,
             .mod = zcu.navFileScope(func.owner_nav).mod.?,
-            .error_msg = null,
             .owner_nav = func.owner_nav.toOptional(),
             .is_naked_fn = Type.fromInterned(func.ty).fnCallingConvention(zcu) == .naked,
             .expected_block = null,
@@ -2237,9 +2232,8 @@ pub fn generate(
     defer code_header.deinit();
 
     genFunc(&function, &fwd_decl.writer, &code_header.writer) catch |err| switch (err) {
-        error.AnalysisFail => return zcu.codegenFailMsg(func.owner_nav, function.dg.error_msg.?),
         error.WriteFailed => return error.OutOfMemory,
-        error.OutOfMemory => |e| return e,
+        else => |e| return e,
     };
 
     var mir: Mir = .{
@@ -2885,6 +2879,7 @@ fn genBodyInner(f: *Function, body: []const Air.Inst.Index) Error!void {
             .work_item_id,
             .work_group_size,
             .work_group_id,
+            .spirv_runtime_array_len,
             => unreachable,
 
             // Instructions that are known to always be `noreturn` based on their tag.
@@ -3433,7 +3428,7 @@ fn airStore(f: *Function, inst: Air.Inst.Index, safety: bool) !CValue {
     if (!is_aligned) {
         // For this memcpy to safely work we need the rhs to have the same
         // underlying type as the lhs (i.e. they must both be arrays of the same underlying type).
-        assert(src_ty.eql(.fromInterned(ptr_info.child), zcu));
+        assert(src_ty.eql(.fromInterned(ptr_info.child)));
 
         const v = try Vectorize.start(f, inst, w, ptr_ty);
         try w.writeAll("memcpy((char *)");
@@ -3878,7 +3873,7 @@ fn airSlice(f: *Function, inst: Air.Inst.Index) !CValue {
 fn airCall(
     f: *Function,
     inst: Air.Inst.Index,
-    modifier: std.builtin.CallModifier,
+    modifier: std.lang.CallModifier,
 ) !CValue {
     const pt = f.dg.pt;
     const zcu = pt.zcu;
@@ -4992,6 +4987,8 @@ fn airAsm(f: *Function, inst: Air.Inst.Index) !CValue {
                 (mem.eql(u8, field_name, "ccr") or mem.eql(u8, field_name, "icc") or mem.eql(u8, field_name, "xcc"))) name: {
                     // C compilers just use `icc` to encompass all of these.
                     break :name "icc";
+                } else if (target.cpu.arch.isRISCV() and mem.eql(u8, field_name, "fp")) name: {
+                    break :name "s0";
                 } else field_name;
 
             try w.print(" {f}", .{fmtStringLiteral(name, null)});
@@ -6911,7 +6908,7 @@ fn airCVaCopy(f: *Function, inst: Air.Inst.Index) !CValue {
     return local;
 }
 
-fn toMemoryOrder(order: std.builtin.AtomicOrder) [:0]const u8 {
+fn toMemoryOrder(order: std.lang.AtomicOrder) [:0]const u8 {
     return switch (order) {
         // Note: unordered is actually even less atomic than relaxed
         .unordered, .monotonic => "zig_memory_order_relaxed",
@@ -6922,11 +6919,11 @@ fn toMemoryOrder(order: std.builtin.AtomicOrder) [:0]const u8 {
     };
 }
 
-fn writeMemoryOrder(w: *Writer, order: std.builtin.AtomicOrder) !void {
+fn writeMemoryOrder(w: *Writer, order: std.lang.AtomicOrder) !void {
     return w.writeAll(toMemoryOrder(order));
 }
 
-fn toCallingConvention(cc: std.builtin.CallingConvention, zcu: *Zcu) ?[]const u8 {
+fn toCallingConvention(cc: std.lang.CallingConvention, zcu: *Zcu) ?[]const u8 {
     if (zcu.getTarget().cCallingConvention()) |ccc| {
         if (cc.eql(ccc)) {
             return null;
@@ -7021,7 +7018,7 @@ fn toCallingConvention(cc: std.builtin.CallingConvention, zcu: *Zcu) ?[]const u8
     };
 }
 
-fn toAtomicRmwSuffix(order: std.builtin.AtomicRmwOp) []const u8 {
+fn toAtomicRmwSuffix(order: std.lang.AtomicRmwOp) []const u8 {
     return switch (order) {
         .Xchg => "xchg",
         .Add => "add",
@@ -7044,7 +7041,7 @@ fn toCIntBits(zig_bits: u32) ?u32 {
     return null;
 }
 
-fn signAbbrev(signedness: std.builtin.Signedness) u8 {
+fn signAbbrev(signedness: std.lang.Signedness) u8 {
     return switch (signedness) {
         .signed => 'i',
         .unsigned => 'u',
@@ -7221,7 +7218,7 @@ fn fmtStringLiteral(str: []const u8, sentinel: ?u8) std.fmt.Alt(FormatStringCont
 
 fn undefPattern(comptime IntType: type) IntType {
     const int_info = @typeInfo(IntType).int;
-    const UnsignedType = std.meta.Int(.unsigned, int_info.bits);
+    const UnsignedType = @Int(.unsigned, int_info.bits);
     return @bitCast(@as(UnsignedType, (1 << (int_info.bits | 1)) / 3));
 }
 

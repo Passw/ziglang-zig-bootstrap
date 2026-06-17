@@ -433,7 +433,7 @@ fn parseIntWithSign(
     // accumulate into Accumulate which is always 8 bits or larger.  this prevents
     // `buf_base` from overflowing Result.
     const info = @typeInfo(Result);
-    const Accumulate = std.meta.Int(info.int.signedness, @max(8, info.int.bits));
+    const Accumulate = @Int(info.int.signedness, @max(8, info.int.bits));
     var accumulate: Accumulate = 0;
 
     if (buf_start[0] == '_' or buf_start[buf_start.len - 1] == '_') return error.InvalidCharacter;
@@ -600,11 +600,6 @@ pub fn bufPrint(buf: []u8, comptime fmt: []const u8, args: anytype) BufPrintErro
         error.WriteFailed => return error.NoSpaceLeft,
     };
     return w.buffered();
-}
-
-/// Deprecated in favor of `bufPrintSentinel`
-pub fn bufPrintZ(buf: []u8, comptime fmt: []const u8, args: anytype) BufPrintError![:0]u8 {
-    return try bufPrintSentinel(buf, fmt, args, 0);
 }
 
 pub fn bufPrintSentinel(
@@ -1194,8 +1189,12 @@ test bytesToHex {
 }
 
 test hexToBytes {
+    const repeated: []const u8 = repeated: {
+        const buf: [32][2]u8 = @splat("90".*);
+        break :repeated @ptrCast(&buf);
+    };
     var buf: [32]u8 = undefined;
-    try expectFmt("90" ** 32, "{X}", .{try hexToBytes(&buf, "90" ** 32)});
+    try expectFmt(repeated, "{X}", .{try hexToBytes(&buf, repeated)});
     try expectFmt("ABCD", "{X}", .{try hexToBytes(&buf, "ABCD")});
     try expectFmt("", "{X}", .{try hexToBytes(&buf, "")});
     try std.testing.expectError(error.InvalidCharacter, hexToBytes(&buf, "012Z"));

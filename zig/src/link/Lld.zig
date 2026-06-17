@@ -126,7 +126,7 @@ pub const Elf = struct {
             .hash_style = options.hash_style,
             .image_base = b: {
                 if (is_dyn_lib) break :b 0;
-                if (output_mode == .Exe and comp.config.pie) break :b 0;
+                if (output_mode == .Exe and (comp.config.pie or target.os.tag == .haiku)) break :b 0;
                 break :b options.image_base orelse switch (ptr_width) {
                     .p32 => 0x10000,
                     .p64 => 0x1000000,
@@ -207,11 +207,6 @@ pub fn createEmpty(
     const output_mode = comp.config.output_mode;
     const optimize_mode = comp.root_mod.optimize_mode;
 
-    const obj_file_ext: []const u8 = switch (target.ofmt) {
-        .coff => "obj",
-        .elf, .wasm => "o",
-        else => unreachable,
-    };
     const gc_sections: bool = options.gc_sections orelse switch (target.ofmt) {
         .coff => optimize_mode != .Debug,
         .elf => optimize_mode != .Debug and output_mode != .Obj,
@@ -230,7 +225,6 @@ pub fn createEmpty(
             .tag = .lld,
             .comp = comp,
             .emit = emit,
-            .zcu_object_basename = try allocPrint(arena, "{s}_zcu.{s}", .{ fs.path.stem(emit.sub_path), obj_file_ext }),
             .gc_sections = gc_sections,
             .print_gc_sections = options.print_gc_sections,
             .stack_size = stack_size,
@@ -255,7 +249,7 @@ pub fn flush(
     arena: Allocator,
     tid: Zcu.PerThread.Id,
     prog_node: std.Progress.Node,
-) link.File.FlushError!void {
+) link.Error!void {
     dev.check(.lld_linker);
     _ = tid;
 
@@ -277,7 +271,7 @@ pub fn flush(
         .wasm => wasmLink(lld, arena),
     };
     result catch |err| switch (err) {
-        error.OutOfMemory, error.LinkFailure => |e| return e,
+        error.OutOfMemory, error.AlreadyReported => |e| return e,
         else => |e| return lld.base.comp.link_diags.fail("failed to link with LLD: {t}", .{e}),
     };
 }
@@ -287,11 +281,11 @@ fn linkAsArchive(lld: *Lld, arena: Allocator) !void {
     const comp = base.comp;
     const directory = base.emit.root_dir; // Just an alias to make it shorter to type.
     const full_out_path = try directory.join(arena, &[_][]const u8{base.emit.sub_path});
-    const full_out_path_z = try arena.dupeZ(u8, full_out_path);
+    const full_out_path_z = try arena.dupeSentinel(u8, full_out_path, 0);
     const opt_zcu = comp.zcu;
 
-    const zcu_obj_path: ?Cache.Path = if (opt_zcu != null) p: {
-        break :p try comp.resolveEmitPathFlush(arena, .temp, base.zcu_object_basename.?);
+    const zcu_obj_path: ?Cache.Path = if (opt_zcu) |zcu| p: {
+        break :p try comp.resolveEmitPathFlush(arena, .temp, zcu.llvm_object.?.out_bin_basename);
     } else null;
 
     log.debug("zcu_obj_path={?f}", .{zcu_obj_path});
@@ -326,7 +320,7 @@ fn linkAsArchive(lld: *Lld, arena: Allocator) !void {
         object_files.appendAssumeCapacity(try key.status.success.object_path.toStringZ(arena));
     }
     for (comp.win32_resource_table.keys()) |key| {
-        object_files.appendAssumeCapacity(try arena.dupeZ(u8, key.status.success.res_path));
+        object_files.appendAssumeCapacity(try arena.dupeSentinel(u8, key.status.success.res_path, 0));
     }
     if (zcu_obj_path) |p| object_files.appendAssumeCapacity(try p.toStringZ(arena));
     if (compiler_rt_path) |p| object_files.appendAssumeCapacity(try p.toStringZ(arena));
@@ -376,8 +370,8 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
     const directory = base.emit.root_dir; // Just an alias to make it shorter to type.
     const full_out_path = try directory.join(arena, &[_][]const u8{base.emit.sub_path});
 
-    const zcu_obj_path: ?Cache.Path = if (comp.zcu != null) p: {
-        break :p try comp.resolveEmitPathFlush(arena, .temp, base.zcu_object_basename.?);
+    const zcu_obj_path: ?Cache.Path = if (comp.zcu) |zcu| p: {
+        break :p try comp.resolveEmitPathFlush(arena, .temp, zcu.llvm_object.?.out_bin_basename);
     } else null;
 
     const is_lib = comp.config.output_mode == .Lib;
@@ -766,8 +760,8 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
     const directory = base.emit.root_dir; // Just an alias to make it shorter to type.
     const full_out_path = try directory.join(arena, &[_][]const u8{base.emit.sub_path});
 
-    const zcu_obj_path: ?Cache.Path = if (comp.zcu != null) p: {
-        break :p try comp.resolveEmitPathFlush(arena, .temp, base.zcu_object_basename.?);
+    const zcu_obj_path: ?Cache.Path = if (comp.zcu) |zcu| p: {
+        break :p try comp.resolveEmitPathFlush(arena, .temp, zcu.llvm_object.?.out_bin_basename);
     } else null;
 
     const output_mode = comp.config.output_mode;
@@ -1086,10 +1080,10 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
             .dso => continue,
             .object, .archive => |obj| {
                 if (obj.must_link and !whole_archive) {
-                    try argv.append("-whole-archive");
+                    try argv.append("--whole-archive");
                     whole_archive = true;
                 } else if (!obj.must_link and whole_archive) {
-                    try argv.append("-no-whole-archive");
+                    try argv.append("--no-whole-archive");
                     whole_archive = false;
                 }
                 try argv.append(try obj.path.toString(arena));
@@ -1101,7 +1095,7 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
         };
 
         if (whole_archive) {
-            try argv.append("-no-whole-archive");
+            try argv.append("--no-whole-archive");
             whole_archive = false;
         }
 
@@ -1115,7 +1109,11 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
 
         if (comp.tsan_lib) |lib| {
             assert(comp.config.any_sanitize_thread);
-            try argv.append(try lib.full_object_path.toString(arena));
+            try argv.appendSlice(&.{
+                "--whole-archive",
+                try lib.full_object_path.toString(arena),
+                "--no-whole-archive",
+            });
         }
 
         if (comp.fuzzer_lib) |lib| {
@@ -1360,8 +1358,8 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
     const directory = base.emit.root_dir; // Just an alias to make it shorter to type.
     const full_out_path = try directory.join(arena, &[_][]const u8{base.emit.sub_path});
 
-    const zcu_obj_path: ?Cache.Path = if (comp.zcu != null) p: {
-        break :p try comp.resolveEmitPathFlush(arena, .temp, base.zcu_object_basename.?);
+    const zcu_obj_path: ?Cache.Path = if (comp.zcu) |zcu| p: {
+        break :p try comp.resolveEmitPathFlush(arena, .temp, zcu.llvm_object.?.out_bin_basename);
     } else null;
 
     const is_obj = comp.config.output_mode == .Obj;
@@ -1549,10 +1547,10 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
         for (comp.link_inputs) |link_input| switch (link_input) {
             .object, .archive => |obj| {
                 if (obj.must_link and !whole_archive) {
-                    try argv.append("-whole-archive");
+                    try argv.append("--whole-archive");
                     whole_archive = true;
                 } else if (!obj.must_link and whole_archive) {
-                    try argv.append("-no-whole-archive");
+                    try argv.append("--no-whole-archive");
                     whole_archive = false;
                 }
                 try argv.append(try obj.path.toString(arena));
@@ -1564,7 +1562,7 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
             .res => unreachable,
         };
         if (whole_archive) {
-            try argv.append("-no-whole-archive");
+            try argv.append("--no-whole-archive");
             whole_archive = false;
         }
 
@@ -1616,7 +1614,7 @@ fn spawnLld(comp: *Compilation, arena: Allocator, argv: []const []const u8) !voi
         const exit_code = try lldMain(arena, argv, false);
         if (exit_code == 0) return;
         if (comp.clang_passthrough_mode) std.process.exit(exit_code);
-        return error.LinkFailure;
+        return error.AlreadyReported;
     }
 
     var stderr: []u8 = &.{};
@@ -1716,7 +1714,7 @@ fn spawnLld(comp: *Compilation, arena: Allocator, argv: []const []const u8) !voi
         .exited => |code| if (code != 0) {
             if (comp.clang_passthrough_mode) std.process.exit(code);
             diags.lockAndParseLldStderr(argv[1], stderr);
-            return error.LinkFailure;
+            return error.AlreadyReported;
         },
         .signal => |sig| {
             if (comp.clang_passthrough_mode) std.process.abort();

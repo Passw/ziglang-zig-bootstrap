@@ -249,6 +249,7 @@ const UnpackValueBits = struct {
             .tuple_type,
             .union_type,
             .opaque_type,
+            .spirv_type,
             .enum_type,
             .func_type,
             .error_set_type,
@@ -565,6 +566,7 @@ const PackValueBits = struct {
                 },
                 .@"packed" => {
                     const backing_int_val = try pack.primitive(ty.bitpackBackingInt(zcu));
+                    if (backing_int_val.isUndef(zcu)) return pt.undefValue(ty);
                     return pt.bitpackValue(ty, backing_int_val);
                 },
             },
@@ -659,6 +661,7 @@ const PackValueBits = struct {
                 },
                 .@"packed" => {
                     const backing_int_val = try pack.primitive(ty.bitpackBackingInt(zcu));
+                    if (backing_int_val.isUndef(zcu)) return pt.undefValue(ty);
                     return pt.bitpackValue(ty, backing_int_val);
                 },
             },

@@ -145,6 +145,8 @@ test "implicit cast to optional to error union to return result loc" {
 }
 
 test "fn returning empty error set can be passed as fn returning any error" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     entry();
     comptime entry();
 }
@@ -206,7 +208,7 @@ const MyErrSet = error{
 };
 
 fn testErrorSetType() !void {
-    try expect(@typeInfo(MyErrSet).error_set.?.len == 2);
+    try expect(@typeInfo(MyErrSet).error_set.error_names.?.len == 2);
 
     const a: MyErrSet!i32 = 5678;
     const b: MyErrSet!i32 = MyErrSet.OutOfMemory;
@@ -526,6 +528,7 @@ test "function pointer with return type that is error union with payload which i
 }
 
 test "return result loc as peer result loc in inferred error set function" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -557,6 +560,7 @@ test "return result loc as peer result loc in inferred error set function" {
 }
 
 test "error payload type is correctly resolved" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -1111,6 +1115,7 @@ test "'if' ignores error via local while 'else' ignores error directly" {
 }
 
 test "@errorCast into own inferred error set" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     const static = struct {
         fn foo(b: bool) !void {
             if (b) {
@@ -1125,9 +1130,9 @@ test "@errorCast into own inferred error set" {
         try expect(err == error.Bad);
     }
 
-    const errors = @typeInfo(@typeInfo(@TypeOf(static.foo(false))).error_union.error_set).error_set.?;
-    comptime assert(errors.len == 1);
-    comptime assert(std.mem.eql(u8, errors[0].name, "Bad"));
+    const error_names = @typeInfo(@typeInfo(@TypeOf(static.foo(false))).error_union.error_set).error_set.error_names.?;
+    comptime assert(error_names.len == 1);
+    comptime assert(std.mem.eql(u8, error_names[0], "Bad"));
 }
 
 test "@errorCast into other inferred error set" {

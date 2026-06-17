@@ -31,7 +31,7 @@ const RegisterManager = abi.RegisterManager;
 const RegisterLock = RegisterManager.RegisterLock;
 const FrameIndex = bits.FrameIndex;
 
-const InnerError = codegen.CodeGenError || error{OutOfRegisters};
+const InnerError = codegen.Error || error{OutOfRegisters};
 
 pub fn legalizeFeatures(_: *const std.Target) *const Air.Legalize.Features {
     return comptime &.initMany(&.{
@@ -106,7 +106,6 @@ va_info: union {
 ret_mcv: InstTracking,
 err_ret_trace_reg: Register,
 fn_type: Type,
-src_loc: Zcu.LazySrcLoc,
 
 eflags_inst: ?Air.Inst.Index = null,
 
@@ -129,7 +128,7 @@ mir_table: std.ArrayList(Mir.Inst.Index) = .empty,
 /// which is a relative jump, based on the address following the reloc.
 epilogue_relocs: std.ArrayList(Mir.Inst.Index) = .empty,
 
-reused_operands: std.StaticBitSet(Air.Liveness.bpi - 1) = undefined,
+reused_operands: std.bit_set.Static(Air.Liveness.bpi - 1) = undefined,
 inst_tracking: InstTrackingMap = .empty,
 
 // Key is the block instruction
@@ -141,7 +140,7 @@ register_manager: RegisterManager = .{},
 scope_generation: u32 = 0,
 
 frame_allocs: std.MultiArrayList(FrameAlloc) = .empty,
-free_frame_indices: std.AutoArrayHashMapUnmanaged(FrameIndex, void) = .empty,
+free_frame_indices: std.array_hash_map.Auto(FrameIndex, void) = .empty,
 frame_locs: std.MultiArrayList(Mir.FrameLoc) = .empty,
 
 loops: std.AutoHashMapUnmanaged(Air.Inst.Index, struct {
@@ -570,8 +569,8 @@ pub const MCValue = union(enum) {
     }
 };
 
-const InstTrackingMap = std.AutoArrayHashMapUnmanaged(Air.Inst.Index, InstTracking);
-const ConstTrackingMap = std.AutoArrayHashMapUnmanaged(InternPool.Index, InstTracking);
+const InstTrackingMap = std.array_hash_map.Auto(Air.Inst.Index, InstTracking);
+const ConstTrackingMap = std.array_hash_map.Auto(InternPool.Index, InstTracking);
 const InstTracking = struct {
     long: MCValue,
     short: MCValue,
@@ -869,11 +868,10 @@ const CodeGen = @This();
 pub fn generate(
     bin_file: *link.File,
     pt: Zcu.PerThread,
-    src_loc: Zcu.LazySrcLoc,
     func_index: InternPool.Index,
     air: *const Air,
     liveness: *const ?Air.Liveness,
-) codegen.CodeGenError!Mir {
+) codegen.Error!Mir {
     _ = bin_file;
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
@@ -898,7 +896,6 @@ pub fn generate(
         .ret_mcv = undefined, // populated after `resolveCallingConventionValues`
         .err_ret_trace_reg = undefined, // populated after `resolveCallingConventionValues`
         .fn_type = fn_type,
-        .src_loc = src_loc,
     };
     defer {
         function.frame_allocs.deinit(gpa);
@@ -937,10 +934,7 @@ pub fn generate(
     );
 
     const fn_info = zcu.typeToFunc(fn_type).?;
-    var call_info = function.resolveCallingConventionValues(fn_info, &.{}, .args_frame) catch |err| switch (err) {
-        error.CodegenFail => |e| return e,
-        else => |e| return e,
-    };
+    var call_info = try function.resolveCallingConventionValues(fn_info, &.{}, .args_frame);
     defer call_info.deinit(&function);
 
     function.args = call_info.args;
@@ -983,7 +977,6 @@ pub fn generate(
     }
 
     function.gen(&file.zir.?, func_zir.inst, func.comptime_args, call_info.air_arg_count) catch |err| switch (err) {
-        error.CodegenFail => |e| return e,
         error.OutOfRegisters => return function.fail("ran out of registers (Zig compiler bug)", .{}),
         else => |e| return e,
     };
@@ -1027,12 +1020,11 @@ pub fn getTmpMir(cg: *CodeGen) Mir {
 pub fn generateLazy(
     bin_file: *link.File,
     pt: Zcu.PerThread,
-    src_loc: Zcu.LazySrcLoc,
     lazy_sym: link.File.LazySymbol,
-    atom_index: u32,
+    atom_id: link.File.AtomId,
     w: *std.Io.Writer,
     debug_output: link.File.DebugInfoOutput,
-) codegen.CodeGenError!void {
+) codegen.Error!void {
     const gpa = pt.zcu.gpa;
     // This function is for generating global code, so we use the root module.
     const mod = pt.zcu.comp.root_mod;
@@ -1050,7 +1042,6 @@ pub fn generateLazy(
         .ret_mcv = undefined,
         .err_ret_trace_reg = undefined,
         .fn_type = undefined,
-        .src_loc = src_loc,
     };
     defer {
         function.inst_tracking.deinit(gpa);
@@ -1068,12 +1059,11 @@ pub fn generateLazy(
     }
 
     function.genLazy(lazy_sym) catch |err| switch (err) {
-        error.CodegenFail => |e| return e,
         error.OutOfRegisters => return function.fail("ran out of registers (Zig compiler bug)", .{}),
         else => |e| return e,
     };
 
-    try function.getTmpMir().emitLazy(bin_file, pt, src_loc, lazy_sym, atom_index, w, debug_output);
+    try function.getTmpMir().emitLazy(bin_file, pt, lazy_sym, atom_id, w, debug_output);
 }
 
 const FormatNavData = struct {
@@ -1111,7 +1101,10 @@ fn formatWipMir(data: FormatWipMirData, w: *Writer) Writer.Error!void {
         .allocator = data.self.gpa,
         .mir = data.self.getTmpMir(),
         .cc = .auto,
-        .src_loc = data.self.src_loc,
+        .src_loc = switch (data.self.owner) {
+            .nav_index => |nav| data.self.pt.zcu.navSrcLoc(nav),
+            .lazy_sym => |lazy_sym| Type.fromInterned(lazy_sym.ty).srcLocOrNull(data.self.pt.zcu) orelse .unneeded,
+        },
     };
     var first = true;
     for ((lower.lowerMir(data.inst) catch |err| switch (err) {
@@ -1214,20 +1207,20 @@ fn addInst(self: *CodeGen, inst: Mir.Inst) error{OutOfMemory}!Mir.Inst.Index {
 }
 
 fn addExtra(self: *CodeGen, extra: anytype) Allocator.Error!u32 {
-    const fields = std.meta.fields(@TypeOf(extra));
-    try self.mir_extra.ensureUnusedCapacity(self.gpa, fields.len);
+    const field_count = std.meta.fieldNames(@TypeOf(extra)).len;
+    try self.mir_extra.ensureUnusedCapacity(self.gpa, field_count);
     return self.addExtraAssumeCapacity(extra);
 }
 
 fn addExtraAssumeCapacity(self: *CodeGen, extra: anytype) u32 {
-    const fields = std.meta.fields(@TypeOf(extra));
+    const info = @typeInfo(@TypeOf(extra)).@"struct";
     const result: u32 = @intCast(self.mir_extra.items.len);
-    inline for (fields) |field| {
-        self.mir_extra.appendAssumeCapacity(switch (field.type) {
-            u32 => @field(extra, field.name),
-            i32, Mir.Memory.Info => @bitCast(@field(extra, field.name)),
-            FrameIndex => @intFromEnum(@field(extra, field.name)),
-            else => @compileError("bad field type: " ++ field.name ++ ": " ++ @typeName(field.type)),
+    inline for (info.field_names, info.field_types) |field_name, field_type| {
+        self.mir_extra.appendAssumeCapacity(switch (field_type) {
+            u32 => @field(extra, field_name),
+            i32, Mir.Memory.Info => @bitCast(@field(extra, field_name)),
+            FrameIndex => @intFromEnum(@field(extra, field_name)),
+            else => @compileError("bad field type: " ++ field_name ++ ": " ++ @typeName(field_type)),
         });
     }
     return result;
@@ -2065,7 +2058,7 @@ fn gen(
 
         const epilogue = if (self.epilogue_relocs.items.len > 0) epilogue: {
             var last_inst: Mir.Inst.Index = @intCast(self.mir_instructions.len - 1);
-            while (self.epilogue_relocs.getLastOrNull() == last_inst) {
+            while (self.epilogue_relocs.getLast() == last_inst) {
                 self.epilogue_relocs.items.len -= 1;
                 self.mir_instructions.set(last_inst, .{
                     .tag = .pseudo,
@@ -173726,7 +173719,7 @@ fn genBody(cg: *CodeGen, body: []const Air.Inst.Index) InnerError!void {
             // No soft-float `Legalize` features are enabled, so this instruction never appears.
             .legalize_compiler_rt_call => unreachable,
 
-            .work_item_id, .work_group_size, .work_group_id => unreachable,
+            .work_item_id, .work_group_size, .work_group_id, .spirv_runtime_array_len => unreachable,
         }
         try cg.resetTemps(@enumFromInt(0));
         cg.checkInvariantsAfterAirInst();
@@ -173952,7 +173945,7 @@ fn setFrameLoc(
     offset.* += self.frame_allocs.items(.abi_size)[frame_i];
 }
 
-fn computeFrameLayout(self: *CodeGen, cc: std.builtin.CallingConvention.Tag) !FrameLayout {
+fn computeFrameLayout(self: *CodeGen, cc: std.lang.CallingConvention.Tag) !FrameLayout {
     const frame_allocs_len = self.frame_allocs.len;
     try self.frame_locs.resize(self.gpa, frame_allocs_len);
     const stack_frame_order = try self.gpa.alloc(FrameIndex, frame_allocs_len - FrameIndex.named_count);
@@ -174294,7 +174287,7 @@ pub fn spillEflagsIfOccupied(self: *CodeGen) !void {
     }
 }
 
-pub fn spillCallerPreservedRegs(self: *CodeGen, cc: std.builtin.CallingConvention.Tag, ignore_reg: Register) !void {
+pub fn spillCallerPreservedRegs(self: *CodeGen, cc: std.lang.CallingConvention.Tag, ignore_reg: Register) !void {
     switch (cc) {
         inline .auto, .x86_64_sysv, .x86_64_win => |tag| inline for (comptime abi.getCallerPreservedRegs(tag)) |reg|
             if (reg != ignore_reg) try self.register_manager.getKnownReg(reg, null),
@@ -175917,7 +175910,7 @@ fn genLocalDebugInfo(cg: *CodeGen, air_tag: Air.Inst.Tag, ty: Type, mcv: MCValue
     };
 }
 
-fn airCall(self: *CodeGen, inst: Air.Inst.Index, modifier: std.builtin.CallModifier, opts: CopyOptions) !void {
+fn airCall(self: *CodeGen, inst: Air.Inst.Index, modifier: std.lang.CallModifier, opts: CopyOptions) !void {
     if (modifier == .always_tail) return self.fail("TODO implement tail calls for x86_64", .{});
 
     const call = self.air.unwrapCall(inst);
@@ -176371,7 +176364,7 @@ fn genTry(
         .close_scope = true,
     });
 
-    self.performReloc(reloc);
+    if (reloc) |r| self.performReloc(r);
 
     for (liveness_cond_br.then_deaths) |death| try self.processDeath(death, .{});
 
@@ -176384,30 +176377,26 @@ fn genTry(
     return result;
 }
 
-fn genCondBrMir(self: *CodeGen, ty: Type, mcv: MCValue) !Mir.Inst.Index {
-    const pt = self.pt;
-    const abi_size = ty.abiSize(pt.zcu);
+fn genCondBrMir(self: *CodeGen, ty: Type, mcv: MCValue) !?Mir.Inst.Index {
     switch (mcv) {
-        .eflags => |cc| {
-            // Here we map the opposites since the jump is to the false branch.
-            return self.asmJccReloc(cc.negate(), undefined);
-        },
+        .eflags => |cc| return try self.asmJccReloc(cc.negate(), undefined),
         .register => |reg| {
             try self.spillEflagsIfOccupied();
             try self.asmRegisterImmediate(.{ ._, .@"test" }, reg.to8(), .u(1));
-            return self.asmJccReloc(.z, undefined);
+            return try self.asmJccReloc(.z, undefined);
         },
-        .immediate,
-        .load_frame,
-        => {
+        .immediate => |imm| switch (@as(u1, @truncate(imm))) {
+            0 => return try self.asmJmpReloc(undefined),
+            1 => return null,
+        },
+        .load_frame => {
             try self.spillEflagsIfOccupied();
-            if (abi_size <= 8) {
-                const reg = try self.copyToTmpRegister(ty, mcv);
-                return self.genCondBrMir(ty, .{ .register = reg });
-            }
-            return self.fail("TODO implement condbr when condition is {f} with abi larger than 8 bytes", .{mcv});
+            try self.asmMemoryImmediate(.{ ._, .@"test" }, try mcv.mem(self, .{ .size = .byte }), .u(1));
+            return try self.asmJccReloc(.z, undefined);
         },
-        else => return self.fail("TODO implement condbr when condition is {s}", .{@tagName(mcv)}),
+        else => return self.fail("TODO implement condbr when condition is {f} {s}", .{
+            ty.fmt(self.pt), @tagName(mcv),
+        }),
     }
 }
 
@@ -176440,7 +176429,7 @@ fn airCondBr(self: *CodeGen, inst: Air.Inst.Index) !void {
         .close_scope = true,
     });
 
-    self.performReloc(reloc);
+    if (reloc) |r| self.performReloc(r);
 
     for (liveness_cond_br.else_deaths) |death| try self.processDeath(death, .{});
     try self.genBodyBlock(else_body);
@@ -176545,7 +176534,7 @@ fn lowerBlock(self: *CodeGen, inst: Air.Inst.Index, body: []const Air.Inst.Index
     defer block_data.value.deinit(self.gpa);
     if (block_data.value.relocs.items.len > 0) {
         var last_inst: Mir.Inst.Index = @intCast(self.mir_instructions.len - 1);
-        while (block_data.value.relocs.getLastOrNull() == last_inst) {
+        while (block_data.value.relocs.getLast() == last_inst) {
             block_data.value.relocs.items.len -= 1;
             self.mir_instructions.set(last_inst, .{
                 .tag = .pseudo,
@@ -176673,7 +176662,7 @@ fn lowerSwitchBr(
             };
             const condition_index_lock = cg.register_manager.lockReg(condition_index_reg);
             defer if (condition_index_lock) |lock| cg.register_manager.unlockReg(lock);
-            try cg.truncateRegister(condition_ty, condition_index_reg);
+            try cg.truncateRegister(unsigned_condition_ty, condition_index_reg);
             const ptr_size = @divExact(cg.target.ptrBitWidth(), 8);
             try cg.asmMemory(.{ ._mp, .j }, .{
                 .base = .table,
@@ -177140,7 +177129,7 @@ fn airBr(self: *CodeGen, inst: Air.Inst.Index) !void {
 }
 
 fn airAsm(self: *CodeGen, inst: Air.Inst.Index) !void {
-    @setEvalBranchQuota(1_100 + @typeInfo(Mir.Inst.Fixes).@"enum".fields.len);
+    @setEvalBranchQuota(1_100 + @typeInfo(Mir.Inst.Fixes).@"enum".field_names.len);
     const pt = self.pt;
     const zcu = pt.zcu;
     const unwrapped_asm = self.air.unwrapAsm(inst);
@@ -177439,7 +177428,7 @@ fn airAsm(self: *CodeGen, inst: Air.Inst.Index) !void {
         }
 
         var mnem_size: struct {
-            op_has_size: std.StaticBitSet(4),
+            op_has_size: std.bit_set.Static(4),
             size: Memory.Size,
             used: bool,
             fn init(size: ?Memory.Size) @This() {
@@ -177748,8 +177737,8 @@ fn airAsm(self: *CodeGen, inst: Air.Inst.Index) !void {
         std.mem.reverse(Operand, ops[0..ops_len]);
         if (mnem_size.size != .none and !mnem_size.used) {
             comptime var max_mnem_len: usize = 0;
-            inline for (@typeInfo(encoder.Instruction.Mnemonic).@"enum".fields) |mnem|
-                max_mnem_len = @max(mnem.name.len, max_mnem_len);
+            inline for (@typeInfo(encoder.Instruction.Mnemonic).@"enum".field_names) |mnem_name|
+                max_mnem_len = @max(mnem_name.len, max_mnem_len);
             var intel_mnem_buf: [max_mnem_len + 1]u8 = undefined;
             const intel_mnem_str = std.fmt.bufPrint(&intel_mnem_buf, "{s}{c}", .{
                 @tagName(mnem_tag),
@@ -178378,7 +178367,7 @@ fn genCopy(self: *CodeGen, ty: Type, dst_mcv: MCValue, src_mcv: MCValue, opts: C
                     else => unreachable,
                 },
                 dst_tag => |src_regs| {
-                    var remaining: std.StaticBitSet(dst_regs.len) = .full;
+                    var remaining: std.bit_set.Static(dst_regs.len) = .full;
                     var hazard_regs = src_regs;
                     while (!remaining.eql(.empty)) {
                         var remaining_it = remaining.iterator(.{});
@@ -179464,7 +179453,26 @@ fn airBitCast(self: *CodeGen, inst: Air.Inst.Index) !void {
                     .gt => src_ty,
                 },
                 .register_mask => src_ty,
-            }, dst_mcv, src_mcv, .{});
+            }, dst_mcv, if (src_ty.isVector(zcu) and src_ty.childType(zcu).toIntern() == .bool_type) src_mcv: {
+                try self.spillEflagsIfOccupied();
+                const dst_signedness: std.builtin.Signedness = if (dst_ty.scalarType(zcu).isSignedInt(zcu)) .signed else .unsigned;
+                switch (src_mcv) {
+                    .immediate => |src_imm| break :src_mcv .{ .immediate = switch (dst_signedness) {
+                        .unsigned => @as(u1, @truncate(src_imm)),
+                        .signed => @as(u8, @bitCast(@as(i8, @as(i1, @bitCast(@as(u1, @truncate(src_imm))))))),
+                    } },
+                    else => {
+                        try self.spillEflagsIfOccupied();
+                        const tmp_reg = try self.copyToTmpRegister(.u8, src_mcv);
+                        try self.asmRegisterImmediate(.{ ._, .@"and" }, tmp_reg.to8(), .u(1));
+                        switch (dst_signedness) {
+                            .unsigned => {},
+                            .signed => try self.asmRegister(.{ ._, .neg }, tmp_reg.to8()),
+                        }
+                        break :src_mcv .{ .register = tmp_reg };
+                    },
+                }
+            } else src_mcv, .{});
             break :dst dst_mcv;
         };
 
@@ -179498,7 +179506,7 @@ fn airBitCast(self: *CodeGen, inst: Air.Inst.Index) !void {
         );
         var offset = dst_limbs_len * 8;
         if (offset < abi_size) {
-            const dst_signedness: std.builtin.Signedness = if (dst_ty.isAbiInt(zcu))
+            const dst_signedness: std.lang.Signedness = if (dst_ty.isAbiInt(zcu))
                 dst_ty.intInfo(zcu).signedness
             else
                 .unsigned;
@@ -179640,8 +179648,8 @@ fn atomicOp(
     ptr_ty: Type,
     val_ty: Type,
     unused: bool,
-    rmw_op: ?std.builtin.AtomicRmwOp,
-    order: std.builtin.AtomicOrder,
+    rmw_op: ?std.lang.AtomicRmwOp,
+    order: std.lang.AtomicOrder,
 ) InnerError!MCValue {
     const pt = self.pt;
     const zcu = pt.zcu;
@@ -179714,7 +179722,7 @@ fn atomicOp(
             defer self.register_manager.unlockReg(dst_lock);
 
             try self.genSetReg(dst_reg, val_ty, val_mcv, .{});
-            if (rmw_op == std.builtin.AtomicRmwOp.Sub and mir_tag[1] == .xadd) {
+            if (rmw_op == std.lang.AtomicRmwOp.Sub and mir_tag[1] == .xadd) {
                 try self.genUnOpMir(.{ ._, .neg }, val_ty, dst_mcv);
             }
             try self.asmMemoryRegister(mir_tag, ptr_mem, registerAlias(dst_reg, val_abi_size));
@@ -179898,7 +179906,7 @@ fn atomicOp(
             };
             const val_lo_mem = try val_mem_mcv.mem(self, .{ .size = .qword });
             const val_hi_mem = try val_mem_mcv.address().offset(8).deref().mem(self, .{ .size = .qword });
-            if (rmw_op != std.builtin.AtomicRmwOp.Xchg) {
+            if (rmw_op != std.lang.AtomicRmwOp.Xchg) {
                 try self.asmRegisterRegister(.{ ._, .mov }, .rbx, .rax);
                 try self.asmRegisterRegister(.{ ._, .mov }, .rcx, .rdx);
             }
@@ -180033,7 +180041,7 @@ fn airAtomicLoad(self: *CodeGen, inst: Air.Inst.Index) !void {
     return self.finishAir(inst, result, .{ atomic_load.ptr, .none, .none });
 }
 
-fn airAtomicStore(self: *CodeGen, inst: Air.Inst.Index, order: std.builtin.AtomicOrder) !void {
+fn airAtomicStore(self: *CodeGen, inst: Air.Inst.Index, order: std.lang.AtomicOrder) !void {
     const bin_op = self.air.instructions.items(.data)[@intFromEnum(inst)].bin_op;
 
     const ptr_ty = self.typeOf(bin_op.lhs);
@@ -181508,7 +181516,7 @@ fn resolveCallingConventionValues(
     return result;
 }
 
-fn fail(cg: *CodeGen, comptime format: []const u8, args: anytype) error{ OutOfMemory, CodegenFail } {
+fn fail(cg: *CodeGen, comptime format: []const u8, args: anytype) error{ OutOfMemory, AlreadyReported } {
     @branchHint(.cold);
     const zcu = cg.pt.zcu;
     return switch (cg.owner) {
@@ -181601,9 +181609,9 @@ fn splitType(self: *CodeGen, comptime parts_len: usize, ty: Type) ![parts_len]Ty
     const ip = &zcu.intern_pool;
     var parts: [parts_len]Type = undefined;
     switch (ip.indexToKey(ty.toIntern())) {
-        .vector_type => |vector_type| if (std.math.divExact(u32, vector_type.len, parts_len)) |vec_len| return .{
-            try pt.vectorType(.{ .len = vec_len, .child = vector_type.child }),
-        } ** parts_len else |err| switch (err) {
+        .vector_type => |vector_type| if (std.math.divExact(u32, vector_type.len, parts_len)) |vec_len| {
+            return @splat(try pt.vectorType(.{ .len = vec_len, .child = vector_type.child }));
+        } else |err| switch (err) {
             error.DivisionByZero => unreachable,
             error.UnexpectedRemainder => {},
         },
@@ -181813,7 +181821,7 @@ fn nonBoolScalarBitSize(cg: *CodeGen, ty: Type) u32 {
     };
 }
 
-fn intInfo(cg: *CodeGen, ty: Type) ?std.builtin.Type.Int {
+fn intInfo(cg: *CodeGen, ty: Type) ?std.lang.Type.Int {
     const zcu = cg.pt.zcu;
     const ip = &zcu.intern_pool;
     var ty_index = ty.ip_index;
@@ -182789,7 +182797,7 @@ const Temp = struct {
                         break :part_ty .usize;
                     },
                 },
-                .struct_type => {
+                .struct_type, .union_type => {
                     assert(src_regs.len - part_index == std.math.divCeil(u32, src_abi_size, 8) catch unreachable);
                     break :part_ty switch (src_abi_size) {
                         0, 3, 5...7 => unreachable,
@@ -187560,11 +187568,9 @@ const Temp = struct {
         }
 
         const max = std.math.maxInt(@typeInfo(Index).@"enum".tag_type);
-        const Set = std.StaticBitSet(max);
+        const Set = std.bit_set.Static(max);
         const SafetySet = if (std.debug.runtime_safety) Set else struct {
-            inline fn initEmpty() @This() {
-                return .{};
-            }
+            pub const empty: @This() = .{};
 
             inline fn isSet(_: @This(), index: usize) bool {
                 assert(index < max);
@@ -188528,7 +188534,7 @@ const Select = struct {
 
             const ConstSpec = struct {
                 ref: Select.Operand.Ref = .none,
-                to_signedness: ?std.builtin.Signedness = null,
+                to_signedness: ?std.lang.Signedness = null,
                 vectorize_to: ?Memory.Size = null,
             };
 
@@ -188537,7 +188543,7 @@ const Select = struct {
                 after: u2,
                 at: u2,
 
-                fn tag(spec: CallConvRegSpec, cg: *const CodeGen) std.builtin.CallingConvention.Tag {
+                fn tag(spec: CallConvRegSpec, cg: *const CodeGen) std.lang.CallingConvention.Tag {
                     return switch (spec.cc) {
                         .none => unreachable,
                         .ccc => cg.target.cCallingConvention().?,
@@ -188667,11 +188673,11 @@ const Select = struct {
                             .smax_mem, .umin_mem => .bool_false,
                         }) },
                         else => {
-                            const scalar_info: std.builtin.Type.Int = cg.intInfo(scalar_ty) orelse .{
+                            const scalar_info: std.lang.Type.Int = cg.intInfo(scalar_ty) orelse .{
                                 .signedness = .signed,
                                 .bits = cg.floatBits(scalar_ty).?,
                             };
-                            const res_scalar_info: std.builtin.Type.Int = .{
+                            const res_scalar_info: std.lang.Type.Int = .{
                                 .signedness = const_spec.to_signedness orelse scalar_info.signedness,
                                 .bits = switch (spec.kind) {
                                     else => scalar_info.bits,
@@ -188739,7 +188745,7 @@ const Select = struct {
                                         .positive = undefined,
                                     };
                                     defer allocator.free(big_int.limbs);
-                                    const signedness: std.builtin.Signedness = switch (spec.kind) {
+                                    const signedness: std.lang.Signedness = switch (spec.kind) {
                                         else => unreachable,
                                         .slimit_delta_mem => .signed,
                                         .umax_delta_mem => .unsigned,
@@ -188774,7 +188780,9 @@ const Select = struct {
                     try pt.aggregateValue(try pt.vectorType(.{ .len = 4, .child = .u32_type }), &(.{
                         (try pt.intValue(.u32, @as(u64, @bitCast(@as(f64, 0x1p52))) >> 32)).toIntern(),
                         (try pt.intValue(.u32, @as(u64, @bitCast(@as(f64, 0x1p84))) >> 32)).toIntern(),
-                    } ++ .{(try pt.intValue(.u32, 0)).toIntern()} ** 2)),
+                        (try pt.intValue(.u32, 0)).toIntern(),
+                        (try pt.intValue(.u32, 0)).toIntern(),
+                    })),
                 ), true },
                 .f32_0_0x1p64_mem => .{ try cg.tempMemFromValue(
                     try pt.aggregateValue(try pt.vectorType(.{ .len = 2, .child = .f32_type }), &.{

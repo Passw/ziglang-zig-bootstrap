@@ -306,6 +306,7 @@ const Writer = struct {
 
             .struct_field_ptr => try w.writeStructField(s, inst),
             .struct_field_val => try w.writeStructField(s, inst),
+            .spirv_runtime_array_len => try w.writeStructField(s, inst),
             .inferred_alloc => @panic("TODO"),
             .inferred_alloc_comptime => @panic("TODO"),
             .assembly => try w.writeAssembly(s, inst),
@@ -516,7 +517,6 @@ const Writer = struct {
         try w.writeOperand(s, inst, 1, bin.lhs);
         try s.writeAll(", ");
         try w.writeOperand(s, inst, 2, bin.rhs);
-        try s.writeAll(", ");
     }
 
     fn writeLegalizeCompilerRtCall(w: *Writer, s: *std.Io.Writer, inst: Air.Inst.Index) Error!void {
@@ -625,7 +625,7 @@ const Writer = struct {
         w: *Writer,
         s: *std.Io.Writer,
         inst: Air.Inst.Index,
-        order: std.builtin.AtomicOrder,
+        order: std.lang.AtomicOrder,
     ) Error!void {
         const bin_op = w.air.instructions.items(.data)[@intFromEnum(inst)].bin_op;
         try w.writeOperand(s, inst, 0, bin_op.lhs);

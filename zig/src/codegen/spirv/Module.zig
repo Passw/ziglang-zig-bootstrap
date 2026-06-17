@@ -28,7 +28,7 @@ uav_link: std.AutoHashMapUnmanaged(struct { InternPool.Index, spec.StorageClass 
 intern_map: std.AutoHashMapUnmanaged(struct { InternPool.Index, Repr }, Id) = .empty,
 decls: std.ArrayList(Decl) = .empty,
 decl_deps: std.ArrayList(Decl.Index) = .empty,
-entry_points: std.AutoArrayHashMapUnmanaged(Id, EntryPoint) = .empty,
+entry_points: std.array_hash_map.Auto(Id, EntryPoint) = .empty,
 /// This map serves a dual purpose:
 /// - It keeps track of pointers that are currently being emitted, so that we can tell
 ///   if they are recursive and need an OpTypeForwardPointer.
@@ -54,22 +54,24 @@ cache: struct {
     bool_type: ?Id = null,
     void_type: ?Id = null,
     opaque_types: std.StringHashMapUnmanaged(Id) = .empty,
-    int_types: std.AutoHashMapUnmanaged(std.builtin.Type.Int, Id) = .empty,
-    float_types: std.AutoHashMapUnmanaged(std.builtin.Type.Float, Id) = .empty,
+    int_types: std.AutoHashMapUnmanaged(std.lang.Type.Int, Id) = .empty,
+    float_types: std.AutoHashMapUnmanaged(std.lang.Type.Float, Id) = .empty,
     vector_types: std.AutoHashMapUnmanaged(struct { Id, u32 }, Id) = .empty,
     array_types: std.AutoHashMapUnmanaged(struct { Id, Id }, Id) = .empty,
-    struct_types: std.ArrayHashMapUnmanaged(StructType, Id, StructType.HashContext, true) = .empty,
-    fn_types: std.ArrayHashMapUnmanaged(FnType, Id, FnType.HashContext, true) = .empty,
+    struct_types: std.array_hash_map.Custom(StructType, Id, StructType.HashContext, true) = .empty,
+    fn_types: std.array_hash_map.Custom(FnType, Id, FnType.HashContext, true) = .empty,
 
     capabilities: std.AutoHashMapUnmanaged(spec.Capability, void) = .empty,
     extensions: std.StringHashMapUnmanaged(void) = .empty,
     extended_instruction_set: std.AutoHashMapUnmanaged(spec.InstructionSet, Id) = .empty,
     decorations: std.AutoHashMapUnmanaged(struct { Id, spec.Decoration }, void) = .empty,
     builtins: std.AutoHashMapUnmanaged(struct { spec.BuiltIn, spec.StorageClass }, Decl.Index) = .empty,
-    strings: std.StringArrayHashMapUnmanaged(Id) = .empty,
+    strings: std.array_hash_map.String(Id) = .empty,
 
     bool_const: [2]?Id = .{ null, null },
-    constants: std.ArrayHashMapUnmanaged(Constant, Id, Constant.HashContext, true) = .empty,
+    constants: std.array_hash_map.Custom(Constant, Id, Constant.HashContext, true) = .empty,
+
+    spirv_types: std.AutoHashMapUnmanaged(InternPool.Index, Id) = .empty,
 } = .{},
 /// Module layout, according to SPIR-V Spec section 2.4, "Logical Layout of a Module".
 sections: struct {
@@ -130,15 +132,10 @@ pub const Decl = struct {
     end_dep: usize = 0,
 };
 
-/// This models a kernel entry point.
 pub const EntryPoint = struct {
-    /// The declaration that should be exported.
     decl_index: Decl.Index,
-    /// The name of the kernel to be exported.
     name: []const u8,
-    /// Calling Convention
-    exec_model: spec.ExecutionModel,
-    exec_mode: ?spec.ExecutionMode = null,
+    cc: std.builtin.CallingConvention,
 };
 
 const StructType = struct {
@@ -229,6 +226,7 @@ pub fn deinit(module: *Module) void {
     module.cache.array_types.deinit(module.gpa);
     module.cache.struct_types.deinit(module.gpa);
     module.cache.fn_types.deinit(module.gpa);
+    module.cache.spirv_types.deinit(module.gpa);
     module.cache.capabilities.deinit(module.gpa);
     module.cache.extensions.deinit(module.gpa);
     module.cache.extended_instruction_set.deinit(module.gpa);
@@ -280,7 +278,7 @@ pub fn idBound(module: Module) Word {
 pub fn addEntryPointDeps(
     module: *Module,
     decl_index: Decl.Index,
-    seen: *std.DynamicBitSetUnmanaged,
+    seen: *std.bit_set.Dynamic,
     interface: *std.array_list.Managed(Id),
 ) !void {
     const decl = module.declPtr(decl_index);
@@ -310,32 +308,96 @@ fn entryPoints(module: *Module) !Section {
     var interface = std.array_list.Managed(Id).init(module.gpa);
     defer interface.deinit();
 
-    var seen = try std.DynamicBitSetUnmanaged.initEmpty(module.gpa, module.decls.items.len);
+    var seen: std.bit_set.Dynamic = try .initEmpty(module.gpa, module.decls.items.len);
     defer seen.deinit(module.gpa);
 
     for (module.entry_points.keys(), module.entry_points.values()) |entry_point_id, entry_point| {
         interface.items.len = 0;
         seen.setRangeValue(.{ .start = 0, .end = module.decls.items.len }, false);
 
+        const exec_model: spec.ExecutionModel = switch (target.os.tag) {
+            .vulkan, .opengl => switch (entry_point.cc) {
+                .spirv_vertex => .vertex,
+                .spirv_fragment => .fragment,
+                .spirv_kernel => .gl_compute,
+                .spirv_task => .task_ext,
+                .spirv_mesh => .mesh_ext,
+                // TODO: We should integrate with the Linkage capability and export this function
+                .spirv_device => continue,
+                else => unreachable,
+            },
+            .opencl => switch (entry_point.cc) {
+                .spirv_kernel => .kernel,
+                // TODO: We should integrate with the Linkage capability and export this function
+                .spirv_device => continue,
+                else => unreachable,
+            },
+            else => unreachable,
+        };
         try module.addEntryPointDeps(entry_point.decl_index, &seen, &interface);
         try entry_points.emit(module.gpa, .OpEntryPoint, .{
-            .execution_model = entry_point.exec_model,
+            .execution_model = exec_model,
             .entry_point = entry_point_id,
             .name = entry_point.name,
             .interface = interface.items,
         });
 
-        if (entry_point.exec_mode == null and entry_point.exec_model == .fragment) {
-            switch (target.os.tag) {
-                .vulkan, .opengl => |tag| {
+        switch (entry_point.cc) {
+            .spirv_kernel, .spirv_task => |kernel| {
+                try module.sections.execution_modes.emit(module.gpa, .OpExecutionMode, .{
+                    .entry_point = entry_point_id,
+                    .mode = .{ .local_size = .{
+                        .x_size = kernel.x,
+                        .y_size = kernel.y,
+                        .z_size = kernel.z,
+                    } },
+                });
+            },
+            .spirv_fragment => |fragment| {
+                try module.sections.execution_modes.emit(module.gpa, .OpExecutionMode, .{
+                    .entry_point = entry_point_id,
+                    .mode = if (target.os.tag == .vulkan) .origin_upper_left else .origin_lower_left,
+                });
+                if (fragment.pixel_centered_integer) {
                     try module.sections.execution_modes.emit(module.gpa, .OpExecutionMode, .{
                         .entry_point = entry_point_id,
-                        .mode = if (tag == .vulkan) .origin_upper_left else .origin_lower_left,
+                        .mode = .pixel_center_integer,
                     });
-                },
-                .opencl => {},
-                else => unreachable,
-            }
+                }
+
+                const exec_mode: ?spec.ExecutionMode.Extended = switch (fragment.depth_assumption) {
+                    .none => null,
+                    .greater => .depth_greater,
+                    .less => .depth_less,
+                    .unchanged => .depth_unchanged,
+                };
+                if (exec_mode) |mode| {
+                    try module.sections.execution_modes.emit(module.gpa, .OpExecutionMode, .{
+                        .entry_point = entry_point_id,
+                        .mode = mode,
+                    });
+                }
+            },
+            .spirv_mesh => |mesh| {
+                try module.sections.execution_modes.emit(module.gpa, .OpExecutionMode, .{
+                    .entry_point = entry_point_id,
+                    .mode = .{ .output_vertices = .{ .vertex_count = mesh.max_vertices } },
+                });
+                try module.sections.execution_modes.emit(module.gpa, .OpExecutionMode, .{
+                    .entry_point = entry_point_id,
+                    .mode = .{ .output_primitives_ext = .{ .primitive_count = mesh.max_primitives } },
+                });
+
+                try module.sections.execution_modes.emit(module.gpa, .OpExecutionMode, .{
+                    .entry_point = entry_point_id,
+                    .mode = switch (mesh.stage_output) {
+                        .output_points => .output_points,
+                        .output_lines => .output_lines_ext,
+                        .output_triangles => .output_triangles_ext,
+                    },
+                });
+            },
+            else => {}, // TODO: should this be unreachable?
         }
     }
 
@@ -582,7 +644,7 @@ pub fn backingIntBits(module: *Module, bits: u16) struct { u16, bool } {
     return .{ std.mem.alignForward(u16, bits, big_int_bits), true };
 }
 
-pub fn intType(module: *Module, signedness: std.builtin.Signedness, bits: u16) !Id {
+pub fn intType(module: *Module, signedness: std.lang.Signedness, bits: u16) !Id {
     assert(bits > 0);
 
     const target = module.zcu.getTarget();
@@ -683,10 +745,8 @@ pub fn structType(
     module: *Module,
     types: []const Id,
     maybe_names: ?[]const []const u8,
-    maybe_offsets: ?[]const u32,
     ip_index: InternPool.Index,
 ) !Id {
-    const target = module.zcu.getTarget();
     const actual_ip_index = if (module.zcu.comp.config.root_strip) .none else ip_index;
 
     if (module.cache.struct_types.get(.{ .fields = types, .ip_index = actual_ip_index })) |id| return id;
@@ -702,22 +762,6 @@ pub fn structType(
         for (names, 0..) |name, i| {
             try module.memberDebugName(result_id, @intCast(i), name);
         }
-    }
-
-    switch (target.os.tag) {
-        .vulkan, .opengl => {
-            if (maybe_offsets) |offsets| {
-                assert(offsets.len == types.len);
-                for (offsets, 0..) |offset, i| {
-                    try module.decorateMember(
-                        result_id,
-                        @intCast(i),
-                        .{ .offset = .{ .byte_offset = offset } },
-                    );
-                }
-            }
-        },
-        else => {},
     }
 
     try module.cache.struct_types.put(
@@ -745,6 +789,75 @@ pub fn functionType(module: *Module, return_ty_id: Id, param_type_ids: []const I
         .params = params_dup,
     }, result_id);
     return result_id;
+}
+
+pub fn samplerType(module: *Module, ip_index: InternPool.Index) !Id {
+    const entry = try module.cache.spirv_types.getOrPut(module.gpa, ip_index);
+    if (!entry.found_existing) {
+        const result_id = module.allocId();
+        entry.value_ptr.* = result_id;
+        try module.sections.globals.emit(module.gpa, .OpTypeSampler, .{
+            .id_result = result_id,
+        });
+    }
+    return entry.value_ptr.*;
+}
+
+pub fn imageType(
+    module: *Module,
+    ip_index: InternPool.Index,
+    sampled_ty_id: Id,
+    dim: spec.Dim,
+    depth: spec.LiteralInteger,
+    arrayed: spec.LiteralInteger,
+    ms: spec.LiteralInteger,
+    sampled: spec.LiteralInteger,
+    image_format: spec.ImageFormat,
+    access_qualifier: ?spec.AccessQualifier,
+) !Id {
+    const entry = try module.cache.spirv_types.getOrPut(module.gpa, ip_index);
+    if (!entry.found_existing) {
+        const result_id = module.allocId();
+        entry.value_ptr.* = result_id;
+        try module.sections.globals.emit(module.gpa, .OpTypeImage, .{
+            .id_result = result_id,
+            .sampled_type = sampled_ty_id,
+            .dim = dim,
+            .depth = depth,
+            .arrayed = arrayed,
+            .ms = ms,
+            .sampled = sampled,
+            .image_format = image_format,
+            .access_qualifier = access_qualifier,
+        });
+    }
+    return entry.value_ptr.*;
+}
+
+pub fn sampledImageType(module: *Module, ip_index: InternPool.Index, image_ty_id: Id) !Id {
+    const entry = try module.cache.spirv_types.getOrPut(module.gpa, ip_index);
+    if (!entry.found_existing) {
+        const result_id = module.allocId();
+        entry.value_ptr.* = result_id;
+        try module.sections.globals.emit(module.gpa, .OpTypeSampledImage, .{
+            .id_result = result_id,
+            .image_type = image_ty_id,
+        });
+    }
+    return entry.value_ptr.*;
+}
+
+pub fn runtimeArrayType(module: *Module, ip_index: InternPool.Index, elem_ty_id: Id) !Id {
+    const entry = try module.cache.spirv_types.getOrPut(module.gpa, ip_index);
+    if (!entry.found_existing) {
+        const result_id = module.allocId();
+        entry.value_ptr.* = result_id;
+        try module.sections.globals.emit(module.gpa, .OpTypeRuntimeArray, .{
+            .id_result = result_id,
+            .element_type = elem_ty_id,
+        });
+    }
+    return entry.value_ptr.*;
 }
 
 pub fn constant(module: *Module, ty_id: Id, value: spec.LiteralContextDependentNumber) !Id {
@@ -871,15 +984,12 @@ pub fn declareEntryPoint(
     module: *Module,
     decl_index: Decl.Index,
     name: []const u8,
-    exec_model: spec.ExecutionModel,
-    exec_mode: ?spec.ExecutionMode,
+    cc: std.builtin.CallingConvention,
 ) !void {
     const gop = try module.entry_points.getOrPut(module.gpa, module.declPtr(decl_index).result_id);
     gop.value_ptr.decl_index = decl_index;
     gop.value_ptr.name = name;
-    gop.value_ptr.exec_model = exec_model;
-    // Might've been set by assembler
-    if (!gop.found_existing) gop.value_ptr.exec_mode = exec_mode;
+    gop.value_ptr.cc = cc;
 }
 
 pub fn debugName(module: *Module, target: Id, name: []const u8) !void {
@@ -918,7 +1028,7 @@ pub fn debugString(module: *Module, string: []const u8) !Id {
     return entry.value_ptr.*;
 }
 
-pub fn storageClass(module: *Module, as: std.builtin.AddressSpace) spec.StorageClass {
+pub fn storageClass(module: *Module, as: std.lang.AddressSpace) spec.StorageClass {
     const target = module.zcu.getTarget();
     return switch (as) {
         .generic => .function,

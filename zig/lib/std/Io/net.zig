@@ -281,7 +281,9 @@ pub const IpAddress = union(enum) {
         /// The socket is restricted to sending and receiving IPv6 packets only.
         /// In this case, an IPv4 and an IPv6 application can bind to a single port
         /// at the same time.
-        ip6_only: bool = false,
+        ///
+        /// The default is determined by system configuration.
+        ip6_only: ?bool = null,
         /// Allow the socket to send datagrams to broadcast addresses.
         /// When not enabled any attempt to send datagrams to a broadcast address
         /// will fail with `error.AccessDenied`
@@ -574,7 +576,7 @@ pub const Ip6Address = struct {
                         const name = text[text_i..];
                         if (name.len == 0) return .incomplete;
                         interface_name_text = name;
-                        text_i = @intCast(text.len);
+                        text_i = std.math.cast(u8, text.len) orelse return .{ .overflow = text.len };
                         continue :state .end;
                     },
                     else => return .{ .invalid_byte = text_i },

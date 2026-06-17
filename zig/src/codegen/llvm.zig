@@ -1,5 +1,24 @@
+const std = @import("std");
+const Io = std.Io;
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const DW = std.dwarf;
+const Builder = std.zig.llvm.Builder;
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 
+const Air = @import("../Air.zig");
+const codegen = @import("../codegen.zig");
+const Compilation = @import("../Compilation.zig");
+const dev = @import("../dev.zig");
+const InternPool = @import("../InternPool.zig");
+const link = @import("../link.zig");
+const Package = @import("../Package.zig");
+const target_util = @import("../target.zig");
+const Type = @import("../Type.zig");
+const Value = @import("../Value.zig");
+const Zcu = @import("../Zcu.zig");
+const aarch64_c_abi = @import("aarch64/abi.zig");
 const FuncGen = @import("llvm/FuncGen.zig");
 const buildAllocaInner = FuncGen.buildAllocaInner;
 const isByRef = FuncGen.isByRef;
@@ -7,34 +26,12 @@ const firstParamSRet = FuncGen.firstParamSRet;
 const lowerFnRetTy = FuncGen.lowerFnRetTy;
 const iterateParamTypes = FuncGen.iterateParamTypes;
 const ccAbiPromoteInt = FuncGen.ccAbiPromoteInt;
-const aarch64_c_abi = @import("aarch64/abi.zig");
 
-const std = @import("std");
-const Io = std.Io;
-const assert = std.debug.assert;
-const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.codegen);
-const DW = std.dwarf;
-const Builder = std.zig.llvm.Builder;
-
-const build_options = @import("build_options");
 const bindings = if (build_options.have_llvm)
     @import("llvm/bindings.zig")
 else
     @compileError("LLVM unavailable");
-
-const link = @import("../link.zig");
-const Compilation = @import("../Compilation.zig");
-const Zcu = @import("../Zcu.zig");
-const InternPool = @import("../InternPool.zig");
-const Package = @import("../Package.zig");
-const Air = @import("../Air.zig");
-const Value = @import("../Value.zig");
-const Type = @import("../Type.zig");
-const codegen = @import("../codegen.zig");
-const dev = @import("../dev.zig");
-
-const target_util = @import("../target.zig");
 
 pub fn legalizeFeatures(_: *const std.Target) ?*const Air.Legalize.Features {
     return comptime &.initMany(&.{
@@ -112,6 +109,7 @@ pub fn targetTriple(allocator: Allocator, target: *const std.Target) ![]const u8
         .hppa64,
         .kalimba,
         .kvx,
+        .m88k,
         .microblaze,
         .microblazeel,
         .or1k,
@@ -305,6 +303,7 @@ pub fn targetTriple(allocator: Allocator, target: *const std.Target) ![]const u8
         .itanium => "itanium",
         .simulator => "simulator",
         .ohos, .ohoseabi => "ohos",
+        .call0 => "unknown",
     };
     try llvm_triple.appendSlice(llvm_abi);
 
@@ -478,6 +477,7 @@ pub fn dataLayout(target: *const std.Target) []const u8 {
         .hppa64,
         .kalimba,
         .kvx,
+        .m88k,
         .microblaze,
         .microblazeel,
         .or1k,
@@ -500,7 +500,7 @@ const CodeModel = enum {
     large,
 };
 
-fn codeModel(model: std.builtin.CodeModel, target: *const std.Target) CodeModel {
+fn codeModel(model: std.lang.CodeModel, target: *const std.Target) CodeModel {
     // Roughly match Clang's mapping of GCC code models to LLVM code models.
     return switch (model) {
         .default => .default,
@@ -517,6 +517,12 @@ fn codeModel(model: std.builtin.CodeModel, target: *const std.Target) CodeModel 
 pub const Object = struct {
     gpa: Allocator,
     builder: Builder,
+
+    /// The basename of the object file which will emitted by LLVM for the ZCU. Once it it emitted,
+    /// this object file is passed to the active linker implementation as an ordinary link input.
+    ///
+    /// For the full path, use `Compilation.resolveEmitPath` with `kind == .temp`.
+    out_bin_basename: []const u8,
 
     /// This pool contains only types (and not `@as(type, undefined)`). It has two purposes:
     ///
@@ -556,7 +562,7 @@ pub const Object = struct {
     /// Same as `nav_map` but for UAVs (which are always global constants).
     uav_map: std.AutoHashMapUnmanaged(struct {
         val: InternPool.Index,
-        @"addrspace": std.builtin.AddressSpace,
+        @"addrspace": std.lang.AddressSpace,
     }, Builder.Variable.Index),
     /// Maps enum types to their corresponding LLVM functions for implementing the `tag_name` instruction.
     enum_tag_name_map: std.AutoHashMapUnmanaged(InternPool.Index, Builder.Function.Index),
@@ -647,12 +653,24 @@ pub const Object = struct {
                     debug_enums_fwd_ref.toOptional(),
                     debug_globals_fwd_ref.toOptional(),
                 };
-            } else .{Builder.Metadata.Optional.none} ** 3;
+            } else .{
+                Builder.Metadata.Optional.none,
+                Builder.Metadata.Optional.none,
+                Builder.Metadata.Optional.none,
+            };
 
         const obj = try arena.create(Object);
         obj.* = .{
             .gpa = gpa,
             .builder = builder,
+            .out_bin_basename = try std.zig.binNameAlloc(arena, .{
+                .root_name = try std.fmt.allocPrint(arena, "{s}_zcu", .{comp.root_name}),
+                .cpu_arch = target.cpu.arch,
+                .os_tag = target.os.tag,
+                .ofmt = target.ofmt,
+                .abi = target.abi,
+                .output_mode = .Obj,
+            }),
             .type_pool = .empty,
             .lazy_abi_aligns = .empty,
             .debug_compile_unit = debug_compile_unit,
@@ -743,7 +761,7 @@ pub const Object = struct {
             b.module_asm.appendSliceAssumeCapacity(assembly);
             b.module_asm.appendAssumeCapacity('\n');
         }
-        if (b.module_asm.getLastOrNull()) |last| {
+        if (b.module_asm.getLast()) |last| {
             if (last != '\n') try b.module_asm.append(gpa, '\n');
         }
     }
@@ -764,7 +782,7 @@ pub const Object = struct {
         lto: std.zig.LtoMode,
     };
 
-    pub fn emit(o: *Object, pt: Zcu.PerThread, options: EmitOptions) error{ LinkFailure, OutOfMemory }!void {
+    pub fn emit(o: *Object, pt: Zcu.PerThread, options: EmitOptions) error{ AlreadyReported, OutOfMemory }!void {
         const zcu = o.zcu;
         const comp = zcu.comp;
         const io = comp.io;
@@ -914,7 +932,7 @@ pub const Object = struct {
         }
 
         const target_triple_sentinel =
-            try o.gpa.dupeZ(u8, o.builder.target_triple.slice(&o.builder).?);
+            try o.gpa.dupeSentinel(u8, o.builder.target_triple.slice(&o.builder).?, 0);
         defer o.gpa.free(target_triple_sentinel);
 
         const emit_asm_msg = options.asm_path orelse "(none)";
@@ -1439,7 +1457,7 @@ pub const Object = struct {
             );
             llvm_function.setSubprogram(subprogram, &o.builder);
             break :debug_info .{ file, subprogram };
-        } else .{undefined} ** 2;
+        } else .{ undefined, undefined };
 
         const fuzz: ?FuncGen.Fuzz = f: {
             if (!owner_mod.fuzz) break :f null;
@@ -1543,6 +1561,11 @@ pub const Object = struct {
         try o.flushTypePool(pt);
     }
 
+    fn workaroundPrivateSymbolBugs(target: *const std.Target, resolved: *const InternPool.Nav.Resolved) bool {
+        // https://codeberg.org/ziglang/zig/issues/31865
+        return target.cpu.arch.isAARCH64() and target.ofmt == .coff and resolved.@"threadlocal";
+    }
+
     pub fn updateNav(o: *Object, pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) !void {
         const zcu = o.zcu;
         const ip = &zcu.intern_pool;
@@ -1615,14 +1638,14 @@ pub const Object = struct {
                 false => .default,
             };
             llvm_global.ptr(&o.builder).linkage = switch (@"extern".linkage) {
-                .internal => if (o.builder.strip) .private else .internal,
+                .internal => if (o.builder.strip and !workaroundPrivateSymbolBugs(zcu.getTarget(), &resolved)) .private else .internal,
                 .strong => .external,
                 .weak => .extern_weak,
                 .link_once => unreachable,
             };
             llvm_global.ptr(&o.builder).visibility = .fromSymbolVisibility(@"extern".visibility);
         } else {
-            llvm_global.ptr(&o.builder).linkage = if (o.builder.strip) .private else .internal;
+            llvm_global.ptr(&o.builder).linkage = if (o.builder.strip and !workaroundPrivateSymbolBugs(zcu.getTarget(), &resolved)) .private else .internal;
             llvm_global.ptr(&o.builder).visibility = .default;
             llvm_global.ptr(&o.builder).dll_storage_class = .default;
             llvm_global.ptr(&o.builder).unnamed_addr = .unnamed_addr;
@@ -1693,7 +1716,7 @@ pub const Object = struct {
         o: *Object,
         exported: Zcu.Exported,
         export_indices: []const Zcu.Export.Index,
-    ) link.File.UpdateExportsError!void {
+    ) link.Error!void {
         const zcu = o.zcu;
         const ip = &zcu.intern_pool;
         const ty: Type, const llvm_ptr: Builder.Constant = switch (exported) {
@@ -1723,7 +1746,7 @@ pub const Object = struct {
         global_index: Builder.Global.Index,
         ty: Type,
         export_indices: []const Zcu.Export.Index,
-    ) link.File.UpdateExportsError!void {
+    ) link.Error!void {
         const zcu = o.zcu;
         const comp = zcu.comp;
         const ip = &zcu.intern_pool;
@@ -1751,7 +1774,7 @@ pub const Object = struct {
         }
 
         // If the first export specifies a linksection, set the exported variable's section to that
-        // one. This is kind of a hack because `std.builtin.ExportOptions.section` doesn't actually
+        // one. This is kind of a hack because `std.lang.ExportOptions.section` doesn't actually
         // make much sense: the linksection should be associated with the declaration itself rather
         // than some particular symbol it is exported as!
         if (export_indices[0].ptr(zcu).opts.section.toSlice(ip)) |section_slice| {
@@ -1934,15 +1957,32 @@ pub const Object = struct {
         const gop = try o.debug_file_map.getOrPut(gpa, file_index);
         errdefer assert(o.debug_file_map.remove(file_index));
         if (gop.found_existing) return gop.value_ptr.*;
-        const path = o.zcu.fileByIndex(file_index).path;
-        const abs_path = try path.toAbsolute(o.zcu.comp.dirs, gpa);
-        defer gpa.free(abs_path);
 
-        gop.value_ptr.* = try o.builder.debugFile(
-            try o.builder.metadataString(std.fs.path.basename(abs_path)),
-            try o.builder.metadataString(std.fs.path.dirname(abs_path) orelse ""),
-        );
-        return gop.value_ptr.*;
+        const dirs = o.zcu.comp.dirs;
+        const path = o.zcu.fileByIndex(file_index).path;
+        const root_path: ?[]const u8 = switch (path.root) {
+            .zig_lib => dirs.zig_lib.path,
+            .global_cache => dirs.global_cache.path,
+            .local_cache => dirs.local_cache.path,
+            .none => null,
+        };
+
+        const file = if (root_path) |root|
+            try o.builder.debugFile(
+                try o.builder.metadataString(path.sub_path),
+                try o.builder.metadataString(root),
+            )
+        else blk: {
+            const relative = try std.fs.path.relative(gpa, dirs.cwd, null, dirs.cwd, path.sub_path);
+            defer gpa.free(relative);
+            break :blk try o.builder.debugFile(
+                try o.builder.metadataString(relative),
+                try o.builder.metadataString(dirs.cwd),
+            );
+        };
+
+        gop.value_ptr.* = file;
+        return file;
     }
 
     pub fn getDebugType(o: *Object, pt: Zcu.PerThread, ty: Type) Allocator.Error!Builder.Metadata {
@@ -2622,6 +2662,7 @@ pub const Object = struct {
             },
             .frame => @panic("TODO implement lowerDebugType for Frame types"),
             .@"anyframe" => @panic("TODO implement lowerDebugType for AnyFrame types"),
+            .spirv => unreachable,
         }
     }
 
@@ -2714,73 +2755,60 @@ pub const Object = struct {
             @panic("TODO: LLVM backend lower async function");
         }
 
-        {
-            const cc_info = toLlvmCallConv(fn_info.cc, target).?;
+        const cc_info = toLlvmCallConv(fn_info.cc, target).?;
 
-            function_index.setCallConv(cc_info.llvm_cc, &o.builder);
+        function_index.setCallConv(cc_info.llvm_cc, &o.builder);
 
-            if (cc_info.align_stack) {
-                try attributes.addFnAttr(.{ .alignstack = .wrap(.fromByteUnits(target.stackAlignment())) }, &o.builder);
-            } else {
-                _ = try attributes.removeFnAttr(.alignstack);
-            }
+        if (cc_info.align_stack) {
+            try attributes.addFnAttr(.{ .alignstack = .wrap(.fromByteUnits(target.stackAlignment())) }, &o.builder);
+        }
 
-            if (cc_info.naked) {
-                try attributes.addFnAttr(.naked, &o.builder);
-            } else {
-                _ = try attributes.removeFnAttr(.naked);
-            }
+        if (cc_info.naked) {
+            try attributes.addFnAttr(.naked, &o.builder);
+        }
 
-            for (0..cc_info.inreg_param_count) |param_idx| {
-                try attributes.addParamAttr(param_idx, .inreg, &o.builder);
-            }
-            for (cc_info.inreg_param_count..std.math.maxInt(u2)) |param_idx| {
-                _ = try attributes.removeParamAttr(param_idx, .inreg);
-            }
-
-            switch (fn_info.cc) {
-                inline .riscv64_interrupt,
-                .riscv32_interrupt,
-                .mips_interrupt,
-                .mips64_interrupt,
-                => |info| {
-                    try attributes.addFnAttr(.{ .string = .{
-                        .kind = try o.builder.string("interrupt"),
-                        .value = try o.builder.string(@tagName(info.mode)),
-                    } }, &o.builder);
-                },
-                .arm_interrupt,
-                => |info| {
-                    try attributes.addFnAttr(.{ .string = .{
-                        .kind = try o.builder.string("interrupt"),
-                        .value = try o.builder.string(switch (info.type) {
-                            .generic => "",
-                            .irq => "IRQ",
-                            .fiq => "FIQ",
-                            .swi => "SWI",
-                            .abort => "ABORT",
-                            .undef => "UNDEF",
-                        }),
-                    } }, &o.builder);
-                },
-                // these function attributes serve as a backup against any mistakes LLVM makes.
-                // clang sets both the function's calling convention and the function attributes
-                // in its backend, so future patches to the AVR backend could end up checking only one,
-                // possibly breaking our support. it's safer to just emit both.
-                .avr_interrupt, .avr_signal, .csky_interrupt => {
-                    try attributes.addFnAttr(.{ .string = .{
-                        .kind = try o.builder.string(switch (fn_info.cc) {
-                            .avr_interrupt,
-                            .csky_interrupt,
-                            => "interrupt",
-                            .avr_signal => "signal",
-                            else => unreachable,
-                        }),
-                        .value = .empty,
-                    } }, &o.builder);
-                },
-                else => {},
-            }
+        switch (fn_info.cc) {
+            inline .riscv64_interrupt,
+            .riscv32_interrupt,
+            .mips_interrupt,
+            .mips64_interrupt,
+            => |info| {
+                try attributes.addFnAttr(.{ .string = .{
+                    .kind = try o.builder.string("interrupt"),
+                    .value = try o.builder.string(@tagName(info.mode)),
+                } }, &o.builder);
+            },
+            .arm_interrupt,
+            => |info| {
+                try attributes.addFnAttr(.{ .string = .{
+                    .kind = try o.builder.string("interrupt"),
+                    .value = try o.builder.string(switch (info.type) {
+                        .generic => "",
+                        .irq => "IRQ",
+                        .fiq => "FIQ",
+                        .swi => "SWI",
+                        .abort => "ABORT",
+                        .undef => "UNDEF",
+                    }),
+                } }, &o.builder);
+            },
+            // these function attributes serve as a backup against any mistakes LLVM makes.
+            // clang sets both the function's calling convention and the function attributes
+            // in its backend, so future patches to the AVR backend could end up checking only one,
+            // possibly breaking our support. it's safer to just emit both.
+            .avr_interrupt, .avr_signal, .csky_interrupt => {
+                try attributes.addFnAttr(.{ .string = .{
+                    .kind = try o.builder.string(switch (fn_info.cc) {
+                        .avr_interrupt,
+                        .csky_interrupt,
+                        => "interrupt",
+                        .avr_signal => "signal",
+                        else => unreachable,
+                    }),
+                    .value = .empty,
+                } }, &o.builder);
+            },
+            else => {},
         }
 
         // Function attributes that are independent of analysis results of the function body.
@@ -2817,12 +2845,31 @@ pub const Object = struct {
             try attributes.addParamAttr(it.llvm_index, .nonnull, &o.builder);
             it.llvm_index += 1;
         }
+
+        var remaining_inreg_int = cc_info.inreg_int_params;
+        var remaining_inreg_float = cc_info.inreg_float_params;
+
         while (try it.next()) |lowering| switch (lowering) {
             .byval => {
                 const param_index = it.zig_index - 1;
                 const param_ty: Type = .fromInterned(fn_info.param_types.get(ip)[param_index]);
                 if (!isByRef(param_ty, zcu)) {
                     try o.addByValParamAttrs(pt, &attributes, param_ty, param_index, fn_info, it.llvm_index - 1);
+                }
+
+                if (remaining_inreg_int > 0 and
+                    (param_ty.isPtrAtRuntime(zcu) or
+                        (param_ty.isAbiInt(zcu) and param_ty.abiSize(zcu) <= Type.usize.abiSize(zcu))))
+                {
+                    try attributes.addParamAttr(it.llvm_index - 1, .inreg, &o.builder);
+                    remaining_inreg_int -= 1;
+                }
+
+                if (remaining_inreg_float > 0 and
+                    param_ty.zigTypeTag(zcu) == .float)
+                {
+                    try attributes.addParamAttr(it.llvm_index - 1, .inreg, &o.builder);
+                    remaining_inreg_float -= 1;
                 }
             },
             .byref => {
@@ -2948,7 +2995,7 @@ pub const Object = struct {
         const target = zcu.getTarget();
         const ip = &zcu.intern_pool;
         return switch (t.toIntern()) {
-            .u0_type, .i0_type => unreachable, // no runtime bits
+            .u0_type => unreachable, // no runtime bits
             inline .u1_type,
             .u8_type,
             .i8_type,
@@ -3329,7 +3376,7 @@ pub const Object = struct {
                     );
                     return ty;
                 },
-                .opaque_type => unreachable, // no runtime bits
+                .opaque_type, .spirv_type => unreachable, // no runtime bits
                 .enum_type => try o.lowerType(t.intTagType(zcu)),
                 .func_type => |func_type| try o.lowerFnType(t, func_type),
                 .error_set_type, .inferred_error_set_type => try o.errorIntType(),
@@ -3374,7 +3421,7 @@ pub const Object = struct {
         }
 
         if (fn_info.cc == .auto and zcu.comp.config.any_error_tracing) {
-            // First parameter is a pointer to `std.builtin.StackTrace`.
+            // First parameter is a pointer to `std.lang.StackTrace`.
             const llvm_ptr_ty = try o.builder.ptrType(toLlvmAddressSpace(.generic, target));
             try llvm_params.append(o.gpa, llvm_ptr_ty);
         }
@@ -3451,6 +3498,7 @@ pub const Object = struct {
             .tuple_type,
             .union_type,
             .opaque_type,
+            .spirv_type,
             .enum_type,
             .func_type,
             .error_set_type,
@@ -3982,7 +4030,7 @@ pub const Object = struct {
         o: *Object,
         /// Must not be `.none`.
         @"align": InternPool.Alignment,
-        @"addrspace": std.builtin.AddressSpace,
+        @"addrspace": std.lang.AddressSpace,
     ) Allocator.Error!Builder.Constant {
         const addr: u64 = @"align".toByteUnits().?;
         const llvm_usize = try o.lowerType(.usize);
@@ -3996,7 +4044,7 @@ pub const Object = struct {
         uav_val: InternPool.Index,
         /// Must not be `.none`.
         @"align": InternPool.Alignment,
-        @"addrspace": std.builtin.AddressSpace,
+        @"addrspace": std.lang.AddressSpace,
     ) Allocator.Error!Builder.Constant {
         assert(@"align" != .none);
 
@@ -4375,24 +4423,32 @@ const CallingConventionInfo = struct {
     align_stack: bool,
     /// Whether the function needs a `naked` attribute.
     naked: bool,
-    /// How many leading parameters to apply the `inreg` attribute to.
-    inreg_param_count: u2 = 0,
+    /// How many leading register-sized integer parameters to apply the `inreg` attribute to.
+    inreg_int_params: u2 = 0,
+    /// How many leading floating-point parameters to apply the `inreg` attribute to.
+    inreg_float_params: u3 = 0,
 };
 
-pub fn toLlvmCallConv(cc: std.builtin.CallingConvention, target: *const std.Target) ?CallingConventionInfo {
+pub fn toLlvmCallConv(cc: std.lang.CallingConvention, target: *const std.Target) ?CallingConventionInfo {
     const llvm_cc = toLlvmCallConvTag(cc, target) orelse return null;
-    const incoming_stack_alignment: ?u64, const register_params: u2 = switch (cc) {
+    const incoming_stack_alignment: ?u64, const inreg_int_params: u2, const inreg_float_params: u3 = switch (cc) {
+        .x86_fastcall => |opts| .{ opts.incoming_stack_alignment, 2, 0 },
+        .x86_vectorcall => |opts| .{ opts.incoming_stack_alignment, 2, 6 },
         inline else => |pl| switch (@TypeOf(pl)) {
-            void => .{ null, 0 },
-            std.builtin.CallingConvention.ArcInterruptOptions,
-            std.builtin.CallingConvention.ArmInterruptOptions,
-            std.builtin.CallingConvention.RiscvInterruptOptions,
-            std.builtin.CallingConvention.ShInterruptOptions,
-            std.builtin.CallingConvention.MicroblazeInterruptOptions,
-            std.builtin.CallingConvention.MipsInterruptOptions,
-            std.builtin.CallingConvention.CommonOptions,
-            => .{ pl.incoming_stack_alignment, 0 },
-            std.builtin.CallingConvention.X86RegparmOptions => .{ pl.incoming_stack_alignment, pl.register_params },
+            void => .{ null, 0, 0 },
+            std.lang.CallingConvention.ArcInterruptOptions,
+            std.lang.CallingConvention.ArmInterruptOptions,
+            std.lang.CallingConvention.RiscvInterruptOptions,
+            std.lang.CallingConvention.ShInterruptOptions,
+            std.lang.CallingConvention.MicroblazeInterruptOptions,
+            std.lang.CallingConvention.MipsInterruptOptions,
+            std.lang.CallingConvention.CommonOptions,
+            => .{ pl.incoming_stack_alignment, 0, 0 },
+            std.lang.CallingConvention.X86RegparmOptions => .{ pl.incoming_stack_alignment, pl.register_params, 0 },
+            std.lang.CallingConvention.SpirvKernelOptions,
+            std.lang.CallingConvention.SpirvFragmentOptions,
+            std.lang.CallingConvention.SpirvMeshOptions,
+            => .{ null, 0, 0 },
             else => @compileError("TODO: toLlvmCallConv" ++ @tagName(pl)),
         },
     };
@@ -4403,10 +4459,11 @@ pub fn toLlvmCallConv(cc: std.builtin.CallingConvention, target: *const std.Targ
             break :need_align a < normal_stack_align;
         } else false,
         .naked = cc == .naked,
-        .inreg_param_count = register_params,
+        .inreg_int_params = inreg_int_params,
+        .inreg_float_params = inreg_float_params,
     };
 }
-pub fn toLlvmCallConvTag(cc_tag: std.builtin.CallingConvention.Tag, target: *const std.Target) ?Builder.CallConv {
+pub fn toLlvmCallConvTag(cc_tag: std.lang.CallingConvention.Tag, target: *const std.Target) ?Builder.CallConv {
     if (target.cCallingConvention()) |default_c| {
         if (cc_tag == default_c) {
             return .ccc;
@@ -4516,6 +4573,7 @@ pub fn toLlvmCallConvTag(cc_tag: std.builtin.CallingConvention.Tag, target: *con
         .loongarch32_ilp32,
         .m68k_sysv,
         .m68k_gnu,
+        .m88k_sysv,
         .msp430_eabi,
         .or1k_sysv,
         .propeller_sysv,
@@ -4534,18 +4592,20 @@ pub fn toLlvmCallConvTag(cc_tag: std.builtin.CallingConvention.Tag, target: *con
         .spirv_kernel,
         .spirv_fragment,
         .spirv_vertex,
+        .spirv_task,
+        .spirv_mesh,
         => null,
     };
 }
 
 /// Convert a zig-address space to an llvm address space.
-pub fn toLlvmAddressSpace(address_space: std.builtin.AddressSpace, target: *const std.Target) Builder.AddrSpace {
+pub fn toLlvmAddressSpace(address_space: std.lang.AddressSpace, target: *const std.Target) Builder.AddrSpace {
     for (llvmAddrSpaceInfo(target)) |info| if (info.zig == address_space) return info.llvm;
     unreachable;
 }
 
 const AddrSpaceInfo = struct {
-    zig: ?std.builtin.AddressSpace,
+    zig: ?std.lang.AddressSpace,
     llvm: Builder.AddrSpace,
     non_integral: bool = false,
     size: ?u16 = null,
@@ -4639,7 +4699,7 @@ fn llvmDefaultGlobalAddressSpace(target: *const std.Target) Builder.AddrSpace {
 
 /// Return the actual address space that a value should be stored in if its a global address space.
 /// When a value is placed in the resulting address space, it needs to be cast back into wanted_address_space.
-fn toLlvmGlobalAddressSpace(wanted_address_space: std.builtin.AddressSpace, target: *const std.Target) Builder.AddrSpace {
+fn toLlvmGlobalAddressSpace(wanted_address_space: std.lang.AddressSpace, target: *const std.Target) Builder.AddrSpace {
     return switch (wanted_address_space) {
         .generic => llvmDefaultGlobalAddressSpace(target),
         else => |as| toLlvmAddressSpace(as, target),
@@ -4888,6 +4948,7 @@ pub fn initializeLLVMTarget(arch: std.Target.Cpu.Arch) void {
         .hppa64,
         .kalimba,
         .kvx,
+        .m88k,
         .microblaze,
         .microblazeel,
         .or1k,

@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = std.builtin;
 const BufMap = std.BufMap;
 const mem = std.mem;
 const fs = std.fs;
@@ -17,6 +16,8 @@ const IoMode = enum { threaded, evented };
 const ValueInterpretMode = enum { direct, by_name };
 
 pub fn build(b: *std.Build) !void {
+    const arena = b.graph.arena;
+
     const only_c = b.option(bool, "only-c", "Translate the Zig compiler to C code, with only the C backend enabled") orelse false;
     const target = b.standardTargetOptions(.{
         .default_target = .{
@@ -36,7 +37,7 @@ pub fn build(b: *std.Build) !void {
     const no_bin = b.option(bool, "no-bin", "skip emitting compiler binary") orelse false;
     const enable_superhtml = b.option(bool, "enable-superhtml", "Check langref output HTML validity") orelse false;
 
-    const langref_file = generateLangRef(b);
+    const langref_file = try generateLangRef(b);
     const install_langref = b.addInstallFileWithDir(langref_file, .prefix, "doc/langref.html");
     const check_langref = superHtmlCheck(b, langref_file);
     if (enable_superhtml) install_langref.step.dependOn(check_langref);
@@ -141,24 +142,9 @@ pub fn build(b: *std.Build) !void {
             .install_dir = if (flat) .prefix else .lib,
             .install_subdir = if (flat) "lib" else "zig",
             .exclude_extensions = &[_][]const u8{
-                // exclude files from lib/std/compress/testdata
-                ".gz",
-                ".z.0",
-                ".z.9",
-                ".zst.3",
-                ".zst.19",
-                "rfc1951.txt",
-                "rfc1952.txt",
-                "rfc8478.txt",
                 // exclude files from lib/std/compress/flate/testdata
                 ".expect",
-                ".expect-noinput",
-                ".golden",
                 ".input",
-                "compress-e.txt",
-                "compress-gettysburg.txt",
-                "compress-pi.txt",
-                "rfc1951.txt",
                 // exclude files from lib/std/compress/lzma/testdata
                 ".lzma",
                 // exclude files from lib/std/compress/xz/testdata
@@ -180,18 +166,18 @@ pub fn build(b: *std.Build) !void {
         return;
 
     const entitlements = b.option([]const u8, "entitlements", "Path to entitlements file for hot-code swapping without sudo on macOS");
-    const tracy = b.option([]const u8, "tracy", "Enable Tracy integration. Supply path to Tracy source");
-    const tracy_callstack = b.option(bool, "tracy-callstack", "Include callstack information with Tracy data. Does nothing if -Dtracy is not provided") orelse (tracy != null);
-    const tracy_allocation = b.option(bool, "tracy-allocation", "Include allocation information with Tracy data. Does nothing if -Dtracy is not provided") orelse (tracy != null);
-    const tracy_callstack_depth: u32 = b.option(u32, "tracy-callstack-depth", "Declare callstack depth for Tracy data. Does nothing if -Dtracy_callstack is not provided") orelse 10;
-    const debug_gpa = b.option(bool, "debug-allocator", "Force the compiler to use DebugAllocator") orelse false;
+    const tracy = b.option(std.Build.LazyPath, "tracy", "Enable Tracy integration. Supply path to Tracy source");
+    const tracy_callstack = b.option(bool, "tracy-callstack", "Include callstack information with Tracy data. Does nothing if -Dtracy is not provided. Has a significant performance impact in some cases. Default: false") orelse false;
+    const tracy_allocation = b.option(bool, "tracy-allocation", "Include allocation information with Tracy data. Does nothing if -Dtracy is not provided. Default: true") orelse (tracy != null);
+    const tracy_callstack_depth: u32 = b.option(u32, "tracy-callstack-depth", "Declare callstack depth for Tracy data. Does nothing if -Dtracy-callstack is not provided") orelse 6;
+    const debug_gpa = b.option(bool, "debug-allocator", "Force the compiler to use SafeAllocator") orelse false;
     const link_libc = b.option(bool, "force-link-libc", "Force self-hosted compiler to link libc") orelse (enable_llvm or only_c);
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable thread-sanitization") orelse false;
     const strip = b.option(bool, "strip", "Omit debug information");
     const valgrind = b.option(bool, "valgrind", "Enable valgrind integration");
     const pie = b.option(bool, "pie", "Produce a Position Independent Executable");
     const io_mode = b.option(IoMode, "io-mode", "How the compiler performs IO") orelse .threaded;
-    const value_interpret_mode = b.option(ValueInterpretMode, "value-interpret-mode", "How the compiler translates between 'std.builtin' types and its internal datastructures") orelse .direct;
+    const value_interpret_mode = b.option(ValueInterpretMode, "value-interpret-mode", "How the compiler translates between 'std.lang' types and its internal datastructures") orelse .direct;
     const value_tracing = b.option(bool, "value-tracing", "Enable extra state tracking to help troubleshoot bugs in the compiler (using the std.debug.Trace API)") orelse false;
 
     const mem_leak_frames: u32 = b.option(u32, "mem-leak-frames", "How many stack frames to print when a memory leak occurs. Tests get 2x this amount.") orelse blk: {
@@ -209,7 +195,8 @@ pub fn build(b: *std.Build) !void {
         .single_threaded = single_threaded,
     });
     exe.pie = pie;
-    exe.entitlements = entitlements;
+    // https://codeberg.org/ziglang/zig/issues/32173
+    exe.entitlements = if (entitlements) |p| .{ .cwd_relative = p } else null;
     exe.use_new_linker = b.option(bool, "new-linker", "Use the new linker");
 
     const use_llvm = b.option(bool, "use-llvm", "Use the llvm backend");
@@ -231,7 +218,6 @@ pub fn build(b: *std.Build) !void {
     exe.root_module.addOptions("build_options", exe_options);
 
     exe_options.addOption(u32, "mem_leak_frames", mem_leak_frames);
-    exe_options.addOption(bool, "skip_non_native", skip_non_native);
     exe_options.addOption(bool, "have_llvm", enable_llvm);
     exe_options.addOption(bool, "llvm_has_m68k", llvm_has_m68k);
     exe_options.addOption(bool, "llvm_has_csky", llvm_has_csky);
@@ -257,12 +243,17 @@ pub fn build(b: *std.Build) !void {
             std.debug.print("error: version info cannot be retrieved from git. Zig version must be provided using -Dversion-string\n", .{});
             std.process.exit(1);
         }
+
+        // Ensure git version changes get picked up
+        // https://codeberg.org/ziglang/zig/issues/35473
+        b.graph.poisonCache();
+
         const version_string = b.fmt("{d}.{d}.{d}", .{ zig_version.major, zig_version.minor, zig_version.patch });
 
         var code: u8 = undefined;
         const git_describe_untrimmed = b.runAllowFail(&[_][]const u8{
             "git",
-            "-C", b.build_root.path orelse ".", // affects the --git-dir argument
+            "-C", b.fmt("{f}", .{b.root}), // affects the --git-dir argument
             "--git-dir", ".git", // affected by the -C argument
             "describe", "--match",    "*.*.*", //
             "--tags",   "--abbrev=9",
@@ -308,7 +299,7 @@ pub fn build(b: *std.Build) !void {
             },
         }
     };
-    const version = try b.allocator.dupeZ(u8, version_slice);
+    const version = try arena.dupeSentinel(u8, version_slice, 0);
     exe_options.addOption([:0]const u8, "version", version);
 
     if (enable_llvm) {
@@ -316,7 +307,7 @@ pub fn build(b: *std.Build) !void {
             const io = b.graph.io;
             const cwd: Io.Dir = .cwd();
             if (findConfigH(b, config_h_path_option)) |config_h_path| {
-                const file_contents = cwd.readFileAlloc(io, config_h_path, b.allocator, .limited(max_config_h_bytes)) catch unreachable;
+                const file_contents = cwd.readFileAlloc(io, config_h_path, arena, .limited(max_config_h_bytes)) catch unreachable;
                 break :blk parseConfigH(b, file_contents);
             } else {
                 std.log.warn("config.h could not be located automatically. Consider providing it explicitly via \"-Dconfig_h\"", .{});
@@ -366,54 +357,53 @@ pub fn build(b: *std.Build) !void {
     exe_options.addOption(bool, "enable_tracy_allocation", tracy_allocation);
     exe_options.addOption(u32, "tracy_callstack_depth", tracy_callstack_depth);
     exe_options.addOption(bool, "value_tracing", value_tracing);
-    if (tracy) |tracy_path| {
-        const client_cpp = b.pathJoin(
-            &[_][]const u8{ tracy_path, "public", "TracyClient.cpp" },
-        );
-
-        const tracy_c_flags: []const []const u8 = &.{
-            "-DTRACY_ENABLE=1",
-            "-fno-sanitize=undefined",
-            "-DTRACY_FIBERS",
-        };
-
-        exe.root_module.addIncludePath(.{ .cwd_relative = tracy_path });
-        exe.root_module.addCSourceFile(.{
-            .file = .{ .cwd_relative = client_cpp },
-            .flags = tracy_c_flags[0..switch (io_mode) {
-                .threaded => 2,
-                .evented => 3,
-            }],
+    if (tracy) |tracy_dir| {
+        const tracy_mod = b.createModule(.{
+            .target = target,
+            // Always build Tracy in ReleaseFast so that it doesn't make Debug compiler builds unusable.
+            .optimize = .ReleaseFast,
+            .root_source_file = null,
+            .link_libc = true,
+            .link_libcpp = true,
         });
-        exe.root_module.link_libc = true;
-        exe.root_module.link_libcpp = true;
+
+        tracy_mod.addCMacro("TRACY_ENABLE", "1");
+
+        if (!tracy_callstack) {
+            tracy_mod.addCMacro("TRACY_NO_CALLSTACK", "1");
+        }
+
+        tracy_mod.addIncludePath(tracy_dir);
+        tracy_mod.addCSourceFile(.{ .file = tracy_dir.path(b, "public/TracyClient.cpp") });
 
         if (target.result.os.tag == .windows) {
-            exe.root_module.linkSystemLibrary("dbghelp", .{});
-            exe.root_module.linkSystemLibrary("ws2_32", .{});
+            tracy_mod.linkSystemLibrary("dbghelp", .{});
+            tracy_mod.linkSystemLibrary("ws2_32", .{});
         }
+
+        exe.root_module.addImport("tracy", tracy_mod);
     }
 
     const test_filters = b.option([]const []const u8, "test-filter", "Skip tests that do not match any filter") orelse &[0][]const u8{};
     const test_target_filters = b.option([]const []const u8, "test-target-filter", "Skip tests whose target triple do not match any filter") orelse &[0][]const u8{};
     const test_extra_targets = b.option(bool, "test-extra-targets", "Enable running module tests for additional targets") orelse false;
 
-    var chosen_opt_modes_buf: [4]builtin.OptimizeMode = undefined;
+    var chosen_opt_modes_buf: [4]std.lang.OptimizeMode = undefined;
     var chosen_mode_index: usize = 0;
     if (!skip_debug) {
-        chosen_opt_modes_buf[chosen_mode_index] = builtin.OptimizeMode.Debug;
+        chosen_opt_modes_buf[chosen_mode_index] = .Debug;
         chosen_mode_index += 1;
     }
     if (!skip_release_safe) {
-        chosen_opt_modes_buf[chosen_mode_index] = builtin.OptimizeMode.ReleaseSafe;
+        chosen_opt_modes_buf[chosen_mode_index] = .ReleaseSafe;
         chosen_mode_index += 1;
     }
     if (!skip_release_fast) {
-        chosen_opt_modes_buf[chosen_mode_index] = builtin.OptimizeMode.ReleaseFast;
+        chosen_opt_modes_buf[chosen_mode_index] = .ReleaseFast;
         chosen_mode_index += 1;
     }
     if (!skip_release_small) {
-        chosen_opt_modes_buf[chosen_mode_index] = builtin.OptimizeMode.ReleaseSmall;
+        chosen_opt_modes_buf[chosen_mode_index] = .ReleaseSmall;
         chosen_mode_index += 1;
     }
     const optimize_modes = chosen_opt_modes_buf[0..chosen_mode_index];
@@ -425,8 +415,8 @@ pub fn build(b: *std.Build) !void {
     else
         null;
 
-    const fmt_include_paths = &.{ "lib", "src", "test", "tools", "build.zig", "build.zig.zon" };
-    const fmt_exclude_paths = &.{ "test/cases", "test/behavior/zon" };
+    const fmt_include_paths = b.pathList(&.{ "lib", "src", "test", "tools", "build.zig", "build.zig.zon" });
+    const fmt_exclude_paths = b.pathList(&.{ "test/cases", "test/behavior/zon" });
     const do_fmt = b.addFmt(.{
         .paths = fmt_include_paths,
         .exclude_paths = fmt_exclude_paths,
@@ -706,11 +696,11 @@ fn addWasiUpdateStep(b: *std.Build, version: [:0]const u8) !void {
     //
     // * We lose a small amount of performance. This is essentially irrelevant for zig1.
     //
-    // * We lose the ability to perform trivial renames on certain `std.builtin` types without
+    // * We lose the ability to perform trivial renames on certain `std.lang` types without
     //   zig1.wasm updates. For instance, we cannot rename an enum from PascalCase fields to
     //   snake_case fields without an update.
     //
-    // * We gain the ability to add and remove fields to and from `std.builtin` types without
+    // * We gain the ability to add and remove fields to and from `std.lang` types without
     //   zig1.wasm updates. For instance, we can add a new tag to `CallingConvention` without
     //   an update.
     //
@@ -740,7 +730,7 @@ fn addWasiUpdateStep(b: *std.Build, version: [:0]const u8) !void {
 }
 
 const AddCompilerModOptions = struct {
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.OptimizeMode,
     target: std.Build.ResolvedTarget,
     strip: ?bool = null,
     valgrind: ?bool = null,
@@ -976,11 +966,12 @@ fn addCxxKnownPath(
     errtxt: ?[]const u8,
     need_cpp_includes: bool,
 ) !void {
-    if (!std.process.can_spawn)
-        return error.RequiredLibraryNotFound;
+    if (!std.process.can_spawn) return error.RequiredLibraryNotFound;
+
+    const arena = b.graph.arena;
 
     const path_padded = run: {
-        var args = std.array_list.Managed([]const u8).init(b.allocator);
+        var args = std.array_list.Managed([]const u8).init(arena);
         try args.append(ctx.cxx_compiler);
         var it = std.mem.tokenizeAny(u8, ctx.cxx_compiler_arg1, &std.ascii.whitespace);
         while (it.next()) |arg| try args.append(arg);
@@ -1029,7 +1020,7 @@ fn addCMakeLibraryList(mod: *std.Build.Module, list: []const u8) void {
 }
 
 const CMakeConfig = struct {
-    llvm_linkage: std.builtin.LinkMode,
+    llvm_linkage: std.lang.LinkMode,
     cmake_binary_dir: []const u8,
     cmake_prefix_path: []const u8,
     cmake_static_library_prefix: []const u8,
@@ -1049,6 +1040,7 @@ const CMakeConfig = struct {
 const max_config_h_bytes = 1 * 1024 * 1024;
 
 fn findConfigH(b: *std.Build, config_h_path_option: ?[]const u8) ?[]const u8 {
+    const arena = b.graph.arena;
     const io = b.graph.io;
     const cwd: Io.Dir = .cwd();
 
@@ -1073,7 +1065,7 @@ fn findConfigH(b: *std.Build, config_h_path_option: ?[]const u8) ?[]const u8 {
         if (config_h_or_err) |*file| {
             file.close(io);
             return fs.path.join(
-                b.allocator,
+                arena,
                 &[_][]const u8{ check_dir, "config.h" },
             ) catch unreachable;
         } else |e| switch (e) {
@@ -1198,7 +1190,8 @@ fn parseConfigH(b: *std.Build, config_h_text: []const u8) ?CMakeConfig {
 }
 
 fn toNativePathSep(b: *std.Build, s: []const u8) []u8 {
-    const duplicated = b.allocator.dupe(u8, s) catch unreachable;
+    const arena = b.graph.arena;
+    const duplicated = arena.dupe(u8, s) catch unreachable;
     for (duplicated) |*byte| switch (byte.*) {
         '/' => byte.* = fs.path.sep,
         else => {},
@@ -1487,8 +1480,9 @@ const llvm_libs_xtensa = [_][]const u8{
     "LLVMXtensaInfo",
 };
 
-fn generateLangRef(b: *std.Build) std.Build.LazyPath {
+fn generateLangRef(b: *std.Build) !std.Build.LazyPath {
     const io = b.graph.io;
+    const arena = b.graph.arena;
 
     const doctest_exe = b.addExecutable(.{
         .name = "doctest",
@@ -1499,11 +1493,10 @@ fn generateLangRef(b: *std.Build) std.Build.LazyPath {
         }),
     });
 
-    var dir = b.build_root.handle.openDir(io, "doc/langref", .{ .iterate = true }) catch |err| {
-        std.debug.panic("unable to open '{f}doc/langref' directory: {s}", .{
-            b.build_root, @errorName(err),
-        });
-    };
+    const langref_path = try b.root.join(arena, "doc/langref");
+
+    var dir = langref_path.root_dir.handle.openDir(io, langref_path.sub_path, .{ .iterate = true }) catch |err|
+        std.debug.panic("unable to open directory {f}: {t}", .{ langref_path, err });
     defer dir.close(io);
 
     var wf = b.addWriteFiles();
@@ -1516,17 +1509,20 @@ fn generateLangRef(b: *std.Build) std.Build.LazyPath {
 
         const out_basename = b.fmt("{s}.out", .{std.fs.path.stem(entry.name)});
         const cmd = b.addRunArtifact(doctest_exe);
-        cmd.addArgs(&.{
-            "--zig",        b.graph.zig_exe,
-            // TODO: enhance doctest to use "--listen=-" rather than operating
-            // in a temporary directory
-            "--cache-root", b.cache_root.path orelse ".",
-        });
-        cmd.addArgs(&.{ "--zig-lib-dir", b.fmt("{f}", .{b.graph.zig_lib_directory}) });
-        cmd.addArgs(&.{"-i"});
+
+        cmd.addArg("--zig");
+        cmd.addFileArg(.zig_exe);
+
+        cmd.addArg("--cache-root");
+        cmd.addDirectoryArg(.cache_root);
+
+        cmd.addArg("--zig-lib-dir");
+        cmd.addDirectoryArg(.zig_lib);
+
+        cmd.addArg("-i");
         cmd.addFileArg(b.path(b.fmt("doc/langref/{s}", .{entry.name})));
 
-        cmd.addArgs(&.{"-o"});
+        cmd.addArg("-o");
         _ = wf.addCopyFile(cmd.addOutputFileArg(out_basename), out_basename);
     }
 

@@ -37,7 +37,7 @@ pub fn buildCrtFile(comp: *Compilation, crt_file: CrtFile, prog_node: std.Progre
     const target = comp.getTarget();
 
     // The old 32-bit x86 variant of SEH doesn't use tables.
-    const unwind_tables: std.builtin.UnwindTables = if (target.cpu.arch != .x86) .async else .none;
+    const unwind_tables: std.lang.UnwindTables = if (target.cpu.arch != .x86) .async else .none;
 
     switch (crt_file) {
         .crt2_o => {
@@ -853,9 +853,6 @@ const mingw32_x86_src = [_][]const u8{
     "math" ++ path.sep_str ++ "fmal.c",
     "math" ++ path.sep_str ++ "llrintl.c",
     "math" ++ path.sep_str ++ "llroundl.c",
-    "math" ++ path.sep_str ++ "lrintl.c",
-    "math" ++ path.sep_str ++ "lroundl.c",
-    "math" ++ path.sep_str ++ "rintl.c",
     "math" ++ path.sep_str ++ "tgammal.c",
     "math" ++ path.sep_str ++ "x86" ++ path.sep_str ++ "_chgsignl.S",
     "math" ++ path.sep_str ++ "x86" ++ path.sep_str ++ "acoshl.c",
