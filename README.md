@@ -184,8 +184,8 @@ is more portable across Linux distributions.
 | `mipsel-netbsd-eabihf`   | OK     |
 | `powerpc-netbsd-eabi`    | OK     |
 | `powerpc-netbsd-eabihf`  | OK     |
-| `riscv32-netbsd-none`    | [#233](https://codeberg.org/ziglang/zig-bootstrap/issues/233) |
-| `riscv64-netbsd-none`    | [#234](https://codeberg.org/ziglang/zig-bootstrap/issues/234) |
+| `riscv32-netbsd-none`    | OK     |
+| `riscv64-netbsd-none`    | OK     |
 | `sparc-netbsd-none`      | [#230](https://codeberg.org/ziglang/zig-bootstrap/issues/230) |
 | `sparc64-netbsd-none`    | [#231](https://codeberg.org/ziglang/zig-bootstrap/issues/231) |
 | `x86-netbsd-none`        | OK     |
