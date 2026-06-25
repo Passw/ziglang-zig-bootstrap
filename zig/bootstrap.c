@@ -168,7 +168,7 @@ int main(int argc, char **argv) {
         if (f == NULL)
             panic("unable to open config.zig for writing");
 
-        const char *zig_version = "0.17.0-dev.890+adf590d58";
+        const char *zig_version = "0.17.0-dev.986+f3544a707";
 
         int written = fprintf(f,
             "pub const have_llvm = false;\n"
@@ -202,10 +202,8 @@ int main(int argc, char **argv) {
             "--name", "zig2", "-femit-bin=zig2.c",
             "-target", host_triple,
             "--dep", "build_options",
-            "--dep", "aro",
             "-Mroot=src/main.zig",
             "-Mbuild_options=config.zig",
-            "-Maro=lib/compiler/aro/aro.zig",
             NULL,
         };
         print_and_run(child_argv);

@@ -14,9 +14,12 @@ const dev = @import("../dev.zig");
 const def = @import("mingw/def.zig");
 const implib = @import("mingw/implib.zig");
 
+const Preprocessor = @import("mingw/Preprocessor.zig");
+
 test {
     _ = def;
     _ = implib;
+    _ = Preprocessor;
 }
 
 pub const CrtFile = enum {
@@ -223,6 +226,8 @@ pub fn buildImportLib(comp: *Compilation, lib_name: []const u8) !void {
         },
         else => |e| return e,
     };
+    // Only .def.in files need preprocessing
+    const def_needs_preprocessing = mem.endsWith(u8, def_file_path, ".def.in");
 
     const target = comp.getTarget();
 
@@ -273,22 +278,6 @@ pub fn buildImportLib(comp: *Compilation, lib_name: []const u8) !void {
     var o_dir = try comp.dirs.global_cache.handle.createDirPathOpen(io, o_sub_path, .{});
     defer o_dir.close(io);
 
-    const aro = @import("aro");
-    var diagnostics: aro.Diagnostics = .{
-        .output = .{ .to_list = .{ .arena = .init(gpa) } },
-    };
-    defer diagnostics.deinit();
-    var aro_comp = try aro.Compilation.init(.{
-        .gpa = gpa,
-        .arena = arena,
-        .io = io,
-        .diagnostics = &diagnostics,
-        .environ_map = null,
-    });
-    defer aro_comp.deinit();
-
-    aro_comp.target = .fromZigTarget(target.*);
-
     const include_dir = try comp.dirs.zig_lib.join(arena, &.{ "libc", "mingw", "def-include" });
 
     if (comp.verbose_cc) {
@@ -304,39 +293,27 @@ pub fn buildImportLib(comp: *Compilation, lib_name: []const u8) !void {
         };
     }
 
-    try aro_comp.search_path.append(gpa, .{ .path = include_dir, .kind = .normal });
-
-    const builtin_macros = try aro_comp.generateBuiltinMacros(.include_system_defines);
-    const def_file_source = try aro_comp.addSourceFromPath(def_file_path);
-
-    var pp = try aro.Preprocessor.init(&aro_comp, .{ .base_file = .unused });
-    defer pp.deinit();
-    pp.linemarkers = .none;
-    pp.preserve_whitespace = true;
-
-    try pp.preprocessSources(.{ .main = def_file_source, .builtin = builtin_macros });
-
-    if (aro_comp.diagnostics.output.to_list.messages.items.len != 0) {
-        var buffer: [64]u8 = undefined;
-        const stderr = try io.lockStderr(&buffer, null);
-        defer io.unlockStderr();
-        for (aro_comp.diagnostics.output.to_list.messages.items) |msg| {
-            if (msg.kind == .@"fatal error" or msg.kind == .@"error") {
-                msg.write(stderr.terminal(), true) catch |err| switch (err) {
-                    error.WriteFailed => return stderr.file_writer.err.?,
-                    error.Canceled, error.Unexpected => |e| return e,
-                };
-                return error.AroPreprocessorFailed;
-            }
-        }
-    }
-
     const members = members: {
-        var aw: Io.Writer.Allocating = .init(gpa);
-        errdefer aw.deinit();
-        try pp.prettyPrintTokens(&aw.writer, .result_only);
+        const input = switch (def_needs_preprocessing) {
+            true => pp: {
+                var aw: Io.Writer.Allocating = .init(gpa);
+                errdefer aw.deinit();
 
-        const input = try aw.toOwnedSliceSentinel(0);
+                var pp_arena = std.heap.ArenaAllocator.init(gpa);
+                defer pp_arena.deinit();
+                var pp: Preprocessor = .{
+                    .io = io,
+                    .arena = pp_arena.allocator(),
+                    .include_dir = include_dir,
+                    .target = target,
+                };
+                try pp.preprocess(def_file_path);
+                try pp.prettyPrintTokens(&aw.writer);
+
+                break :pp try aw.toOwnedSliceSentinel(0);
+            },
+            false => try Io.Dir.cwd().readFileAllocOptions(io, def_file_path, gpa, .unlimited, .of(u8), 0),
+        };
         defer gpa.free(input);
 
         const machine_type = target.toCoffMachine();

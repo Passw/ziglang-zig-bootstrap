@@ -8,7 +8,6 @@ const minInt = std.math.minInt;
 test "@intCast i32 to u7" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
     var x: u128 = maxInt(u128);
@@ -19,7 +18,6 @@ test "@intCast i32 to u7" {
 }
 
 test "coerce i8 to i32 and @intCast back" {
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -35,7 +33,6 @@ test "coerce i8 to i32 and @intCast back" {
 }
 
 test "coerce non byte-sized integers accross 32bits boundary" {
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest; // TODO
 
     {
@@ -147,7 +144,6 @@ fn testIntCast(comptime S: type, a: S, comptime D: type, expected: D) !void {
 test "@intCast <= 64 bits" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
-
     try testIntCast(i32, minInt(i32), i64, minInt(i32));
     try testIntCast(i32, maxInt(i32), i64, maxInt(i32));
     try testIntCast(u32, maxInt(u32), u64, maxInt(u32));

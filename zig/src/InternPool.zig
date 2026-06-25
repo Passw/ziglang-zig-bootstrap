@@ -5406,16 +5406,15 @@ pub const Tag = enum(u8) {
             _: u23 = 0,
 
             pub const Source = enum(u1) { builtin, syntax };
-            pub const DecorationType = enum(u2) { none, location, descriptor };
+            pub const DecorationType = enum(u2) { none, location, descriptor, flat };
         };
 
         pub fn decoration(self: Extern) ?std.lang.ExternOptions.Decoration {
             return switch (self.flags.decoration_type) {
                 .none => null,
-                .location => std.lang.ExternOptions.Decoration{
-                    .location = self.location_or_descriptor_set,
-                },
+                .location => std.lang.ExternOptions.Decoration{ .location = self.location_or_descriptor_set },
                 .descriptor => std.lang.ExternOptions.Decoration{ .descriptor = .{ .set = self.location_or_descriptor_set, .binding = self.descriptor_binding } },
+                .flat => std.lang.ExternOptions.Decoration{ .flat = self.location_or_descriptor_set },
             };
         }
     };
@@ -6008,13 +6007,7 @@ pub const Alignment = enum(u6) {
         return r;
     }
 
-    const LlvmBuilderAlignment = std.zig.llvm.Builder.Alignment;
-
-    pub fn toLlvm(a: Alignment) LlvmBuilderAlignment {
-        return @enumFromInt(@intFromEnum(a));
-    }
-
-    pub fn fromLlvm(a: LlvmBuilderAlignment) Alignment {
+    pub fn toLlvm(a: Alignment) std.zig.llvm.Builder.Alignment {
         return @enumFromInt(@intFromEnum(a));
     }
 };
@@ -9199,6 +9192,7 @@ pub fn getExtern(
     }) catch unreachable; // capacity asserted above
     const decoration_type, const location_or_descriptor_set, const descriptor_binding = if (key.decoration) |decoration| switch (decoration) {
         .location => |location| .{ Tag.Extern.Flags.DecorationType.location, location, undefined },
+        .flat => |location| .{ Tag.Extern.Flags.DecorationType.flat, location, undefined },
         .descriptor => |descriptor| .{ Tag.Extern.Flags.DecorationType.descriptor, descriptor.set, descriptor.binding },
     } else .{ Tag.Extern.Flags.DecorationType.none, undefined, undefined };
     const extra_index = addExtraAssumeCapacity(extra, Tag.Extern{
