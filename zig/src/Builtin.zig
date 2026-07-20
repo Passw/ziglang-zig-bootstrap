@@ -296,7 +296,7 @@ pub fn populateFile(opts: @This(), gpa: Allocator, file: *File) Allocator.Error!
 
     log.debug("parsing and generating 'builtin.zig'", .{});
 
-    file.tree = try std.zig.Ast.parse(gpa, file.source.?, .zig);
+    file.tree = try std.zig.Ast.parse(gpa, file.source.?, .{});
     assert(file.tree.?.errors.len == 0); // builtin.zig must parse
 
     file.zir = try AstGen.generate(gpa, file.tree.?);
@@ -370,7 +370,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Cache = std.Build.Cache;
 const build_options = @import("build_options");
-const Module = @import("Package/Module.zig");
+const Module = @import("Module.zig");
 const assert = std.debug.assert;
 const AstGen = std.zig.AstGen;
 const File = @import("Zcu.zig").File;

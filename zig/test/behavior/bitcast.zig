@@ -138,7 +138,6 @@ test "bitcast packed struct to integer and back" {
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const LevelUpMove = packed struct {
         move_id: u9,
@@ -439,6 +438,8 @@ test "@bitCast of packed struct with void field to integer" {
 }
 
 test "@bitCast vector to array with different element size" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const static = struct {
         fn doTheTest(v: @Vector(4, u5)) !void {
             const result: [5]u4 = @bitCast(v);
@@ -462,6 +463,8 @@ test "@bitCast vector to array with different element size" {
 }
 
 test "@bitCast packed struct to array of bits" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const S = packed struct(u16) {
         foo: u5,
         bar: i7,
@@ -508,6 +511,8 @@ test "@bitCast packed struct to array of bits" {
 }
 
 test "@bitCast nested arrays of vectors" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const Src = [2][2]@Vector(4, u5);
     const Dest = [5]@Vector(2, u8);
 
@@ -543,6 +548,8 @@ test "@bitCast nested arrays of vectors" {
 }
 
 test "@bitCast nested arrays of bool to scalar" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const static = struct {
         fn doTheTest(src: [4][4]bool) !void {
             const result: u16 = @bitCast(src);
@@ -560,6 +567,8 @@ test "@bitCast nested arrays of bool to scalar" {
 }
 
 test "@bitCast deeply nested arrays to scalar" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
     const static = struct {
         fn doTheTest(src: [2][1][3][5]u4) !void {
             const signed: i120 = @bitCast(src);

@@ -13,7 +13,7 @@ const Compilation = @import("../Compilation.zig");
 const dev = @import("../dev.zig");
 const InternPool = @import("../InternPool.zig");
 const link = @import("../link.zig");
-const Package = @import("../Package.zig");
+const Module = @import("../Module.zig");
 const target_util = @import("../target.zig");
 const Type = @import("../Type.zig");
 const Value = @import("../Value.zig");
@@ -239,7 +239,6 @@ pub fn targetTriple(allocator: Allocator, target: *const std.Target) ![]const u8
         .vulkan => "vulkan",
         .managarm => "managarm",
 
-        .@"3ds",
         .contiki,
         .freestanding,
         .opencl, // https://llvm.org/docs/SPIRVUsage.html#target-triples
@@ -250,7 +249,10 @@ pub fn targetTriple(allocator: Allocator, target: *const std.Target) ![]const u8
         .psp,
         .vita,
         .tios,
+        .@"3ds",
         .wiiu,
+        .@"switch",
+        .ashetos,
         => "unknown",
     };
     try llvm_triple.appendSlice(llvm_os);
@@ -1717,6 +1719,7 @@ pub const Object = struct {
     }
 
     pub fn updateContainerType(o: *Object, pt: Zcu.PerThread, ty: InternPool.Index, success: bool) Allocator.Error!void {
+        _ = o.type_map.remove(ty);
         try o.type_pool.updateContainerType(pt, .{ .llvm = o }, ty, success);
         if (o.named_enum_map.get(ty)) |function_index| {
             try o.updateIsNamedEnumValueFunction(.fromInterned(ty), function_index);
@@ -1736,14 +1739,14 @@ pub const Object = struct {
         assert(zcu.intern_pool.typeOf(val) == .type_type);
 
         {
-            assert(@intFromEnum(index) == o.lazy_abi_aligns.items.len);
+            assert(@backingInt(index) == o.lazy_abi_aligns.items.len);
             try o.lazy_abi_aligns.ensureUnusedCapacity(gpa, 1);
             const fwd_ref = try o.builder.alignmentForwardReference();
             o.lazy_abi_aligns.appendAssumeCapacity(fwd_ref);
         }
 
         if (!o.builder.strip) {
-            assert(@intFromEnum(index) == o.debug_types.items.len);
+            assert(@backingInt(index) == o.debug_types.items.len);
             try o.debug_types.ensureUnusedCapacity(gpa, 1);
             const fwd_ref = try o.builder.debugForwardReference();
             o.debug_types.appendAssumeCapacity(fwd_ref);
@@ -1763,13 +1766,13 @@ pub const Object = struct {
         const ty: Type = .fromInterned(val);
 
         {
-            const fwd_ref = o.lazy_abi_aligns.items[@intFromEnum(index)];
+            const fwd_ref = o.lazy_abi_aligns.items[@backingInt(index)];
             o.builder.resolveAlignmentForwardReference(fwd_ref, .fromByteUnits(1));
         }
 
         if (!o.builder.strip) {
             assert(val != .anyerror_type);
-            const fwd_ref = o.debug_types.items[@intFromEnum(index)];
+            const fwd_ref = o.debug_types.items[@backingInt(index)];
             const name_str = try o.builder.metadataStringFmt("{f}", .{ty.fmt(pt)});
             // If `ty` is a function, use a dummy *function* type to prevent existing debug
             // subprograms from becoming ill-formed.
@@ -1790,12 +1793,12 @@ pub const Object = struct {
         const ty: Type = .fromInterned(val);
 
         {
-            const fwd_ref = o.lazy_abi_aligns.items[@intFromEnum(index)];
+            const fwd_ref = o.lazy_abi_aligns.items[@backingInt(index)];
             o.builder.resolveAlignmentForwardReference(fwd_ref, ty.abiAlignment(zcu).toLlvm());
         }
 
         if (!o.builder.strip) {
-            const fwd_ref = o.debug_types.items[@intFromEnum(index)];
+            const fwd_ref = o.debug_types.items[@backingInt(index)];
             if (val == .anyerror_type) {
                 // Don't lower this now; it will be populated in `emit` instead.
                 assert(o.debug_anyerror_fwd_ref == fwd_ref.toOptional());
@@ -1842,7 +1845,7 @@ pub const Object = struct {
     pub fn getDebugType(o: *Object, pt: Zcu.PerThread, ty: Type) Allocator.Error!Builder.Metadata {
         assert(!o.builder.strip);
         const index = try o.type_pool.get(pt, .{ .llvm = o }, ty.toIntern());
-        return o.debug_types.items[@intFromEnum(index)];
+        return o.debug_types.items[@backingInt(index)];
     }
 
     /// In codegen logic, instead of calling this directly, use `getDebugType` to get a forward
@@ -2771,7 +2774,7 @@ pub const Object = struct {
     fn addCommonFnAttributes(
         o: *Object,
         attributes: *Builder.FunctionAttributes.Wip,
-        owner_mod: *Package.Module,
+        owner_mod: *Module,
         omit_frame_pointer: bool,
     ) Allocator.Error!void {
         if (!owner_mod.red_zone) {
@@ -3249,7 +3252,7 @@ pub const Object = struct {
                     return ty;
                 },
                 .opaque_type, .spirv_type => unreachable, // no runtime bits
-                .enum_type => try o.lowerType(t.intTagType(zcu), repr),
+                .enum_type => try o.lowerType(t.backingIntType(zcu), repr),
                 .func_type => |func_type| try o.lowerFnType(t, func_type),
                 .error_set_type, .inferred_error_set_type => try o.errorIntType(repr),
                 // values, not types
@@ -3955,7 +3958,7 @@ pub const Object = struct {
         errdefer assert(o.uav_map.remove(.{ .val = uav_val, .@"addrspace" = @"addrspace" }));
 
         const llvm_ty = try o.lowerType(uav_ty, .in_memory);
-        const llvm_name = try o.builder.strtabStringFmt("__anon_{d}", .{@intFromEnum(uav_val)});
+        const llvm_name = try o.builder.strtabStringFmt("__anon_{d}", .{@backingInt(uav_val)});
         const llvm_variable = try o.builder.addVariable(llvm_name, llvm_ty, llvm_addrspace);
         gop.value_ptr.* = llvm_variable;
         try llvm_variable.setInitializer(try o.lowerValue(uav_val, .in_memory), &o.builder);
@@ -4192,7 +4195,7 @@ pub const Object = struct {
 
     pub fn lazyAbiAlignment(o: *Object, pt: Zcu.PerThread, ty: Type) Allocator.Error!Builder.Alignment.Lazy {
         const index = try o.type_pool.get(pt, .{ .llvm = o }, ty.toIntern());
-        return o.lazy_abi_aligns.items[@intFromEnum(index)];
+        return o.lazy_abi_aligns.items[@backingInt(index)];
     }
 
     pub fn getIsNamedEnumValueFunction(o: *Object, enum_ty: Type) Allocator.Error!Builder.Function.Index {

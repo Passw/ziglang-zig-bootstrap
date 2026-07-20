@@ -78,6 +78,7 @@ comptime {
 
             .@"3ds",
             .wiiu,
+            .@"switch",
 
             .psx,
             .psp,
@@ -93,7 +94,7 @@ fn DllMainCRTStartup(
     fdwReason: std.os.windows.DWORD,
     lpReserved: std.os.windows.LPVOID,
 ) callconv(.winapi) std.os.windows.BOOL {
-    if (!builtin.single_threaded and !builtin.link_libc) {
+    if (!builtin.single_threaded) {
         _ = @import("os/windows/tls.zig");
     }
 
@@ -140,14 +141,14 @@ fn EfiMain(handle: uefi.Handle, system_table: *uefi.tables.SystemTable) callconv
             return 0;
         },
         uefi.Status => {
-            return @intFromEnum(root.main());
+            return @backingInt(root.main());
         },
         uefi.Error!void => {
             root.main() catch |err| switch (err) {
                 error.Unexpected => @panic("EfiMain: unexpected error"),
                 else => {
                     const status = uefi.Status.fromError(@errorCast(err));
-                    return @intFromEnum(status);
+                    return @backingInt(status);
                 },
             };
 

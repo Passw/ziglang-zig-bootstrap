@@ -349,7 +349,7 @@ pub fn dumpHexFallible(t: Io.Terminal, bytes: []const u8) !void {
     var chunks = mem.window(u8, bytes, 16, 16);
     while (chunks.next()) |window| {
         // 1. Print the address.
-        const address = (@intFromPtr(bytes.ptr) + 0x10 * (std.math.divCeil(usize, chunks.index orelse bytes.len, 16) catch unreachable)) - 0x10;
+        const address = (@intFromPtr(bytes.ptr) + 0x10 * @divCeil(chunks.index orelse bytes.len, 16) - 0x10);
         try t.setColor(.dim);
         // We print the address in lowercase and the bytes in uppercase hexadecimal to distinguish them more.
         // Also, make sure all lines are aligned by padding the address.
@@ -494,7 +494,6 @@ const use_trap_panic = switch (builtin.zig_backend) {
     .stage2_powerpc,
     .stage2_riscv64,
     .stage2_spirv,
-    .stage2_wasm,
     .stage2_x86,
     => true,
     else => false,
@@ -512,6 +511,7 @@ pub fn defaultPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
 
         .@"3ds",
         .wiiu,
+        .@"switch",
 
         .psx,
         .psp,
@@ -844,7 +844,7 @@ pub fn writeErrorReturnTrace(et: *const std.builtin.StackTrace, t: Io.Terminal) 
     // writing the stack trace.
     const len = @min(et.instruction_addresses.len, et.index);
     const skipped = et.index - len;
-    try writeTrace(et.instruction_addresses[0..len], @enumFromInt(skipped), t, false);
+    try writeTrace(et.instruction_addresses[0..len], @fromBackingInt(@intCast(skipped)), t, false);
 }
 
 /// Write a previously captured stack trace to `writer`, annotated with source locations.

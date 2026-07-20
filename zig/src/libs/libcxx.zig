@@ -6,7 +6,7 @@ const target_util = @import("../target.zig");
 const Compilation = @import("../Compilation.zig");
 const build_options = @import("build_options");
 const trace = @import("../tracy.zig").trace;
-const Module = @import("../Package/Module.zig");
+const Module = @import("../Module.zig");
 
 const libcxxabi_files = [_][]const u8{
     "src/cxa_aux_runtime.cpp",
@@ -325,7 +325,7 @@ pub fn buildLibCxxAbi(comp: *Compilation, prog_node: std.Progress.Node) BuildErr
     // See the `-fno-exceptions` logic for WASI.
     // The old 32-bit x86 variant of SEH doesn't use tables.
     const unwind_tables: std.lang.UnwindTables =
-        if (target.os.tag == .wasi or (target.cpu.arch == .x86 and target.os.tag == .windows)) .none else .async;
+        if (target.cpu.arch == .x86 and target.os.tag == .windows) .none else .async;
 
     const config = Compilation.Config.resolve(.{
         .output_mode = output_mode,
