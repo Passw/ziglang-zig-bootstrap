@@ -1,4 +1,12 @@
 cmake_minimum_required(VERSION 3.20.0)
+if("${CMAKE_VERSION}" VERSION_LESS "3.31.0")
+  message(WARNING
+    "Your CMake version is ${CMAKE_VERSION}. Starting with LLVM 24, the "
+    "minimum version of CMake required to build LLVM will become 3.31.0, and "
+    "using an older CMake will become an error. Please upgrade your CMake to "
+    "at least 3.31.0 now to avoid issues in the future.")
+endif()
+
 set(LLVM_SUBPROJECT_TITLE "LLD")
 
 if(NOT DEFINED LLVM_COMMON_CMAKE_UTILS)
@@ -185,13 +193,10 @@ endif()
 include_directories(BEFORE
   ${CMAKE_CURRENT_BINARY_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/../zig/lib/libunwind/include
   )
 
 add_subdirectory(Common)
-if(LLD_BUILD_TOOLS)
-  add_subdirectory(tools/lld)
-endif()
+add_subdirectory(tools/lld)
 
 if (LLVM_INCLUDE_TESTS)
   add_custom_target(LLDUnitTests)
@@ -202,6 +207,7 @@ if (LLVM_INCLUDE_TESTS)
   add_subdirectory(test)
 endif()
 
+add_subdirectory(docs)
 add_subdirectory(COFF)
 add_subdirectory(ELF)
 add_subdirectory(MachO)

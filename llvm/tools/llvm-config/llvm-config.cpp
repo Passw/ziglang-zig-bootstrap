@@ -21,6 +21,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Config/config.h"
 #include "llvm/Support/FileSystem.h"
@@ -31,7 +32,6 @@
 #include "llvm/TargetParser/Triple.h"
 #include <cstdlib>
 #include <set>
-#include <unordered_set>
 #include <vector>
 
 using namespace llvm;
@@ -414,12 +414,6 @@ int main(int argc, char **argv) {
     StaticExt = "a";
     StaticDir = SharedDir = ActiveLibDir;
     StaticPrefix = SharedPrefix = "lib";
-  } else if (HostTriple.isOSOpenBSD()) {
-    SharedExt = "so";
-    SharedVersionedExt = ".so" ;
-    StaticExt = "a";
-    StaticDir = SharedDir = ActiveLibDir;
-    StaticPrefix = SharedPrefix = "lib";
   } else {
     // default to the unix values:
     SharedExt = "so";
@@ -447,12 +441,7 @@ int main(int argc, char **argv) {
     std::string path((SharedDir + DirSep + DyLibName).str());
     if (DirSep == "\\")
       llvm::replace(path, '/', '\\');
-    // path does not include major.minor
-    if (HostTriple.isOSOpenBSD()) {
-      DyLibExists = true;
-    } else {
-      DyLibExists = sys::fs::exists(path);
-    }
+    DyLibExists = sys::fs::exists(path);
     if (!DyLibExists) {
       // The shared library does not exist: don't error unless the user
       // explicitly passes --link-shared.
@@ -706,7 +695,7 @@ int main(int argc, char **argv) {
     }
 
     if (PrintSharedMode) {
-      std::unordered_set<std::string> FullDyLibComponents;
+      StringSet<> FullDyLibComponents;
       std::vector<std::string> DyLibComponents =
           getAllDyLibComponents(IsInDevelopmentTree, false, DirSep);
 

@@ -14,6 +14,7 @@
 #include "Sparc.h"
 #include "SparcMachineFunctionInfo.h"
 #include "SparcTargetObjectFile.h"
+#include "SparcTargetTransformInfo.h"
 #include "TargetInfo/SparcTargetInfo.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
@@ -35,7 +36,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeSparcTarget() {
 }
 
 static cl::opt<bool>
-    BranchRelaxation("sparc-enable-branch-relax", cl::Hidden, cl::init(false),
+    BranchRelaxation("sparc-enable-branch-relax", cl::Hidden, cl::init(true),
                      cl::desc("Relax out of range conditional branches"));
 
 static Reloc::Model getEffectiveRelocModel(std::optional<Reloc::Model> RM) {
@@ -111,13 +112,8 @@ SparcTargetMachine::getSubtargetImpl(const Function &F) const {
     FS += FS.empty() ? "+soft-float" : ",+soft-float";
 
   auto &I = SubtargetMap[CPU + FS];
-  if (!I) {
-    // This needs to be done before we create a new subtarget since any
-    // creation will depend on the TM and the code generation flags on the
-    // function that reside in TargetOptions.
-    resetTargetOptions(F);
+  if (!I)
     I = std::make_unique<SparcSubtarget>(CPU, TuneCPU, FS, *this);
-  }
   return I.get();
 }
 
@@ -147,6 +143,11 @@ public:
 
 TargetPassConfig *SparcTargetMachine::createPassConfig(PassManagerBase &PM) {
   return new SparcPassConfig(*this, PM);
+}
+
+TargetTransformInfo
+SparcTargetMachine::getTargetTransformInfo(const Function &F) const {
+  return TargetTransformInfo(std::make_unique<SparcTTIImpl>(this, F));
 }
 
 void SparcPassConfig::addIRPasses() {
