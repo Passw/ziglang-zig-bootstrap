@@ -501,7 +501,7 @@ fn serveRequest(ws: *WebServer, req: *http.Server.Request) !void {
     if (mem.eql(u8, target, "/main.js")) return serveLibFile(ws, req, "build-web/main.js", "application/javascript");
     if (mem.eql(u8, target, "/style.css")) return serveLibFile(ws, req, "build-web/style.css", "text/css");
     if (mem.eql(u8, target, "/time_report.css")) return serveLibFile(ws, req, "build-web/time_report.css", "text/css");
-    if (mem.eql(u8, target, "/main.wasm")) return serveClientWasm(ws, req, if (debug) .Debug else .ReleaseFast);
+    if (mem.eql(u8, target, "/main.wasm")) return serveClientWasm(ws, req, if (debug) .debug else .fast);
 
     if (ws.fuzz) |*fuzz| {
         if (mem.eql(u8, target, "/sources.tar")) return fuzz.serveSourcesTar(req);
@@ -531,7 +531,7 @@ fn serveLibFile(
 fn serveClientWasm(
     ws: *WebServer,
     req: *http.Server.Request,
-    optimize_mode: std.builtin.OptimizeMode,
+    optimize_mode: std.builtin.Optimize,
 ) !void {
     const gpa = ws.graph.cache.gpa;
 
@@ -603,7 +603,7 @@ pub fn serveTarFile(ws: *WebServer, request: *http.Server.Request, paths: []cons
     try response.end();
 }
 
-fn buildClientWasm(ws: *WebServer, arena: Allocator, optimize: std.builtin.OptimizeMode) !Cache.Path {
+fn buildClientWasm(ws: *WebServer, arena: Allocator, optimize: std.builtin.Optimize) !Cache.Path {
     const root_name = "build-web";
     const arch_os_abi = "wasm32-freestanding";
     const cpu_features = "baseline+atomics+bulk_memory+multivalue+mutable_globals+nontrapping_fptoint+reference_types+sign_ext";

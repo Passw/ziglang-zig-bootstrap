@@ -121,7 +121,7 @@ pub const Wip = struct {
         }
 
         pub fn hash(_: @This(), adapted_key: []const u8) u64 {
-            assert(std.mem.indexOfScalar(u8, adapted_key, 0) == null);
+            assert(std.mem.findScalar(u8, adapted_key, 0) == null);
             return std.hash_map.hashString(adapted_key);
         }
     };
@@ -182,7 +182,7 @@ pub const Wip = struct {
 
     pub fn addString(wip: *Wip, bytes: []const u8) Allocator.Error!String {
         const gpa = wip.gpa;
-        assert(std.mem.indexOfScalar(u8, bytes, 0) == null);
+        assert(std.mem.findScalar(u8, bytes, 0) == null);
         const gop = try wip.string_table.getOrPutContextAdapted(
             gpa,
             @as([]const u8, bytes),
@@ -439,7 +439,7 @@ pub const Wip = struct {
     /// Returned slice expires upon next append to the configuration.
     pub fn stringSlice(wip: *const Wip, s: String) [:0]const u8 {
         const start_slice = wip.string_bytes.items[@backingInt(s)..];
-        return start_slice[0..std.mem.indexOfScalar(u8, start_slice, 0).? :0];
+        return start_slice[0..std.mem.findScalar(u8, start_slice, 0).? :0];
     }
 };
 
@@ -569,8 +569,7 @@ pub const Step = extern struct {
         flags2: Flags2,
         args: Storage.LengthPrefixedList(Arg.Index),
         cwd: Storage.FlagOptional(.flags, .cwd, LazyPath.Index),
-        preopen_names: Storage.LengthPrefixedList(String),
-        preopen_paths: Storage.LengthPrefixedList(LazyPath.Index),
+        preopens: Storage.FlagLengthPrefixedList(.flags, .preopens, Preopen),
         captured_stdout: Storage.FlagOptional(.flags, .captured_stdout, CapturedStream),
         captured_stderr: Storage.FlagOptional(.flags, .captured_stderr, CapturedStream),
         file_inputs: Storage.LengthPrefixedList(LazyPath.Index),
@@ -627,6 +626,13 @@ pub const Step = extern struct {
                 output_file,
                 output_directory,
                 passthru,
+                /// `prefix` contains the enabled string.
+                /// `suffix` contains the disabled string.
+                enable_darling,
+                enable_qemu,
+                enable_rosetta,
+                enable_wasmtime,
+                enable_wine,
             };
 
             pub const Index = IndexType(@This());
@@ -644,6 +650,11 @@ pub const Step = extern struct {
             /// The build runner does not modify the `CLICOLOR_FORCE` or `NO_COLOR` environment variables.
             /// They are treated like normal variables, so can be controlled through `setEnvironmentVariable`.
             manual,
+        };
+
+        pub const Preopen = extern struct {
+            name: String,
+            path: LazyPath.Index,
         };
 
         pub const StdIn = union(@This().Tag) {
@@ -676,7 +687,8 @@ pub const Step = extern struct {
             captured_stdout: bool,
             captured_stderr: bool,
             environ_map: bool,
-            _: u4 = 0,
+            preopens: bool,
+            _: u3 = 0,
         };
 
         pub const Flags2 = packed struct(u32) {
@@ -941,6 +953,7 @@ pub const Step = extern struct {
             import_symbols: bool,
             import_table: bool,
             export_table: bool,
+            growable_table: bool,
             shared_memory: bool,
             link_eh_frame_hdr: bool,
             link_emit_relocs: bool,
@@ -956,7 +969,6 @@ pub const Step = extern struct {
             force_load_objc: bool,
             discard_local_symbols: bool,
             mingw_unicode_entry_point: bool,
-            _: u1 = 0,
         };
 
         pub const Flags2 = packed struct(u32) {
@@ -979,8 +991,6 @@ pub const Step = extern struct {
         };
 
         pub const Flags3 = packed struct(u32) {
-            is_linking_libc: bool,
-            is_linking_libcpp: bool,
             version: bool,
             initial_memory: bool,
             max_memory: bool,
@@ -998,6 +1008,7 @@ pub const Step = extern struct {
             entry: Entry,
             lto: Lto,
             subsystem: Subsystem,
+            _: u2 = 0,
         };
 
         pub const Flags4 = packed struct(u32) {
@@ -1076,6 +1087,7 @@ pub const Step = extern struct {
             autoconf_undef,
             autoconf_at,
             cmake,
+            meson,
             blank,
             nasm,
 
@@ -1084,6 +1096,7 @@ pub const Step = extern struct {
                     .autoconf_undef => .autoconf_undef,
                     .autoconf_at => .autoconf_at,
                     .cmake => .cmake,
+                    .meson => .meson,
                     .blank => .blank,
                     .nasm => .nasm,
                 };
@@ -1495,13 +1508,7 @@ pub const LazyPath = union(@This().Tag) {
     };
 
     /// An index into `extra`.
-    pub const Index = enum(u32) {
-        _,
-
-        pub fn get(this: @This(), c: *const Configuration) LazyPath {
-            return extraData(c, LazyPath, @backingInt(this));
-        }
-    };
+    pub const Index = IndexType(@This());
 
     /// An index into `extra`, or `null`.
     pub const OptionalIndex = enum(u32) {
@@ -1653,12 +1660,12 @@ pub const Module = struct {
         small,
         default,
 
-        pub fn init(o: ?std.builtin.OptimizeMode) Optimize {
+        pub fn init(o: ?std.builtin.Optimize) Optimize {
             return switch (o orelse return .default) {
-                .Debug => .debug,
-                .ReleaseSafe => .safe,
-                .ReleaseFast => .fast,
-                .ReleaseSmall => .small,
+                .debug => .debug,
+                .safe => .safe,
+                .fast => .fast,
+                .small => .small,
             };
         }
     };
@@ -1703,14 +1710,6 @@ pub const Module = struct {
                 .@"32" => .@"32",
                 .@"64" => .@"64",
             };
-        }
-    };
-
-    pub const Index = enum(u32) {
-        _,
-
-        pub fn get(this: @This(), c: *const Configuration) Module {
-            return extraData(c, Module, @backingInt(this));
         }
     };
 
@@ -1784,6 +1783,8 @@ pub const Module = struct {
             _: u30 = 0,
         };
     };
+
+    pub const Index = IndexType(@This());
 };
 
 pub const ImportTable = struct {
@@ -1946,7 +1947,7 @@ pub const String = enum(u32) {
 
     pub fn slice(index: String, c: *const Configuration) [:0]const u8 {
         const start_slice = c.string_bytes[@backingInt(index)..];
-        return start_slice[0..std.mem.indexOfScalar(u8, start_slice, 0).? :0];
+        return start_slice[0..std.mem.findScalar(u8, start_slice, 0).? :0];
     }
 };
 
@@ -2011,13 +2012,7 @@ pub const SystemLib = struct {
     name: String,
     flags: Flags,
 
-    pub const Index = enum(u32) {
-        _,
-
-        pub fn get(this: @This(), c: *const Configuration) SystemLib {
-            return extraData(c, SystemLib, @backingInt(this));
-        }
-    };
+    pub const Index = IndexType(@This());
 
     pub const UsePkgConfig = enum(u2) {
         /// Don't use pkg-config, just pass -lfoo where foo is name.
@@ -2050,13 +2045,7 @@ pub const CSourceFiles = struct {
     args: Storage.FlagList(.flags, .args_len, String),
     sub_paths: Storage.LengthPrefixedList(String),
 
-    pub const Index = enum(u32) {
-        _,
-
-        pub fn get(this: @This(), c: *const Configuration) CSourceFiles {
-            return extraData(c, CSourceFiles, @backingInt(this));
-        }
-    };
+    pub const Index = IndexType(@This());
 
     pub const Flags = packed struct(u32) {
         /// C compiler CLI flags.
@@ -2070,13 +2059,7 @@ pub const CSourceFile = struct {
     file: LazyPath.Index,
     args: Storage.FlagList(.flags, .args_len, String),
 
-    pub const Index = enum(u32) {
-        _,
-
-        pub fn get(this: @This(), c: *const Configuration) CSourceFile {
-            return extraData(c, CSourceFile, @backingInt(this));
-        }
-    };
+    pub const Index = IndexType(@This());
 
     pub const Flags = packed struct(u32) {
         /// C compiler CLI flags.
@@ -2091,13 +2074,7 @@ pub const RcSourceFile = struct {
     args: Storage.FlagList(.flags, .args_len, String),
     include_paths: Storage.FlagLengthPrefixedList(.flags, .include_paths, LazyPath.Index),
 
-    pub const Index = enum(u32) {
-        _,
-
-        pub fn get(this: @This(), c: *const Configuration) RcSourceFile {
-            return extraData(c, RcSourceFile, @backingInt(this));
-        }
-    };
+    pub const Index = IndexType(@This());
 
     pub const Flags = packed struct(u32) {
         /// C compiler CLI flags.
@@ -2113,27 +2090,18 @@ pub const OptionalCSourceLanguage = enum(u3) {
     objective_cpp,
     assembly,
     assembly_with_preprocessor,
+
     default,
 
     pub fn init(x: ?std.Build.Module.CSourceLanguage) @This() {
         return switch (x orelse return .default) {
-            .c => .c,
-            .cpp => .cpp,
-            .objective_c => .objective_c,
-            .objective_cpp => .objective_cpp,
-            .assembly => .assembly,
-            .assembly_with_preprocessor => .assembly_with_preprocessor,
+            inline else => |tag| @field(@This(), @tagName(tag)),
         };
     }
 
     pub fn get(this: @This()) ?std.Build.Module.CSourceLanguage {
         return switch (this) {
-            .c => .c,
-            .cpp => .cpp,
-            .objective_c => .objective_c,
-            .objective_cpp => .objective_cpp,
-            .assembly => .assembly,
-            .assembly_with_preprocessor => .assembly_with_preprocessor,
+            inline else => |tag| @field(std.Build.Module.CSourceLanguage, @tagName(tag)),
             .default => null,
         };
     }
@@ -2145,13 +2113,7 @@ pub const ResolvedTarget = struct {
     /// defaults will be resolved.
     result: TargetQuery.Index,
 
-    pub const Index = enum(u32) {
-        _,
-
-        pub fn get(this: @This(), c: *const Configuration) ResolvedTarget {
-            return extraData(c, ResolvedTarget, @backingInt(this));
-        }
-    };
+    pub const Index = IndexType(@This());
 
     pub const OptionalIndex = enum(u32) {
         none = max_u32,
@@ -2261,10 +2223,7 @@ pub const TargetQuery = struct {
 
         pub fn init(x: std.Target.Query.CpuModel) @This() {
             return switch (x) {
-                .native => .native,
-                .baseline => .baseline,
-                .determined_by_arch_os => .determined_by_arch_os,
-                .explicit => .explicit,
+                inline else => |_, tag| @field(@This(), @tagName(tag)),
             };
         }
     };
@@ -2322,71 +2281,13 @@ pub const TargetQuery = struct {
 
         pub fn init(x: ?std.Target.Abi) @This() {
             return switch (x orelse return .default) {
-                .none => .none,
-                .gnu => .gnu,
-                .gnuabin32 => .gnuabin32,
-                .gnuabi64 => .gnuabi64,
-                .gnueabi => .gnueabi,
-                .gnueabihf => .gnueabihf,
-                .gnuf32 => .gnuf32,
-                .gnusf => .gnusf,
-                .gnux32 => .gnux32,
-                .eabi => .eabi,
-                .eabihf => .eabihf,
-                .abin32 => .abin32,
-                .x32 => .x32,
-                .ilp32 => .ilp32,
-                .android => .android,
-                .androideabi => .androideabi,
-                .musl => .musl,
-                .muslabin32 => .muslabin32,
-                .muslabi64 => .muslabi64,
-                .musleabi => .musleabi,
-                .musleabihf => .musleabihf,
-                .muslf32 => .muslf32,
-                .muslsf => .muslsf,
-                .muslx32 => .muslx32,
-                .msvc => .msvc,
-                .itanium => .itanium,
-                .simulator => .simulator,
-                .ohos => .ohos,
-                .ohoseabi => .ohoseabi,
-                .call0 => .call0,
+                inline else => |tag| @field(@This(), @tagName(tag)),
             };
         }
 
         pub fn unwrap(this: @This()) ?std.Target.Abi {
             return switch (this) {
-                .none => .none,
-                .gnu => .gnu,
-                .gnuabin32 => .gnuabin32,
-                .gnuabi64 => .gnuabi64,
-                .gnueabi => .gnueabi,
-                .gnueabihf => .gnueabihf,
-                .gnuf32 => .gnuf32,
-                .gnusf => .gnusf,
-                .gnux32 => .gnux32,
-                .eabi => .eabi,
-                .eabihf => .eabihf,
-                .abin32 => .abin32,
-                .x32 => .x32,
-                .ilp32 => .ilp32,
-                .android => .android,
-                .androideabi => .androideabi,
-                .musl => .musl,
-                .muslabin32 => .muslabin32,
-                .muslabi64 => .muslabi64,
-                .musleabi => .musleabi,
-                .musleabihf => .musleabihf,
-                .muslf32 => .muslf32,
-                .muslsf => .muslsf,
-                .muslx32 => .muslx32,
-                .msvc => .msvc,
-                .itanium => .itanium,
-                .simulator => .simulator,
-                .ohos => .ohos,
-                .ohoseabi => .ohoseabi,
-                .call0 => .call0,
+                inline else => |tag| @field(std.Target.Abi, @tagName(tag)),
                 .default => null,
             };
         }
@@ -2440,6 +2341,7 @@ pub const TargetQuery = struct {
         sheb,
         sparc,
         sparc64,
+        spork8,
         spirv32,
         spirv64,
         thumb,
@@ -2458,132 +2360,13 @@ pub const TargetQuery = struct {
 
         pub fn init(x: ?std.Target.Cpu.Arch) @This() {
             return switch (x orelse return .default) {
-                .aarch64 => .aarch64,
-                .aarch64_be => .aarch64_be,
-                .alpha => .alpha,
-                .amdgcn => .amdgcn,
-                .arc => .arc,
-                .arceb => .arceb,
-                .arm => .arm,
-                .armeb => .armeb,
-                .avr => .avr,
-                .bpfeb => .bpfeb,
-                .bpfel => .bpfel,
-                .csky => .csky,
-                .ez80 => .ez80,
-                .hexagon => .hexagon,
-                .hppa => .hppa,
-                .hppa64 => .hppa64,
-                .kalimba => .kalimba,
-                .kvx => .kvx,
-                .lanai => .lanai,
-                .loongarch32 => .loongarch32,
-                .loongarch64 => .loongarch64,
-                .m68k => .m68k,
-                .m88k => .m88k,
-                .microblaze => .microblaze,
-                .microblazeel => .microblazeel,
-                .mips => .mips,
-                .mipsel => .mipsel,
-                .mips64 => .mips64,
-                .mips64el => .mips64el,
-                .msp430 => .msp430,
-                .nvptx => .nvptx,
-                .nvptx64 => .nvptx64,
-                .or1k => .or1k,
-                .powerpc => .powerpc,
-                .powerpcle => .powerpcle,
-                .powerpc64 => .powerpc64,
-                .powerpc64le => .powerpc64le,
-                .propeller => .propeller,
-                .riscv32 => .riscv32,
-                .riscv32be => .riscv32be,
-                .riscv64 => .riscv64,
-                .riscv64be => .riscv64be,
-                .s390x => .s390x,
-                .sh => .sh,
-                .sheb => .sheb,
-                .sparc => .sparc,
-                .sparc64 => .sparc64,
-                .spirv32 => .spirv32,
-                .spirv64 => .spirv64,
-                .thumb => .thumb,
-                .thumbeb => .thumbeb,
-                .ve => .ve,
-                .wasm32 => .wasm32,
-                .wasm64 => .wasm64,
-                .x86_16 => .x86_16,
-                .x86 => .x86,
-                .x86_64 => .x86_64,
-                .xcore => .xcore,
-                .xtensa => .xtensa,
-                .xtensaeb => .xtensaeb,
+                inline else => |tag| @field(@This(), @tagName(tag)),
             };
         }
 
         pub fn unwrap(this: @This()) ?std.Target.Cpu.Arch {
             return switch (this) {
-                .aarch64 => .aarch64,
-                .aarch64_be => .aarch64_be,
-                .alpha => .alpha,
-                .amdgcn => .amdgcn,
-                .arc => .arc,
-                .arceb => .arceb,
-                .arm => .arm,
-                .armeb => .armeb,
-                .avr => .avr,
-                .bpfeb => .bpfeb,
-                .bpfel => .bpfel,
-                .csky => .csky,
-                .ez80 => .ez80,
-                .hexagon => .hexagon,
-                .hppa => .hppa,
-                .hppa64 => .hppa64,
-                .kalimba => .kalimba,
-                .kvx => .kvx,
-                .lanai => .lanai,
-                .loongarch32 => .loongarch32,
-                .loongarch64 => .loongarch64,
-                .m68k => .m68k,
-                .m88k => .m88k,
-                .microblaze => .microblaze,
-                .microblazeel => .microblazeel,
-                .mips => .mips,
-                .mipsel => .mipsel,
-                .mips64 => .mips64,
-                .mips64el => .mips64el,
-                .msp430 => .msp430,
-                .nvptx => .nvptx,
-                .nvptx64 => .nvptx64,
-                .or1k => .or1k,
-                .powerpc => .powerpc,
-                .powerpcle => .powerpcle,
-                .powerpc64 => .powerpc64,
-                .powerpc64le => .powerpc64le,
-                .propeller => .propeller,
-                .riscv32 => .riscv32,
-                .riscv32be => .riscv32be,
-                .riscv64 => .riscv64,
-                .riscv64be => .riscv64be,
-                .s390x => .s390x,
-                .sh => .sh,
-                .sheb => .sheb,
-                .sparc => .sparc,
-                .sparc64 => .sparc64,
-                .spirv32 => .spirv32,
-                .spirv64 => .spirv64,
-                .thumb => .thumb,
-                .thumbeb => .thumbeb,
-                .ve => .ve,
-                .wasm32 => .wasm32,
-                .wasm64 => .wasm64,
-                .x86_16 => .x86_16,
-                .x86 => .x86,
-                .x86_64 => .x86_64,
-                .xcore => .xcore,
-                .xtensa => .xtensa,
-                .xtensaeb => .xtensaeb,
-
+                inline else => |tag| @field(std.Target.Cpu.Arch, @tagName(tag)),
                 .default => null,
             };
         }
@@ -2619,6 +2402,7 @@ pub const TargetQuery = struct {
         @"3ds",
         wiiu,
         @"switch",
+        gba,
         psx,
         ps3,
         ps4,
@@ -2642,106 +2426,13 @@ pub const TargetQuery = struct {
 
         pub fn init(x: ?std.Target.Os.Tag) @This() {
             return switch (x orelse return .default) {
-                .freestanding => .freestanding,
-                .other => .other,
-                .contiki => .contiki,
-                .fuchsia => .fuchsia,
-                .hermit => .hermit,
-                .managarm => .managarm,
-                .haiku => .haiku,
-                .hurd => .hurd,
-                .illumos => .illumos,
-                .linux => .linux,
-                .plan9 => .plan9,
-                .rtems => .rtems,
-                .serenity => .serenity,
-                .dragonfly => .dragonfly,
-                .freebsd => .freebsd,
-                .netbsd => .netbsd,
-                .openbsd => .openbsd,
-                .driverkit => .driverkit,
-                .ios => .ios,
-                .maccatalyst => .maccatalyst,
-                .macos => .macos,
-                .tvos => .tvos,
-                .visionos => .visionos,
-                .watchos => .watchos,
-                .windows => .windows,
-                .uefi => .uefi,
-                .@"3ds" => .@"3ds",
-                .wiiu => .wiiu,
-                .@"switch" => .@"switch",
-                .psx => .psx,
-                .ps3 => .ps3,
-                .ps4 => .ps4,
-                .ps5 => .ps5,
-                .psp => .psp,
-                .vita => .vita,
-                .emscripten => .emscripten,
-                .wasi => .wasi,
-                .amdhsa => .amdhsa,
-                .amdpal => .amdpal,
-                .cuda => .cuda,
-                .mesa3d => .mesa3d,
-                .nvcl => .nvcl,
-                .opencl => .opencl,
-                .opengl => .opengl,
-                .vulkan => .vulkan,
-                .tios => .tios,
-                .ashetos => .ashetos,
+                inline else => |tag| @field(@This(), @tagName(tag)),
             };
         }
 
         pub fn unwrap(this: @This()) ?std.Target.Os.Tag {
             return switch (this) {
-                .freestanding => .freestanding,
-                .other => .other,
-                .contiki => .contiki,
-                .fuchsia => .fuchsia,
-                .hermit => .hermit,
-                .managarm => .managarm,
-                .haiku => .haiku,
-                .hurd => .hurd,
-                .illumos => .illumos,
-                .linux => .linux,
-                .plan9 => .plan9,
-                .rtems => .rtems,
-                .serenity => .serenity,
-                .dragonfly => .dragonfly,
-                .freebsd => .freebsd,
-                .netbsd => .netbsd,
-                .openbsd => .openbsd,
-                .driverkit => .driverkit,
-                .ios => .ios,
-                .maccatalyst => .maccatalyst,
-                .macos => .macos,
-                .tvos => .tvos,
-                .visionos => .visionos,
-                .watchos => .watchos,
-                .windows => .windows,
-                .uefi => .uefi,
-                .@"3ds" => .@"3ds",
-                .wiiu => .wiiu,
-                .@"switch" => .@"switch",
-                .psx => .psx,
-                .ps3 => .ps3,
-                .ps4 => .ps4,
-                .ps5 => .ps5,
-                .psp => .psp,
-                .vita => .vita,
-                .emscripten => .emscripten,
-                .wasi => .wasi,
-                .amdhsa => .amdhsa,
-                .amdpal => .amdpal,
-                .cuda => .cuda,
-                .mesa3d => .mesa3d,
-                .nvcl => .nvcl,
-                .opencl => .opencl,
-                .opengl => .opengl,
-                .vulkan => .vulkan,
-                .tios => .tios,
-                .ashetos => .ashetos,
-
+                inline else => |tag| @field(std.Target.Os.Tag, @tagName(tag)),
                 .default => null,
             };
         }
@@ -2762,30 +2453,13 @@ pub const TargetQuery = struct {
 
         pub fn init(x: ?std.Target.ObjectFormat) @This() {
             return switch (x orelse return .default) {
-                .c => .c,
-                .coff => .coff,
-                .elf => .elf,
-                .hex => .hex,
-                .macho => .macho,
-                .plan9 => .plan9,
-                .raw => .raw,
-                .spirv => .spirv,
-                .wasm => .wasm,
+                inline else => |tag| @field(@This(), @tagName(tag)),
             };
         }
 
         pub fn unwrap(this: @This()) ?std.Target.ObjectFormat {
             return switch (this) {
-                .c => .c,
-                .coff => .coff,
-                .elf => .elf,
-                .hex => .hex,
-                .macho => .macho,
-                .plan9 => .plan9,
-                .raw => .raw,
-                .spirv => .spirv,
-                .wasm => .wasm,
-
+                inline else => |tag| @field(std.Target.ObjectFormat, @tagName(tag)),
                 .default => null,
             };
         }

@@ -43,6 +43,8 @@ type_dependencies: std.ArrayList(link.ConstPool.Index),
 /// one array.
 align_dependency_masks: std.ArrayList(u64),
 
+/// Emitted at the top of the file. This can be cached since it only depends on the target.
+header: String,
 /// All NAVs, regardless of whether they are functions or simple constants, are put in this map.
 navs: std.array_hash_map.Auto(InternPool.Nav.Index, RenderedDecl),
 /// All UAVs which may be referenced are in this map. The UAV alignment is not included in the
@@ -404,9 +406,8 @@ pub fn createEmpty(
     emit: Path,
     options: link.File.OpenOptions,
 ) !*C {
+    assert(comp.root_mod.resolved_target.result.ofmt == .c);
     const io = comp.io;
-    const target = &comp.root_mod.resolved_target.result;
-    assert(target.ofmt == .c);
     const optimize_mode = comp.root_mod.optimize_mode;
     const use_lld = build_options.have_llvm and comp.config.use_lld;
     const use_llvm = comp.config.use_llvm;
@@ -422,14 +423,13 @@ pub fn createEmpty(
     });
     errdefer file.close(io);
 
-    const c_file = try arena.create(C);
-
-    c_file.* = .{
+    const c = try arena.create(C);
+    c.* = .{
         .base = .{
             .tag = .c,
             .comp = comp,
             .emit = emit,
-            .gc_sections = options.gc_sections orelse (optimize_mode != .Debug and output_mode != .Obj),
+            .gc_sections = options.gc_sections orelse (optimize_mode != .debug and output_mode != .Obj),
             .print_gc_sections = options.print_gc_sections,
             .stack_size = options.stack_size orelse 16777216,
             .allow_shlib_undefined = options.allow_shlib_undefined orelse false,
@@ -439,6 +439,7 @@ pub fn createEmpty(
         .string_bytes = .empty,
         .type_dependencies = .empty,
         .align_dependency_masks = .empty,
+        .header = .empty,
         .navs = .empty,
         .uavs = .empty,
         .type_pool = .empty,
@@ -447,8 +448,7 @@ pub fn createEmpty(
         .exported_navs = .empty,
         .exported_uavs = .empty,
     };
-
-    return c_file;
+    return c;
 }
 
 pub fn deinit(c: *C) void {
@@ -467,6 +467,21 @@ pub fn deinit(c: *C) void {
     c.bigint_types.deinit(gpa);
     c.exported_navs.deinit(gpa);
     c.exported_uavs.deinit(gpa);
+}
+
+pub fn prelink(c: *C, prog_node: std.Progress.Node) !void {
+    const comp = c.base.comp;
+
+    const sub_prog_node = prog_node.start("Generate Header", 0);
+    defer sub_prog_node.end();
+
+    var header_aw: std.Io.Writer.Allocating = .init(comp.gpa);
+    defer header_aw.deinit();
+    codegen.genHeader(comp.zcu.?, &header_aw.writer) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => |e| return e,
+    };
+    c.header = try c.addString(&.{header_aw.written()});
 }
 
 pub fn updateContainerType(
@@ -727,7 +742,6 @@ pub fn flush(c: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Prog
     const io = comp.io;
     const zcu = c.base.comp.zcu.?;
     const ip = &zcu.intern_pool;
-    const target = zcu.getTarget();
     const active = zcu.activate(tid);
     defer active.deactivate();
     const pt = active.pt;
@@ -943,7 +957,7 @@ pub fn flush(c: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Prog
     // We have discovered the full set of NAVs, UAVs, and types we need to emit, and will now begin
     // to build the output buffer. Our strategy is to emit the C source in this order:
     //
-    // * ABI defines and `#include "zig.h"`
+    // * Header
     // * Big-int type definitions
     // * Other CType definitions (traversing the dependency graph to sort topologically)
     // * Global assembly
@@ -968,7 +982,7 @@ pub fn flush(c: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Prog
 
     // We know exactly what we'll be emitting, so can reserve capacity for all of our buffers!
 
-    try f.all_buffers.ensureUnusedCapacity(gpa, 3 + // ABI defines and `#include "zig.h"`
+    try f.all_buffers.ensureUnusedCapacity(gpa, 1 + // Header
         1 + // Big-int type definitions
         need_types.count() + // `RenderedType.fwd_decl` (worst-case)
         need_types.count() + // `RenderedType.definition`
@@ -984,20 +998,7 @@ pub fn flush(c: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Prog
         need_uavs.count() * 3 + // UAV definitions ("static ", "zig_align(4)", "<definition body>")
         need_navs.count() * 2); // NAV definitions ("static ", "<definition body>")
 
-    // ABI defines and `#include "zig.h"`
-    switch (target.abi) {
-        .msvc, .itanium => f.appendBufAssumeCapacity("#define ZIG_TARGET_ABI_MSVC\n"),
-        else => {},
-    }
-    f.appendBufAssumeCapacity(try std.fmt.allocPrint(
-        arena,
-        "#define ZIG_TARGET_MAX_INT_ALIGNMENT {d}\n",
-        .{target.cMaxIntAlignment()},
-    ));
-    f.appendBufAssumeCapacity(
-        \\#include "zig.h"
-        \\
-    );
+    f.appendBufAssumeCapacity(c.header.get(c));
 
     // Big-int type definitions
     var bigint_aw: std.Io.Writer.Allocating = .init(gpa);
@@ -1227,58 +1228,62 @@ const Flush = struct {
 pub fn updateExports(
     c: *C,
     pt: Zcu.PerThread,
-    exported: Zcu.Exported,
     export_indices: []const Zcu.Export.Index,
 ) Allocator.Error!void {
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
 
+    c.exported_navs.clearRetainingCapacity();
+    c.exported_uavs.clearRetainingCapacity();
+
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
 
-    var dg: codegen.DeclGen = .{
-        .gpa = gpa,
-        .arena = arena.allocator(),
-        .pt = pt,
-        .mod = zcu.root_mod,
-        .owner_nav = .none,
-        .is_naked_fn = false,
-        .expected_block = null,
-        .ctype_deps = .empty,
-        .uavs = .empty,
-    };
-    defer {
-        assert(dg.uavs.count() == 0);
-        dg.ctype_deps.deinit(gpa);
+    var by_exported: std.array_hash_map.Auto(Zcu.Exported, std.ArrayList(Zcu.Export.Index)) = .empty;
+    try by_exported.ensureUnusedCapacity(arena.allocator(), export_indices.len);
+
+    for (export_indices) |exp_index| {
+        const exported = exp_index.ptr(zcu).exported;
+        const gop = by_exported.getOrPutAssumeCapacity(exported);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .empty;
+        }
+        try gop.value_ptr.append(arena.allocator(), exp_index);
     }
 
-    const code: String = code: {
-        var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, &c.string_bytes);
-        defer c.string_bytes = aw.toArrayList();
-        const start = aw.written().len;
-        codegen.genExports(&dg, &aw.writer, exported, export_indices) catch |err| switch (err) {
-            error.WriteFailed => return error.OutOfMemory,
-            error.OutOfMemory => |e| return e,
+    for (by_exported.keys(), by_exported.values()) |exported, *exports_of_this| {
+        var dg: codegen.DeclGen = .{
+            .gpa = gpa,
+            .arena = arena.allocator(),
+            .pt = pt,
+            .mod = zcu.root_mod,
+            .owner_nav = .none,
+            .is_naked_fn = false,
+            .expected_block = null,
+            .ctype_deps = .empty,
+            .uavs = .empty,
         };
-        break :code .{
-            .start = @intCast(start),
-            .len = @intCast(aw.written().len - start),
+        defer {
+            assert(dg.uavs.count() == 0);
+            dg.ctype_deps.deinit(gpa);
+        }
+        const code: String = code: {
+            var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, &c.string_bytes);
+            defer c.string_bytes = aw.toArrayList();
+            const start = aw.written().len;
+            codegen.genExports(&dg, &aw.writer, exported, exports_of_this.items) catch |err| switch (err) {
+                error.WriteFailed => return error.OutOfMemory,
+                error.OutOfMemory => |e| return e,
+            };
+            break :code .{
+                .start = @intCast(start),
+                .len = @intCast(aw.written().len - start),
+            };
         };
-    };
-    switch (exported) {
-        .nav => |nav| try c.exported_navs.put(gpa, nav, code),
-        .uav => |uav| try c.exported_uavs.put(gpa, uav, code),
-    }
-}
-
-pub fn deleteExport(
-    self: *C,
-    exported: Zcu.Exported,
-    _: InternPool.NullTerminatedString,
-) void {
-    switch (exported) {
-        .nav => |nav| _ = self.exported_navs.swapRemove(nav),
-        .uav => |uav| _ = self.exported_uavs.swapRemove(uav),
+        switch (exported) {
+            .nav => |nav| try c.exported_navs.put(gpa, nav, code),
+            .uav => |uav| try c.exported_uavs.put(gpa, uav, code),
+        }
     }
 }
 

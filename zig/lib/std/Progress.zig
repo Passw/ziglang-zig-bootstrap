@@ -442,7 +442,15 @@ pub const Node = struct {
             global_progress.ipc_files[slot] = file;
             storageByIndex(index).setIpcIndex(.{ .slot = slot, .generation = generation });
             break;
-        } else file.close(io);
+        } else {
+            // There was no IPC slot available, so we'll drop this node's IPC info and just close
+            // the fd. To avoid an old `estimated_total_items` or `completed_count` value still
+            // being rendered for the node, we'll zero that field out (and the user is not allowed
+            // to change it because they think we're doing IPC).
+            file.close(io);
+            @atomicStore(u32, &storageByIndex(index).completed_count, 0, .monotonic);
+            @atomicStore(u32, &storageByIndex(index).estimated_total_count, 0, .monotonic);
+        }
     }
 
     pub fn setIpcIndex(node: Node, ipc_index: Ipc.Index) void {
@@ -452,7 +460,11 @@ pub const Node = struct {
     /// Not thread-safe.
     pub fn takeIpcIndex(node: Node) ?Ipc.Index {
         const storage = storageByIndex(node.index.unwrap() orelse return null);
-        assert(storage.estimated_total_count == std.math.maxInt(u32));
+        switch (storage.estimated_total_count) {
+            std.math.maxInt(u32) => {}, // indicates that there is an IPC index in `completed_count`
+            0 => return null, // `setIpcFile` failed so we don't have an IPC index for this node
+            else => unreachable, // not an IPC node
+        }
         @atomicStore(u32, &storage.estimated_total_count, 0, .monotonic);
         return @bitCast(storage.completed_count);
     }
@@ -1342,7 +1354,7 @@ fn computeRedraw(io: Io, serialized_buffer: *Serialized.Buffer) !struct { []u8, 
                         buf[i..][0..progress_pulsing.len].* = progress_pulsing.*;
                         i += progress_pulsing.len;
                     } else {
-                        const percent = completed_items * 100 / estimated_total;
+                        const percent = @as(u64, completed_items) * 100 / estimated_total;
                         if (std.fmt.bufPrint(buf[i..], @"progress_normal {d}", .{percent})) |b| {
                             i += b.len;
                         } else |_| {}
@@ -1361,7 +1373,7 @@ fn computeRedraw(io: Io, serialized_buffer: *Serialized.Buffer) !struct { []u8, 
                         buf[i..][0..progress_pulsing_error.len].* = progress_pulsing_error.*;
                         i += progress_pulsing_error.len;
                     } else {
-                        const percent = completed_items * 100 / estimated_total;
+                        const percent = @as(u64, completed_items) * 100 / estimated_total;
                         if (std.fmt.bufPrint(buf[i..], @"progress_error {d}", .{percent})) |b| {
                             i += b.len;
                         } else |_| {}

@@ -730,7 +730,7 @@ pub const clock_t = i32;
 pub const dl_phdr_info = extern struct {
     addr: usize,
     name: ?[*:0]const u8,
-    phdr: [*]std.elf.Phdr,
+    phdr: [*]std.elf.ElfN.Phdr,
     phnum: u16,
 };
 
@@ -741,7 +741,7 @@ pub const nfds_t = usize;
 pub const pollfd = extern struct {
     fd: fd_t,
     events: i16,
-    revents: i16,
+    revents: i16 = undefined,
 };
 
 pub const stack_t = extern struct {

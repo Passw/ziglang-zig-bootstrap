@@ -221,35 +221,43 @@ pub fn writeSplatHeaderLimit(
     limit: Limit,
 ) Error!usize {
     var remaining = @backingInt(limit);
+    assert(data.len > 0);
     {
-        const copy_len = @min(header.len, w.buffer.len - w.end, remaining);
-        if (header.len - copy_len != 0) return writeSplatHeaderLimitFinish(w, header, data, splat, remaining);
+        const copy_len = @min(header.len, remaining);
+        if (w.buffer.len - w.end < copy_len) return try writeSplatHeaderLimitFinish(w, header, data, splat, remaining);
         @memcpy(w.buffer[w.end..][0..copy_len], header[0..copy_len]);
         w.end += copy_len;
         remaining -= copy_len;
     }
-    for (data[0 .. data.len - 1], 0..) |buf, i| {
-        const copy_len = @min(buf.len, w.buffer.len - w.end, remaining);
-        if (buf.len - copy_len != 0) return @backingInt(limit) - remaining +
-            try writeSplatHeaderLimitFinish(w, &.{}, data[i..], splat, remaining);
-        @memcpy(w.buffer[w.end..][0..copy_len], buf[0..copy_len]);
-        w.end += copy_len;
-        remaining -= copy_len;
-    }
-    const pattern = data[data.len - 1];
-    const splat_n = pattern.len * splat;
-    if (splat_n > @min(w.buffer.len - w.end, remaining)) {
-        const buffered_n = @backingInt(limit) - remaining;
-        const written = try writeSplatHeaderLimitFinish(w, &.{}, data[data.len - 1 ..][0..1], splat, remaining);
-        return buffered_n + written;
+
+    remaining_zero: {
+        if (remaining == 0) break :remaining_zero;
+        for (data[0 .. data.len - 1], 0..) |bytes, i| {
+            const copy_len = @min(bytes.len, remaining);
+            if (w.buffer.len - w.end < copy_len) {
+                const n = try writeSplatHeaderLimitFinish(w, &.{}, data[i..], splat, remaining);
+                return @backingInt(limit) - remaining + n;
+            }
+            @memcpy(w.buffer[w.end..][0..copy_len], bytes[0..copy_len]);
+            w.end += copy_len;
+            remaining -= copy_len;
+        }
+
+        if (remaining == 0) break :remaining_zero;
+        const pattern = data[data.len - 1];
+        for (0..splat) |i| {
+            const copy_len = @min(pattern.len, remaining);
+            if (w.buffer.len - w.end < copy_len) {
+                const remaining_splat = splat - i;
+                const n = try writeSplatHeaderLimitFinish(w, &.{}, data[data.len - 1 ..][0..1], remaining_splat, remaining);
+                return @backingInt(limit) - remaining + n;
+            }
+            @memcpy(w.buffer[w.end..][0..copy_len], pattern[0..copy_len]);
+            w.end += copy_len;
+            remaining -= copy_len;
+        }
     }
 
-    for (0..splat) |_| {
-        @memcpy(w.buffer[w.end..][0..pattern.len], pattern);
-        w.end += pattern.len;
-    }
-
-    remaining -= splat_n;
     return @backingInt(limit) - remaining;
 }
 
@@ -291,6 +299,64 @@ fn writeSplatHeaderLimitFinish(
         return w.vtable.drain(w, (&vecs)[0..i], @min(remaining / pattern.len, splat));
     }
     return w.vtable.drain(w, (&vecs)[0..i], 1);
+}
+
+const SplatHeaderTestCase = struct {
+    writer_type: enum { fixed, allocating },
+    /// When writer_type is .fixed, determines the buffer size.
+    /// When writer_type is .allocating, determines the initial capacity.
+    buf_len: usize = 100,
+    header: []const u8,
+    data: []const []const u8,
+    splat: u8,
+    limit: u8,
+    expected_res: union(enum) { written: usize, write_failed },
+    expected_buf_content: []const u8,
+};
+
+fn testWriteSplatHeaderLimit(comptime test_case: SplatHeaderTestCase) !void {
+    var buf: [test_case.buf_len]u8 = @splat(0);
+    var aw: Allocating = if (test_case.writer_type == .allocating)
+        try Allocating.initCapacity(testing.allocator, test_case.buf_len)
+    else
+        undefined;
+    defer if (test_case.writer_type == .allocating) aw.deinit();
+    var fw: Writer = if (test_case.writer_type == .fixed) .fixed(&buf) else undefined;
+    var w: *Writer = switch (test_case.writer_type) {
+        .allocating => &aw.writer,
+        .fixed => &fw,
+    };
+    const n_or_error = w.writeSplatHeaderLimit(test_case.header, test_case.data, test_case.splat, .limited(test_case.limit));
+    switch (test_case.expected_res) {
+        .written => |expected_len| {
+            const n = try n_or_error;
+            try std.testing.expectEqual(expected_len, n);
+        },
+        .write_failed => {
+            try std.testing.expectError(error.WriteFailed, n_or_error);
+        },
+    }
+    try std.testing.expectEqualStrings(test_case.expected_buf_content, w.buffered());
+}
+
+test "fixed writer writeSplatHeaderLimit" {
+    // fixed writer with buffer larger than the full data size
+    try testWriteSplatHeaderLimit(.{ .writer_type = .fixed, .header = "header is longer", .data = &.{""}, .splat = 1, .limit = 6, .expected_res = .{ .written = 6 }, .expected_buf_content = "header" });
+    try testWriteSplatHeaderLimit(.{ .writer_type = .fixed, .header = "head", .data = &.{"123456"}, .splat = 1, .limit = 5, .expected_res = .{ .written = 5 }, .expected_buf_content = "head1" });
+    try testWriteSplatHeaderLimit(.{ .writer_type = .fixed, .header = "head", .data = &.{"123"}, .splat = 1, .limit = 10, .expected_res = .{ .written = 7 }, .expected_buf_content = "head123" });
+    try testWriteSplatHeaderLimit(.{ .writer_type = .fixed, .header = "head", .data = &.{ "1", "abcdefg" }, .splat = 1, .limit = 6, .expected_res = .{ .written = 6 }, .expected_buf_content = "head1a" });
+    try testWriteSplatHeaderLimit(.{ .writer_type = .fixed, .header = "head", .data = &.{ "123", "abc" }, .splat = 2, .limit = 6, .expected_res = .{ .written = 6 }, .expected_buf_content = "head12" });
+    try testWriteSplatHeaderLimit(.{ .writer_type = .fixed, .header = "head", .data = &.{ "123", "abc" }, .splat = 2, .limit = 11, .expected_res = .{ .written = 11 }, .expected_buf_content = "head123abca" });
+    try testWriteSplatHeaderLimit(.{ .writer_type = .fixed, .header = "head", .data = &.{ "123", "a" }, .splat = 2, .limit = 10, .expected_res = .{ .written = 9 }, .expected_buf_content = "head123aa" });
+    try testWriteSplatHeaderLimit(.{ .writer_type = .fixed, .header = "head", .data = &.{ "123", "abc" }, .splat = 2, .limit = 100, .expected_res = .{ .written = 13 }, .expected_buf_content = "head123abcabc" });
+
+    // fixed writer with buffer smaller than the full data size
+    try testWriteSplatHeaderLimit(.{ .writer_type = .fixed, .header = "header is longer", .data = &.{""}, .splat = 1, .limit = 6, .expected_res = .write_failed, .expected_buf_content = "head", .buf_len = 4 });
+    try testWriteSplatHeaderLimit(.{ .writer_type = .fixed, .header = "head", .data = &.{"123456"}, .splat = 1, .limit = 8, .expected_res = .write_failed, .expected_buf_content = "head1", .buf_len = 5 });
+    try testWriteSplatHeaderLimit(.{ .writer_type = .fixed, .header = "head", .data = &.{ "123", "ab" }, .splat = 2, .limit = 100, .expected_res = .write_failed, .expected_buf_content = "head123aba", .buf_len = 10 });
+
+    // allocating writer that needs to expand capacity during splat
+    try testWriteSplatHeaderLimit(.{ .writer_type = .allocating, .buf_len = 8, .header = "hhhh", .data = &.{"PP"}, .splat = 3, .limit = 100, .expected_res = .{ .written = 10 }, .expected_buf_content = "hhhhPPPPPP" });
 }
 
 test "writeSplatHeader splatting avoids buffer aliasing temptation" {
@@ -584,36 +650,41 @@ pub fn writeAll(w: *Writer, bytes: []const u8) Error!void {
 /// required, otherwise the digit following ':' is interpreted as **width**.
 ///
 /// **specifier** supports:
-/// - `x` and `X`: numeric value in hexadecimal notation, or string in hexadecimal bytes
-/// - `s`:
+/// - "x" and "X": numeric value in hexadecimal notation, or string in hexadecimal bytes
+/// - "s":
 ///   - for pointer-to-many and C pointers of u8, print as a C-string using zero-termination
 ///   - for slices of u8, print the entire slice as a string without zero-termination
-/// - `t`:
+/// - "t":
 ///   - for enums and tagged unions: prints the tag name
 ///   - for error sets: prints the error name
-/// - `b64`: string as standard base64
-/// - `e`: floating point value in scientific notation
-/// - `d`: numeric value in decimal notation
-/// - `b`: integer value in binary notation
-/// - `o`: integer value in octal notation
-/// - `c`: integer as an ASCII character. Integer type must have 8 bits at max.
-/// - `u`: integer as an UTF-8 sequence. Integer type must have 21 bits at max.
-/// - `B`: bytes in SI units (decimal)
-/// - `Bi`: bytes in IEC units (binary)
-/// - `?`: optional value as either the unwrapped value, or `null`; may be
+/// - "b64": string as standard base64
+/// - "e": floating point value in scientific notation
+/// - "d": numeric value in decimal notation
+/// - "b": integer value in binary notation
+/// - "o": integer value in octal notation
+/// - "c": integer as an ASCII character. Integer type must have 8 bits at max.
+/// - "u": integer as an UTF-8 sequence. Integer type must have 21 bits at max.
+/// - "B": bytes in SI units (decimal)
+/// - "Bi": bytes in IEC units (binary)
+/// - "?": optional value as either the unwrapped value, or `null`; may be
 ///   followed by a format specifier for the underlying value.
-/// - `!`: error union value as either the unwrapped value, or the formatted
+/// - "!": error union value as either the unwrapped value, or the formatted
 ///   error value; may be followed by a format specifier for the underlying
 ///   value.
-/// - `*`: the address of the value instead of the value itself.
-/// - `any`: a value of any type using its default format.
-/// - `f`: delegates to the `format` method of the type, passing `*Writer` and
+/// - "*": the address of the value instead of the value itself.
+/// - "any": a value of any type using its default format.
+/// - "f": delegates to the `format` method of the type, passing `*Writer` and
 ///   expecting `Error!void` returned.
-///
-/// A user type may be a struct, vector, union or enum type.
+/// - "q": prints as a double-quote escaped string. Inside the double-quoted
+///   string, everything is passed through unmodified, except for the following
+///   transformations:
+///   - escaped: '\n', '\r', '\t', '\\', '"'
+///   - hex-encoded: ASCII control characters
+/// - "qf": delegates to the `format` method of the type, while double-quote
+///   escaping.
 ///
 /// Literal curly braces can be escaped in the format string via doubling, e.g.
-/// `{{` or `}}`.
+/// "{{" or "}}".
 pub fn print(w: *Writer, comptime fmt: []const u8, args: anytype) Error!void {
     const ArgsType = @TypeOf(args);
     const args_type_info = @typeInfo(ArgsType);
@@ -874,7 +945,7 @@ pub fn splatBytes(w: *Writer, bytes: []const u8, n: usize) Error!usize {
 }
 
 /// Asserts the `buffer` was initialized with a capacity of at least `@sizeOf(T)` bytes.
-pub inline fn writeInt(w: *Writer, comptime T: type, value: T, endian: std.builtin.Endian) Error!void {
+pub inline fn writeInt(w: *Writer, comptime T: type, value: T, endian: std.lang.Endian) Error!void {
     var bytes: [@divExact(@typeInfo(T).int.bits, 8)]u8 = undefined;
     std.mem.writeInt(std.math.ByteAlignedInt(@TypeOf(value)), &bytes, value, endian);
     return w.writeAll(&bytes);
@@ -882,7 +953,7 @@ pub inline fn writeInt(w: *Writer, comptime T: type, value: T, endian: std.built
 
 /// The function is inline to avoid the dead code in case `endian` is
 /// comptime-known and matches host endianness.
-pub inline fn writeStruct(w: *Writer, value: anytype, endian: std.builtin.Endian) Error!void {
+pub inline fn writeStruct(w: *Writer, value: anytype, endian: std.lang.Endian) Error!void {
     switch (@typeInfo(@TypeOf(value))) {
         .@"struct" => |info| switch (info.layout) {
             .auto => @compileError("ill-defined memory layout"),
@@ -907,7 +978,7 @@ pub inline fn writeSliceEndian(
     w: *Writer,
     Elem: type,
     slice: []const Elem,
-    endian: std.builtin.Endian,
+    endian: std.lang.Endian,
 ) Error!void {
     switch (@typeInfo(Elem)) {
         .@"struct" => |info| comptime assert(info.layout != .auto),
@@ -1228,6 +1299,18 @@ pub fn printValue(
                     .int, .comptime_int => return w.printByteSize(value, .binary, options),
                     .@"struct" => return value.formatByteSize(w, .binary),
                     else => invalidFmtError(fmt, value),
+                },
+                else => {},
+            },
+            'q' => switch (fmt[1]) {
+                'f' => {
+                    try w.writeByte('"');
+                    var buffer: [64]u8 = undefined;
+                    var escaping_writer: std.zig.StringEscapeWriter = .init(w, &buffer);
+                    try value.format(&escaping_writer.writer);
+                    try escaping_writer.writer.flush();
+                    try w.writeByte('"');
+                    return;
                 },
                 else => {},
             },
@@ -2143,6 +2226,11 @@ test "{q} format string" {
     try testing.expectFmt("hello \"i\\tlike\\\"cheese\\x00\\x05cheese\" world", "hello {q} world", .{data});
 }
 
+test "{qf} format string" {
+    const data: []const u8 = "😎";
+    try testing.expectFmt("hello \"@\\\"😎\\\"\" world", "hello {qf} world", .{std.zig.fmtId(data)});
+}
+
 fn testPrintIntCase(expected: []const u8, value: anytype, base: u8, case: std.fmt.Case, options: std.fmt.Options) !void {
     var buffer: [100]u8 = undefined;
     var w: Writer = .fixed(&buffer);
@@ -2387,6 +2475,7 @@ pub fn unreachableRebase(w: *Writer, preserve: usize, capacity: usize) Error!voi
 
 pub fn fromArrayList(array_list: *ArrayList(u8)) Writer {
     defer array_list.* = .empty;
+    array_list.pointer_stability.assertUnlocked();
     return .{
         .vtable = &.{
             .drain = fixedDrain,
@@ -2402,6 +2491,7 @@ pub fn toArrayList(w: *Writer) ArrayList(u8) {
     const result: ArrayList(u8) = .{
         .items = w.buffer[0..w.end],
         .capacity = w.buffer.len,
+        .pointer_stability = .{},
     };
     w.buffer = &.{};
     w.end = 0;
@@ -2651,6 +2741,7 @@ pub const Allocating = struct {
         const result: std.array_list.Aligned(u8, alignment) = .{
             .items = @alignCast(w.buffer[0..w.end]),
             .capacity = w.buffer.len,
+            .pointer_stability = .{},
         };
         w.buffer = &.{};
         w.end = 0;
@@ -2742,29 +2833,26 @@ pub const Allocating = struct {
 
     fn drain(w: *Writer, data: []const []const u8, splat: usize) Error!usize {
         const a: *Allocating = @fieldParentPtr("writer", w);
-        const pattern = data[data.len - 1];
-        const splat_len = pattern.len * splat;
-        const start_len = a.writer.end;
         assert(data.len != 0);
-        for (data) |bytes| {
-            a.ensureUnusedCapacity(bytes.len + splat_len + 1) catch return error.WriteFailed;
+        const count = countSplat(data, splat);
+        a.ensureUnusedCapacity(count + 1) catch return error.WriteFailed;
+        for (data[0 .. data.len - 1]) |bytes| {
             @memcpy(a.writer.buffer[a.writer.end..][0..bytes.len], bytes);
             a.writer.end += bytes.len;
         }
-        if (splat == 0) {
-            a.writer.end -= pattern.len;
-        } else switch (pattern.len) {
+        const pattern = data[data.len - 1];
+        switch (pattern.len) {
             0 => {},
             1 => {
-                @memset(a.writer.buffer[a.writer.end..][0 .. splat - 1], pattern[0]);
-                a.writer.end += splat - 1;
+                @memset(a.writer.buffer[a.writer.end..][0..splat], pattern[0]);
+                a.writer.end += splat;
             },
-            else => for (0..splat - 1) |_| {
+            else => for (0..splat) |_| {
                 @memcpy(a.writer.buffer[a.writer.end..][0..pattern.len], pattern);
                 a.writer.end += pattern.len;
             },
         }
-        return a.writer.end - start_len;
+        return count;
     }
 
     fn sendFile(w: *Writer, file_reader: *File.Reader, limit: Limit) FileError!usize {
@@ -2817,12 +2905,12 @@ pub const Allocating = struct {
     }
 
     test Allocating {
-        try testAllocating(.fromByteUnits(1));
-        try testAllocating(.fromByteUnits(4));
-        try testAllocating(.fromByteUnits(8));
-        try testAllocating(.fromByteUnits(16));
-        try testAllocating(.fromByteUnits(32));
-        try testAllocating(.fromByteUnits(64));
+        try testAllocating(.@"1");
+        try testAllocating(.@"4");
+        try testAllocating(.@"8");
+        try testAllocating(.@"16");
+        try testAllocating(.@"32");
+        try testAllocating(.@"64");
     }
 };
 

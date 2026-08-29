@@ -51,6 +51,7 @@ pub const Os = struct {
         @"3ds",
         wiiu,
         @"switch",
+        gba,
 
         psx,
         ps3,
@@ -89,6 +90,7 @@ pub const Os = struct {
             };
         }
 
+        /// Deprecated; to be removed in 0.18.0. Check for relevant tags instead.
         pub inline fn isBSD(tag: Tag) bool {
             return tag.isDarwin() or switch (tag) {
                 .freebsd, .openbsd, .netbsd, .dragonfly => true,
@@ -103,6 +105,7 @@ pub const Os = struct {
                 .plan9 => arch.plan9Ext(),
                 else => switch (arch) {
                     .wasm32, .wasm64 => ".wasm",
+                    .spork8 => ".bin",
                     else => "",
                 },
             };
@@ -166,6 +169,7 @@ pub const Os = struct {
                 .ps3,
                 .ps4,
                 .ps5,
+                .gba,
 
                 .emscripten,
 
@@ -406,6 +410,7 @@ pub const Os = struct {
                 .ps3,
                 .ps4,
                 .ps5,
+                .gba,
 
                 .emscripten,
 
@@ -458,7 +463,7 @@ pub const Os = struct {
 
                                 break :blk default_min;
                             },
-                            .max = .{ .major = 7, .minor = 1, .patch = 9 },
+                            .max = .{ .major = 7, .minor = 2, .patch = 0 },
                         },
                         .glibc = blk: {
                             // For 32-bit targets that traditionally used 32-bit time, we require
@@ -787,6 +792,7 @@ pub const s390x = @import("Target/s390x.zig");
 pub const sh = @import("Target/generic.zig");
 pub const sparc = @import("Target/sparc.zig");
 pub const spirv = @import("Target/spirv.zig");
+pub const spork8 = @import("Target/generic.zig");
 pub const ve = @import("Target/ve.zig");
 pub const wasm = @import("Target/wasm.zig");
 pub const x86 = @import("Target/x86.zig");
@@ -932,6 +938,7 @@ pub const Abi = enum {
             .uefi => .msvc,
             .@"3ds" => .eabihf,
             .wiiu => .eabihf,
+            .gba => .eabi,
             .psx => .eabi,
             .psp => .eabihf,
             .vita => .eabihf,
@@ -1074,6 +1081,7 @@ pub const ObjectFormat = enum {
             else => switch (arch) {
                 .spirv32, .spirv64 => .spirv,
                 .wasm32, .wasm64 => .wasm,
+                .spork8 => .raw,
                 else => .elf,
             },
         };
@@ -1109,7 +1117,7 @@ pub fn toElfMachine(target: *const Target) std.elf.EM {
         .riscv32, .riscv32be, .riscv64, .riscv64be => .RISCV,
         .s390x => .S390,
         .sh, .sheb => .SH,
-        .sparc => if (target.cpu.has(.sparc, .v9)) .SPARC32PLUS else .SPARC,
+        .sparc => if (target.cpu.hasAny(.sparc, &.{ .v8plus, .v9 })) .SPARC32PLUS else .SPARC,
         .sparc64 => .SPARCV9,
         .ve => .VE,
         .x86_16, .x86 => .@"386",
@@ -1123,6 +1131,7 @@ pub fn toElfMachine(target: *const Target) std.elf.EM {
         .spirv64,
         .wasm32,
         .wasm64,
+        .spork8,
         => .NONE,
     };
 }
@@ -1190,12 +1199,10 @@ pub fn toCoffMachine(target: *const Target) std.coff.IMAGE.FILE.MACHINE {
         .xcore,
         .xtensa,
         .xtensaeb,
+        .spork8,
         => .UNKNOWN,
     };
 }
-
-/// Deprecated; use 'std.zig.Subsystem' instead. To be removed after 0.16.0 is tagged.
-pub const SubSystem = std.zig.Subsystem;
 
 pub const Cpu = struct {
     /// Architecture
@@ -1397,6 +1404,7 @@ pub const Cpu = struct {
         sheb,
         sparc,
         sparc64,
+        spork8,
         spirv32,
         spirv64,
         thumb,
@@ -1449,6 +1457,7 @@ pub const Cpu = struct {
             xcore,
             xtensa,
             z80,
+            spork8,
         };
 
         pub inline fn family(arch: Arch) Family {
@@ -1487,6 +1496,7 @@ pub const Cpu = struct {
                 .x86_16, .x86, .x86_64 => .x86,
                 .xcore => .xcore,
                 .xtensa, .xtensaeb => .xtensa,
+                .spork8 => .spork8,
             };
         }
 
@@ -1512,7 +1522,10 @@ pub const Cpu = struct {
             };
         }
 
-        pub inline fn isAARCH64(arch: Arch) bool {
+        /// Deprecated; to be removed in 0.18.0. Use `isAarch64` instead.
+        pub const isAARCH64 = isAarch64;
+
+        pub inline fn isAarch64(arch: Arch) bool {
             return switch (arch) {
                 .aarch64, .aarch64_be => true,
                 else => false,
@@ -1540,14 +1553,20 @@ pub const Cpu = struct {
             };
         }
 
-        pub inline fn isLoongArch(arch: Arch) bool {
+        /// Deprecated; to be removed in 0.18.0. Use `isLoongarch` instead.
+        pub const isLoongArch = isLoongarch;
+
+        pub inline fn isLoongarch(arch: Arch) bool {
             return switch (arch) {
                 .loongarch32, .loongarch64 => true,
                 else => false,
             };
         }
 
-        pub inline fn isRISCV(arch: Arch) bool {
+        /// Deprecated; to be removed in 0.18.0. Use `isRiscv` instead.
+        pub const isRISCV = isRiscv;
+
+        pub inline fn isRiscv(arch: Arch) bool {
             return arch.isRiscv32() or arch.isRiscv64();
         }
 
@@ -1572,50 +1591,74 @@ pub const Cpu = struct {
             };
         }
 
-        pub inline fn isMIPS(arch: Arch) bool {
-            return arch.isMIPS32() or arch.isMIPS64();
+        /// Deprecated; to be removed in 0.18.0. Use `isMips` instead.
+        pub const isMIPS = isMips;
+
+        pub inline fn isMips(arch: Arch) bool {
+            return arch.isMips32() or arch.isMips64();
         }
 
-        pub inline fn isMIPS32(arch: Arch) bool {
+        /// Deprecated; to be removed in 0.18.0. Use `isMips32` instead.
+        pub const isMIPS32 = isMips32;
+
+        pub inline fn isMips32(arch: Arch) bool {
             return switch (arch) {
                 .mips, .mipsel => true,
                 else => false,
             };
         }
 
-        pub inline fn isMIPS64(arch: Arch) bool {
+        /// Deprecated; to be removed in 0.18.0. Use `isMips64` instead.
+        pub const isMIPS64 = isMips64;
+
+        pub inline fn isMips64(arch: Arch) bool {
             return switch (arch) {
                 .mips64, .mips64el => true,
                 else => false,
             };
         }
 
-        pub inline fn isPowerPC(arch: Arch) bool {
-            return arch.isPowerPC32() or arch.isPowerPC64();
+        /// Deprecated; to be removed in 0.18.0. Use `isPowerpc` instead.
+        pub const isPowerPC = isPowerpc;
+
+        pub inline fn isPowerpc(arch: Arch) bool {
+            return arch.isPowerpc32() or arch.isPowerpc64();
         }
 
-        pub inline fn isPowerPC32(arch: Arch) bool {
+        /// Deprecated; to be removed in 0.18.0. Use `isPowerpc32` instead.
+        pub const isPowerPC32 = isPowerpc32;
+
+        pub inline fn isPowerpc32(arch: Arch) bool {
             return switch (arch) {
                 .powerpc, .powerpcle => true,
                 else => false,
             };
         }
 
-        pub inline fn isPowerPC64(arch: Arch) bool {
+        /// Deprecated; to be removed in 0.18.0. Use `isPowerpc64` instead.
+        pub const isPowerPC64 = isPowerpc64;
+
+        pub inline fn isPowerpc64(arch: Arch) bool {
             return switch (arch) {
                 .powerpc64, .powerpc64le => true,
                 else => false,
             };
         }
 
-        pub inline fn isSPARC(arch: Arch) bool {
+        /// Deprecated; to be removed in 0.18.0. Use `isSparc` instead.
+        pub const isSPARC = isSparc;
+
+        pub inline fn isSparc(arch: Arch) bool {
             return switch (arch) {
                 .sparc, .sparc64 => true,
                 else => false,
             };
         }
 
-        pub inline fn isSpirV(arch: Arch) bool {
+        /// Deprecated; to be removed in 0.18.0. Use `isSpirv` instead.
+        pub const isSpirV = isSpirv;
+
+        pub inline fn isSpirv(arch: Arch) bool {
             return switch (arch) {
                 .spirv32, .spirv64 => true,
                 else => false,
@@ -1718,6 +1761,7 @@ pub const Cpu = struct {
                 .sparc,
                 .sparc64,
                 .xtensaeb,
+                .spork8,
                 => .big,
 
                 // GPU endianness is opaque. For now, assume little endian.
@@ -1796,10 +1840,12 @@ pub const Cpu = struct {
                 .x86_64_regcall_v4_win,
                 .x86_64_vectorcall,
                 .x86_64_interrupt,
+                .x86_64_preserve_none,
                 => &.{.x86_64},
 
                 .x86_sysv,
                 .x86_win,
+                .x86_mingw,
                 .x86_stdcall,
                 .x86_fastcall,
                 .x86_thiscall,
@@ -1821,6 +1867,7 @@ pub const Cpu = struct {
                 .aarch64_aapcs_win,
                 .aarch64_vfabi,
                 .aarch64_vfabi_sve,
+                .aarch64_preserve_none,
                 => &.{ .aarch64, .aarch64_be },
 
                 .alpha_osf,
@@ -1973,6 +2020,9 @@ pub const Cpu = struct {
                 .ez80_cet,
                 .ez80_tiflags,
                 => &.{.ez80},
+
+                .spork8,
+                => &.{.spork8},
             };
         }
     };
@@ -2037,10 +2087,12 @@ pub const Cpu = struct {
                 .arm => switch (os.tag) {
                     .@"3ds" => &arm.cpu.mpcore,
                     .vita => &arm.cpu.cortex_a9,
+                    .gba => &arm.cpu.arm7tdmi,
                     else => &arm.cpu.baseline,
                 },
                 .thumb => switch (os.tag) {
                     .vita => &arm.cpu.cortex_a9,
+                    .gba => &arm.cpu.arm7tdmi,
                     else => &arm.cpu.baseline,
                 },
                 .armeb, .thumbeb => &arm.cpu.baseline,
@@ -2081,6 +2133,7 @@ pub const Cpu = struct {
                     else => generic(arch),
                 },
                 .powerpc64 => switch (os.tag) {
+                    .linux, .freebsd => &powerpc.cpu.pwr8,
                     .openbsd => &powerpc.cpu.pwr9,
                     else => generic(arch),
                 },
@@ -2145,18 +2198,22 @@ pub fn zigTriple(target: *const Target, allocator: Allocator) Allocator.Error![]
     return Query.fromTarget(target).zigTriple(allocator);
 }
 
+/// Deprecated; to be removed in 0.18.0. Use `std.zig.target.hurdTupleSimple` instead.
 pub fn hurdTupleSimple(allocator: Allocator, arch: Cpu.Arch, abi: Abi) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}-{s}", .{ @tagName(arch), @tagName(abi) });
 }
 
+/// Deprecated; to be removed in 0.18.0. Use `std.zig.target.hurdTuple` instead.
 pub fn hurdTuple(target: *const Target, allocator: Allocator) ![]u8 {
     return hurdTupleSimple(allocator, target.cpu.arch, target.abi);
 }
 
+/// Deprecated; to be removed in 0.18.0. Use `std.zig.target.linuxTripleSimple` instead.
 pub fn linuxTripleSimple(allocator: Allocator, arch: Cpu.Arch, os_tag: Os.Tag, abi: Abi) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}-{s}-{s}", .{ @tagName(arch), @tagName(os_tag), @tagName(abi) });
 }
 
+/// Deprecated; to be removed in 0.18.0. Use `std.zig.target.linuxTriple` instead.
 pub fn linuxTriple(target: *const Target, allocator: Allocator) ![]u8 {
     return linuxTripleSimple(allocator, target.cpu.arch, target.os.tag, target.abi);
 }
@@ -2243,6 +2300,7 @@ pub fn requiresLibC(target: *const Target) bool {
         .dragonfly,
         .haiku,
         .serenity,
+        .emscripten,
         => true,
 
         // Android API levels prior to 29 did not have native TLS support. For these API levels, TLS
@@ -2266,6 +2324,7 @@ pub fn requiresLibC(target: *const Target) bool {
         .ps3,
         .ps4,
         .ps5,
+        .gba,
         .psp,
         .vita,
         .mesa3d,
@@ -2274,7 +2333,6 @@ pub fn requiresLibC(target: *const Target) bool {
         .hermit,
         .hurd,
         .wasi,
-        .emscripten,
         .uefi,
         .opencl,
         .opengl,
@@ -2435,6 +2493,7 @@ pub const DynamicLinker = struct {
             .@"3ds",
             .wiiu,
             .@"switch",
+            .gba,
 
             .emscripten,
             .wasi,
@@ -2660,12 +2719,26 @@ pub const DynamicLinker = struct {
                         else => return none,
                     }}),
 
-                    .loongarch64 => initFmt("/lib64/ld-linux-loongarch-{s}.so.1", .{switch (abi) {
-                        .gnu => "lp64d",
-                        .gnuf32 => "lp64f",
-                        .gnusf => "lp64s",
-                        else => return none,
-                    }}),
+                    .loongarch32,
+                    .loongarch64,
+                    => |arch| initFmt("/lib{s}/ld-linux-{s}{s}.so.1", .{
+                        switch (arch) {
+                            .loongarch32 => "32",
+                            .loongarch64 => "64",
+                            else => unreachable,
+                        },
+                        switch (arch) {
+                            .loongarch32 => "loongarch-ilp32",
+                            .loongarch64 => "loongarch-lp64",
+                            else => unreachable,
+                        },
+                        switch (abi) {
+                            .gnu => "d",
+                            .gnuf32 => "f",
+                            .gnusf => "s",
+                            else => return none,
+                        },
+                    }),
 
                     .hppa,
                     .m68k,
@@ -2860,6 +2933,7 @@ pub const DynamicLinker = struct {
             .@"3ds",
             .wiiu,
             .@"switch",
+            .gba,
 
             .psx,
             .psp,
@@ -2918,6 +2992,7 @@ pub fn ptrBitWidth_arch_abi(cpu_arch: Cpu.Arch, abi: Abi) u16 {
         .avr,
         .msp430,
         .x86_16,
+        .spork8,
         => 16,
 
         .ez80,
@@ -3042,6 +3117,8 @@ pub fn stackAlignment(target: *const Target) u16 {
 
         .kvx => return 32,
 
+        .spork8 => return 256,
+
         else => {},
     }
 
@@ -3061,6 +3138,7 @@ pub fn stackGrowth(target: *const Target) StackGrowth {
     return switch (target.cpu.arch) {
         .hppa,
         .hppa64,
+        .spork8,
         => .up,
         else => .down,
     };
@@ -3069,9 +3147,13 @@ pub fn stackGrowth(target: *const Target) StackGrowth {
 /// Default signedness of `char` for the native C compiler for this target
 /// Note that char signedness is implementation-defined and many compilers provide
 /// an option to override the default signedness e.g. GCC's -funsigned-char / -fsigned-char
-pub fn cCharSignedness(target: *const Target) std.builtin.Signedness {
+/// Returns `null` if no C ABI is defined for this target.
+pub fn cCharSignedness(target: *const Target) ?std.builtin.Signedness {
+    switch (target.os.tag) {
+        .opengl => return null,
+        else => {},
+    }
     if (target.os.tag.isDarwin() or target.os.tag == .windows or target.os.tag == .uefi) return .signed;
-
     return switch (target.cpu.arch) {
         .aarch64,
         .aarch64_be,
@@ -3117,7 +3199,8 @@ pub const CType = enum {
     longdouble,
 };
 
-pub fn cTypeByteSize(t: *const Target, c_type: CType) u16 {
+/// Returns `null` if no C ABI is defined for this target.
+pub fn cTypeByteSize(t: *const Target, c_type: CType) ?u16 {
     return switch (c_type) {
         .char,
         .short,
@@ -3130,19 +3213,20 @@ pub fn cTypeByteSize(t: *const Target, c_type: CType) u16 {
         .ulonglong,
         .float,
         .double,
-        => @divExact(cTypeBitSize(t, c_type), 8),
+        => @divExact(cTypeBitSize(t, c_type) orelse return null, 8),
 
-        .longdouble => switch (cTypeBitSize(t, c_type)) {
+        .longdouble => switch (cTypeBitSize(t, c_type) orelse return null) {
             64 => 8,
-            80 => @intCast(std.mem.alignForward(usize, 10, cTypeAlignment(t, .longdouble))),
+            80 => @intCast(std.mem.alignForward(usize, 10, cTypeAlignment(t, c_type).?)),
             128 => 16,
             else => unreachable,
         },
     };
 }
 
-pub fn cTypeBitSize(target: *const Target, c_type: CType) u16 {
-    switch (target.os.tag) {
+/// Returns `null` if no C ABI is defined for this target.
+pub fn cTypeBitSize(target: *const Target, c_type: CType) ?u16 {
+    return switch (target.os.tag) {
         .freestanding,
         .other,
         .ashetos,
@@ -3150,49 +3234,56 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) u16 {
             .msp430,
             .x86_16,
             => switch (c_type) {
-                .char => return 8,
-                .short, .ushort, .int, .uint => return 16,
-                .float, .long, .ulong => return 32,
-                .longlong, .ulonglong, .double, .longdouble => return 64,
+                .char => 8,
+                .short, .ushort, .int, .uint => 16,
+                .float, .long, .ulong => 32,
+                .longlong, .ulonglong, .double, .longdouble => 64,
             },
             .avr => switch (c_type) {
-                .char => return 8,
-                .short, .ushort, .int, .uint => return 16,
-                .long, .ulong, .float, .double, .longdouble => return 32,
-                .longlong, .ulonglong => return 64,
+                .char => 8,
+                .short, .ushort, .int, .uint => 16,
+                .long, .ulong, .float, .double, .longdouble => 32,
+                .longlong, .ulonglong => 64,
+            },
+            // https://github.com/benanderman/spork-8/blob/main/Programming.md
+            .spork8 => switch (c_type) {
+                .char => 8,
+                .short, .ushort, .int, .uint => 16,
+                .long, .ulong, .float => 32,
+                .double, .longdouble, .longlong, .ulonglong => 64,
             },
             .mips64,
             .mips64el,
             => switch (c_type) {
-                .char => return 8,
-                .short, .ushort => return 16,
-                .int, .uint, .float => return 32,
+                .char => 8,
+                .short, .ushort => 16,
+                .int, .uint, .float => 32,
                 .long, .ulong => switch (target.abi) {
-                    .abin32 => return 32,
-                    else => return 64,
+                    .abin32 => 32,
+                    else => 64,
                 },
-                .longlong, .ulonglong, .double => return 64,
-                .longdouble => return 128,
+                .longlong, .ulonglong, .double => 64,
+                .longdouble => 128,
             },
             .x86_64 => switch (c_type) {
-                .char => return 8,
-                .short, .ushort => return 16,
-                .int, .uint, .float => return 32,
+                .char => 8,
+                .short, .ushort => 16,
+                .int, .uint, .float => 32,
                 .long, .ulong => switch (target.abi) {
-                    .x32 => return 32,
-                    else => return 64,
+                    .x32 => 32,
+                    else => 64,
                 },
-                .longlong, .ulonglong, .double => return 64,
-                .longdouble => return 80,
+                .longlong, .ulonglong, .double => 64,
+                .longdouble => 80,
             },
             else => switch (c_type) {
-                .char => return 8,
-                .short, .ushort => return 16,
-                .int, .uint, .float => return 32,
-                .long, .ulong => return target.ptrBitWidth(),
-                .longlong, .ulonglong, .double => return 64,
+                .char => 8,
+                .short, .ushort => 16,
+                .int, .uint, .float => 32,
+                .long, .ulong => target.ptrBitWidth(),
+                .longlong, .ulonglong, .double => 64,
                 .longdouble => switch (target.cpu.arch) {
-                    .x86 => return 80,
+                    .x86 => 80,
 
                     .alpha,
                     .riscv32,
@@ -3212,9 +3303,9 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) u16 {
                     .loongarch32,
                     .loongarch64,
                     .ve,
-                    => return 128,
+                    => 128,
 
-                    else => return 64,
+                    else => 64,
                 },
             },
         },
@@ -3241,60 +3332,60 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) u16 {
             .mips64,
             .mips64el,
             => switch (c_type) {
-                .char => return 8,
-                .short, .ushort => return 16,
-                .int, .uint, .float => return 32,
+                .char => 8,
+                .short, .ushort => 16,
+                .int, .uint, .float => 32,
                 .long, .ulong => switch (target.abi) {
-                    .gnuabin32, .muslabin32, .abin32 => return 32,
-                    else => return 64,
+                    .gnuabin32, .muslabin32, .abin32 => 32,
+                    else => 64,
                 },
-                .longlong, .ulonglong, .double => return 64,
-                .longdouble => return 128,
+                .longlong, .ulonglong, .double => 64,
+                .longdouble => 128,
             },
             .x86_64 => switch (c_type) {
-                .char => return 8,
-                .short, .ushort => return 16,
-                .int, .uint, .float => return 32,
+                .char => 8,
+                .short, .ushort => 16,
+                .int, .uint, .float => 32,
                 .long, .ulong => switch (target.abi) {
-                    .gnux32, .muslx32, .x32 => return 32,
-                    else => return 64,
+                    .gnux32, .muslx32, .x32 => 32,
+                    else => 64,
                 },
-                .longlong, .ulonglong, .double => return 64,
-                .longdouble => return 80,
+                .longlong, .ulonglong, .double => 64,
+                .longdouble => 80,
             },
             else => switch (c_type) {
-                .char => return 8,
-                .short, .ushort => return 16,
-                .int, .uint, .float => return 32,
-                .long, .ulong => return target.ptrBitWidth(),
-                .longlong, .ulonglong, .double => return 64,
+                .char => 8,
+                .short, .ushort => 16,
+                .int, .uint, .float => 32,
+                .long, .ulong => target.ptrBitWidth(),
+                .longlong, .ulonglong, .double => 64,
                 .longdouble => switch (target.cpu.arch) {
                     .x86 => switch (target.abi) {
-                        .android => return 64,
-                        else => return 80,
+                        .android => 64,
+                        else => 80,
                     },
 
                     .powerpc,
                     .powerpcle,
                     => switch (target.abi) {
-                        .musleabi, .musleabihf => return 64,
+                        .musleabi, .musleabihf => 64,
                         else => switch (target.os.tag) {
                             .netbsd,
                             .openbsd,
-                            => return 64,
-                            else => return 128,
+                            => 64,
+                            else => 128,
                         },
                     },
 
                     .powerpc64,
                     .powerpc64le,
                     => switch (target.abi) {
-                        .musl => return 64,
+                        .musl => 64,
                         else => switch (target.os.tag) {
                             .freebsd,
                             .openbsd,
-                            => return 64,
-                            else => return 128,
+                            => 64,
+                            else => 128,
                         },
                     },
 
@@ -3314,43 +3405,43 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) u16 {
                     .loongarch32,
                     .loongarch64,
                     .ve,
-                    => return 128,
+                    => 128,
 
-                    else => return 64,
+                    else => 64,
                 },
             },
         },
 
         .windows, .uefi => switch (target.cpu.arch) {
             .x86 => switch (c_type) {
-                .char => return 8,
-                .short, .ushort => return 16,
-                .int, .uint, .float => return 32,
-                .long, .ulong => return 32,
-                .longlong, .ulonglong, .double => return 64,
+                .char => 8,
+                .short, .ushort => 16,
+                .int, .uint, .float => 32,
+                .long, .ulong => 32,
+                .longlong, .ulonglong, .double => 64,
                 .longdouble => switch (target.abi) {
-                    .gnu => return 80,
-                    else => return 64,
+                    .gnu => 80,
+                    else => 64,
                 },
             },
             .x86_64 => switch (c_type) {
-                .char => return 8,
-                .short, .ushort => return 16,
-                .int, .uint, .float => return 32,
-                .long, .ulong => return 32,
-                .longlong, .ulonglong, .double => return 64,
+                .char => 8,
+                .short, .ushort => 16,
+                .int, .uint, .float => 32,
+                .long, .ulong => 32,
+                .longlong, .ulonglong, .double => 64,
                 .longdouble => switch (target.abi) {
-                    .gnu => return 80,
-                    else => return 64,
+                    .gnu => 80,
+                    else => 64,
                 },
             },
             else => switch (c_type) {
-                .char => return 8,
-                .short, .ushort => return 16,
-                .int, .uint, .float => return 32,
-                .long, .ulong => return 32,
-                .longlong, .ulonglong, .double => return 64,
-                .longdouble => return 64,
+                .char => 8,
+                .short, .ushort => 16,
+                .int, .uint, .float => 32,
+                .long, .ulong => 32,
+                .longlong, .ulonglong, .double => 64,
+                .longdouble => 64,
             },
         },
 
@@ -3362,119 +3453,129 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) u16 {
         .visionos,
         .watchos,
         => switch (c_type) {
-            .char => return 8,
-            .short, .ushort => return 16,
-            .int, .uint, .float => return 32,
+            .char => 8,
+            .short, .ushort => 16,
+            .int, .uint, .float => 32,
             .long, .ulong => switch (target.cpu.arch) {
-                .x86_64 => return 64,
+                .x86_64 => 64,
                 else => switch (target.abi) {
-                    .ilp32 => return 32,
-                    else => return 64,
+                    .ilp32 => 32,
+                    else => 64,
                 },
             },
-            .longlong, .ulonglong, .double => return 64,
+            .longlong, .ulonglong, .double => 64,
             .longdouble => switch (target.cpu.arch) {
-                .x86_64 => return 80,
-                else => return 64,
+                .x86_64 => 80,
+                else => 64,
             },
         },
 
         .nvcl, .cuda => switch (c_type) {
-            .char => return 8,
-            .short, .ushort => return 16,
-            .int, .uint, .float => return 32,
+            .char => 8,
+            .short, .ushort => 16,
+            .int, .uint, .float => 32,
             .long, .ulong => switch (target.cpu.arch) {
-                .nvptx => return 32,
-                .nvptx64 => return 64,
-                else => return 64,
+                .nvptx => 32,
+                .nvptx64 => 64,
+                else => 64,
             },
-            .longlong, .ulonglong, .double => return 64,
-            .longdouble => return 64,
+            .longlong, .ulonglong, .double => 64,
+            .longdouble => 64,
         },
 
         .amdhsa, .amdpal, .mesa3d => switch (c_type) {
-            .char => return 8,
-            .short, .ushort => return 16,
-            .int, .uint, .float => return 32,
-            .long, .ulong, .longlong, .ulonglong, .double => return 64,
-            .longdouble => return 128,
+            .char => 8,
+            .short, .ushort => 16,
+            .int, .uint, .float => 32,
+            .long, .ulong, .longlong, .ulonglong, .double => 64,
+            .longdouble => 128,
         },
 
         .opencl, .vulkan => switch (c_type) {
-            .char => return 8,
-            .short, .ushort => return 16,
-            .int, .uint, .float => return 32,
-            .long, .ulong, .double => return 64,
-            .longlong, .ulonglong => return 128,
+            .char => 8,
+            .short, .ushort => 16,
+            .int, .uint, .float => 32,
+            .long, .ulong, .double => 64,
+            .longlong, .ulonglong => 128,
             // Note: The OpenCL specification does not guarantee a particular size for long double,
             // but clang uses 128 bits.
-            .longdouble => return 128,
+            .longdouble => 128,
         },
 
         .@"3ds" => switch (c_type) {
-            .char => return 8,
-            .short, .ushort => return 16,
-            .int, .uint, .float, .long, .ulong => return 32,
-            .longlong, .ulonglong, .double, .longdouble => return 64,
+            .char => 8,
+            .short, .ushort => 16,
+            .int, .uint, .float, .long, .ulong => 32,
+            .longlong, .ulonglong, .double, .longdouble => 64,
         },
 
         .wiiu => switch (c_type) {
-            .char => return 8,
-            .short, .ushort => return 16,
-            .int, .uint, .float, .long, .ulong => return 32,
-            .longlong, .ulonglong, .double, .longdouble => return 64,
+            .char => 8,
+            .short, .ushort => 16,
+            .int, .uint, .float, .long, .ulong => 32,
+            .longlong, .ulonglong, .double, .longdouble => 64,
         },
 
         .@"switch" => switch (c_type) {
-            .char => return 8,
-            .short, .ushort => return 16,
-            .int, .uint, .float => return 32,
-            .long, .ulong, .longlong, .ulonglong, .double => return 64,
-            .longdouble => return 128,
+            .char => 8,
+            .short, .ushort => 16,
+            .int, .uint, .float => 32,
+            .long, .ulong, .longlong, .ulonglong, .double => 64,
+            .longdouble => 128,
         },
 
-        .psx => switch (c_type) {
+        .gba => switch (c_type) {
             .char => return 8,
             .short, .ushort => return 16,
             .int, .uint, .long, .ulong, .float => return 32,
             .longlong, .ulonglong, .double, .longdouble => return 64,
         },
+
+        .psx => switch (c_type) {
+            .char => 8,
+            .short, .ushort => 16,
+            .int, .uint, .long, .ulong, .float => 32,
+            .longlong, .ulonglong, .double, .longdouble => 64,
+        },
         .ps4, .ps5 => switch (c_type) {
-            .char => return 8,
-            .short, .ushort => return 16,
-            .int, .uint, .float => return 32,
-            .long, .ulong => return 64,
-            .longlong, .ulonglong, .double => return 64,
-            .longdouble => return 80,
+            .char => 8,
+            .short, .ushort => 16,
+            .int, .uint, .float => 32,
+            .long, .ulong => 64,
+            .longlong, .ulonglong, .double => 64,
+            .longdouble => 80,
         },
         .psp, .vita => switch (c_type) {
-            .char => return 8,
-            .short, .ushort => return 16,
-            .int, .uint, .float => return 32,
-            .long, .ulong => return 64,
-            .longlong, .ulonglong, .double, .longdouble => return 64,
+            .char => 8,
+            .short, .ushort => 16,
+            .int, .uint, .float => 32,
+            .long, .ulong => 64,
+            .longlong, .ulonglong, .double, .longdouble => 64,
         },
         .tios => switch (c_type) {
-            .char => return 8,
-            .short, .ushort => return 16,
-            .int, .uint => return 24,
-            .long, .ulong, .float, .double => return 32,
-            .longlong, .ulonglong, .longdouble => return 64,
+            .char => 8,
+            .short, .ushort => 16,
+            .int, .uint => 24,
+            .long, .ulong, .float, .double => 32,
+            .longlong, .ulonglong, .longdouble => 64,
         },
+
+        .opengl => null,
 
         .ps3,
         .contiki,
         .managarm,
-        .opengl,
         => @panic("specify the C integer and float type sizes for this OS"),
-    }
+    };
 }
 
-pub fn cTypeAlignment(target: *const Target, c_type: CType) u16 {
+/// Returns `null` if no C ABI is defined for this target.
+pub fn cTypeAlignment(target: *const Target, c_type: CType) ?u16 {
     // Overrides for unusual alignments
     switch (target.cpu.arch) {
         .avr,
         .ez80,
+        .spork8,
         => return 1,
         .x86 => switch (target.os.tag) {
             .windows, .uefi => switch (c_type) {
@@ -3503,7 +3604,7 @@ pub fn cTypeAlignment(target: *const Target, c_type: CType) u16 {
 
     // Next-power-of-two-aligned, up to a maximum.
     return @min(
-        std.math.ceilPowerOfTwoAssert(u16, (cTypeBitSize(target, c_type) + 7) / 8),
+        std.math.ceilPowerOfTwoAssert(u16, ((cTypeBitSize(target, c_type) orelse return null) + 7) / 8),
         @as(u16, switch (target.cpu.arch) {
             .msp430,
             .x86_16,
@@ -3573,120 +3674,7 @@ pub fn cTypeAlignment(target: *const Target, c_type: CType) u16 {
 
             .avr,
             .ez80,
-            => unreachable, // Handled above.
-        }),
-    );
-}
-
-pub fn cTypePreferredAlignment(target: *const Target, c_type: CType) u16 {
-    // Overrides for unusual alignments
-    switch (target.cpu.arch) {
-        .arc, .arceb => switch (c_type) {
-            .longdouble => return 4,
-            else => {},
-        },
-        .avr,
-        .ez80,
-        => return 1,
-        .x86 => switch (target.os.tag) {
-            .windows, .uefi => switch (c_type) {
-                .longdouble => switch (target.abi) {
-                    .gnu => return 4,
-                    else => return 8,
-                },
-                else => {},
-            },
-            else => switch (c_type) {
-                .longdouble => return 4,
-                else => {},
-            },
-        },
-        .m68k => switch (c_type) {
-            .int, .uint, .long, .ulong => return 2,
-            else => {},
-        },
-        .wasm32, .wasm64 => switch (target.os.tag) {
-            .emscripten => switch (c_type) {
-                .longdouble => return 8,
-                else => {},
-            },
-            else => {},
-        },
-        else => {},
-    }
-
-    // Next-power-of-two-aligned, up to a maximum.
-    return @min(
-        std.math.ceilPowerOfTwoAssert(u16, (cTypeBitSize(target, c_type) + 7) / 8),
-        @as(u16, switch (target.cpu.arch) {
-            .x86_16,
-            .msp430,
-            => 2,
-
-            .arc,
-            .arceb,
-            .csky,
-            .kalimba,
-            .microblaze,
-            .microblazeel,
-            .or1k,
-            .propeller,
-            .sh,
-            .sheb,
-            .xcore,
-            .xtensa,
-            .xtensaeb,
-            => 4,
-
-            .amdgcn,
-            .arm,
-            .armeb,
-            .bpfeb,
-            .bpfel,
-            .hexagon,
-            .hppa,
-            .lanai,
-            .m68k,
-            .m88k,
-            .mips,
-            .mipsel,
-            .nvptx,
-            .nvptx64,
-            .s390x,
-            .sparc,
-            .thumb,
-            .thumbeb,
-            .x86,
-            => 8,
-
-            .aarch64,
-            .aarch64_be,
-            .alpha,
-            .hppa64,
-            .kvx,
-            .loongarch32,
-            .loongarch64,
-            .mips64,
-            .mips64el,
-            .powerpc,
-            .powerpcle,
-            .powerpc64,
-            .powerpc64le,
-            .riscv32,
-            .riscv32be,
-            .riscv64,
-            .riscv64be,
-            .sparc64,
-            .spirv32,
-            .spirv64,
-            .ve,
-            .wasm32,
-            .wasm64,
-            .x86_64,
-            => 16,
-
-            .avr,
-            .ez80,
+            .spork8,
             => unreachable, // Handled above.
         }),
     );
@@ -3696,6 +3684,7 @@ pub fn cMaxIntAlignment(target: *const Target) u16 {
     return switch (target.cpu.arch) {
         .avr,
         .ez80,
+        .spork8,
         => 1,
 
         .msp430,
@@ -3715,6 +3704,11 @@ pub fn cMaxIntAlignment(target: *const Target) u16 {
         .xcore,
         => 4,
 
+        .x86 => switch (target.os.tag) {
+            else => 4,
+            .uefi, .windows => 8,
+        },
+
         .arm,
         .armeb,
         .hexagon,
@@ -3733,7 +3727,6 @@ pub fn cMaxIntAlignment(target: *const Target) u16 {
         .sparc,
         .thumb,
         .thumbeb,
-        .x86,
         .xtensa,
         .xtensaeb,
         => 8,
@@ -3769,18 +3762,14 @@ pub fn cMaxIntAlignment(target: *const Target) u16 {
 pub fn cCallingConvention(target: *const Target) ?std.builtin.CallingConvention {
     return switch (target.cpu.arch) {
         .x86_64 => switch (target.os.tag) {
-            .windows,
-            .uefi,
-            => .{ .x86_64_win = .{} },
+            .windows, .uefi => .{ .x86_64_win = .{} },
             else => switch (target.abi) {
                 .gnux32, .muslx32, .x32 => .{ .x86_64_x32 = .{} },
                 else => .{ .x86_64_sysv = .{} },
             },
         },
         .x86 => switch (target.os.tag) {
-            .windows,
-            .uefi,
-            => .{ .x86_win = .{} },
+            .windows, .uefi => if (target.isMinGW()) .{ .x86_mingw = .{} } else .{ .x86_win = .{} },
             else => .{ .x86_sysv = .{} },
         },
         .x86_16 => .{ .x86_16_cdecl = .{} },
@@ -3841,6 +3830,7 @@ pub fn cCallingConvention(target: *const Target) ?std.builtin.CallingConvention 
         .nvptx, .nvptx64 => .nvptx_device,
         .spirv32, .spirv64 => .spirv_device,
         .ez80 => .ez80_cet,
+        .spork8 => .spork8,
     };
 }
 

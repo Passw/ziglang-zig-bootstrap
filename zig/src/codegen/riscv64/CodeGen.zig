@@ -58,6 +58,9 @@ pub fn legalizeFeatures(_: *const std.Target) *const Air.Legalize.Features {
         .expand_add_safe,
         .expand_sub_safe,
         .expand_mul_safe,
+
+        .expand_array_splat,
+        .expand_array_to_vector,
     });
 }
 
@@ -1474,6 +1477,7 @@ fn genBody(func: *Func, body: []const Air.Inst.Index) InnerError!void {
 
             .slice           => try func.airSlice(inst),
             .array_to_slice  => try func.airArrayToSlice(inst),
+            .array_to_vector => unreachable, // legalize .expand_array_to_vector
 
             .slice_ptr       => try func.airSlicePtr(inst),
             .slice_len       => try func.airSliceLen(inst),
@@ -3533,7 +3537,7 @@ fn airWrapErrUnionPayload(func: *Func, inst: Air.Inst.Index) !void {
     const zcu = pt.zcu;
     const ty_op = func.air.instructions.items(.data)[@backingInt(inst)].ty_op;
 
-    const eu_ty = ty_op.ty.toType();
+    const eu_ty = ty_op.ty;
     const pl_ty = eu_ty.errorUnionPayload(zcu);
     const err_ty = eu_ty.errorUnionSet(zcu);
     const operand = try func.resolveInst(ty_op.operand);
@@ -3558,7 +3562,7 @@ fn airWrapErrUnionErr(func: *Func, inst: Air.Inst.Index) !void {
     const zcu = pt.zcu;
     const ty_op = func.air.instructions.items(.data)[@backingInt(inst)].ty_op;
 
-    const eu_ty = ty_op.ty.toType();
+    const eu_ty = ty_op.ty;
     const pl_ty = eu_ty.errorUnionPayload(zcu);
     const err_ty = eu_ty.errorUnionSet(zcu);
 
@@ -3580,7 +3584,7 @@ fn airRuntimeNavPtr(func: *Func, inst: Air.Inst.Index) !void {
     const zcu = func.pt.zcu;
     const ip = &zcu.intern_pool;
     const ty_nav = func.air.instructions.items(.data)[@backingInt(inst)].ty_nav;
-    const ptr_ty: Type = .fromInterned(ty_nav.ty);
+    const ptr_ty: Type = ty_nav.ty;
 
     const nav = ip.getNav(ty_nav.nav);
     const tlv_sym_index = if (func.bin_file.cast(.elf)) |elf_file| sym: {
@@ -5036,7 +5040,7 @@ fn airRet(func: *Func, inst: Air.Inst.Index, safety: bool) !void {
         .register_pair,
         => {
             if (ret_ty.isVector(zcu)) {
-                const bit_size = ret_ty.totalVectorBits(zcu);
+                const bit_size = ret_ty.bitSize(zcu);
 
                 // set the vtype to hold the entire vector's contents in a single element
                 try func.setVl(.zero, 0, .{
@@ -6235,8 +6239,8 @@ fn airAsm(func: *Func, inst: Air.Inst.Index) !void {
         next_op: for (&ops) |*op| {
             const op_str = while (!last_op) {
                 const full_str = op_it.next() orelse break :next_op;
-                const code_str = if (mem.indexOfScalar(u8, full_str, '#') orelse
-                    mem.indexOf(u8, full_str, "//")) |comment|
+                const code_str = if (mem.findScalar(u8, full_str, '#') orelse
+                    mem.find(u8, full_str, "//")) |comment|
                 code: {
                     last_op = true;
                     break :code full_str[0..comment];
@@ -6250,7 +6254,7 @@ fn airAsm(func: *Func, inst: Air.Inst.Index) !void {
             } else if (std.fmt.parseInt(i12, op_str, 10)) |int| {
                 op.* = .{ .imm = Immediate.s(int) };
             } else |_| if (mem.startsWith(u8, op_str, "%[")) {
-                const mod_index = mem.indexOf(u8, op_str, "]@");
+                const mod_index = mem.find(u8, op_str, "]@");
                 const modifier = if (mod_index) |index|
                     op_str[index + "]@".len ..]
                 else
@@ -6871,7 +6875,7 @@ fn genSetReg(func: *Func, ty: Type, reg: Register, src_mcv: MCValue) InnerError!
             // size to the total size of the vector, and vmv.x.s will work then
             if (src_reg.class() == .vector) {
                 try func.setVl(.zero, 0, .{
-                    .vsew = switch (ty.totalVectorBits(zcu)) {
+                    .vsew = switch (ty.bitSize(zcu)) {
                         8 => .@"8",
                         16 => .@"16",
                         32 => .@"32",
@@ -7292,7 +7296,7 @@ fn airFloatFromInt(func: *Func, inst: Air.Inst.Index) !void {
         const operand = try func.resolveInst(ty_op.operand);
 
         const src_ty = func.typeOf(ty_op.operand);
-        const dst_ty = ty_op.ty.toType();
+        const dst_ty = ty_op.ty;
 
         const src_reg, const src_lock = try func.promoteReg(src_ty, operand);
         defer if (src_lock) |lock| func.register_manager.unlockReg(lock);
@@ -7355,7 +7359,7 @@ fn airIntFromFloat(func: *Func, inst: Air.Inst.Index) !void {
 
         const operand = try func.resolveInst(ty_op.operand);
         const src_ty = func.typeOf(ty_op.operand);
-        const dst_ty = ty_op.ty.toType();
+        const dst_ty = ty_op.ty;
 
         const is_unsigned = dst_ty.isUnsignedInt(zcu);
         const src_bits = src_ty.bitSize(zcu);
@@ -8338,10 +8342,10 @@ fn resolveCallingConventionValues(
 
 fn wantSafety(func: *Func) bool {
     return switch (func.mod.optimize_mode) {
-        .Debug => true,
-        .ReleaseSafe => true,
-        .ReleaseFast => false,
-        .ReleaseSmall => false,
+        .debug => true,
+        .safe => true,
+        .fast => false,
+        .small => false,
     };
 }
 

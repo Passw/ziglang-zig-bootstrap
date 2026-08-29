@@ -523,7 +523,10 @@ pub fn systemCompiler(target: *const Target) LangOpts.Compiler {
     // the rest for documentation as fn returns .clang
     if (target.os.tag.isDarwin() or
         target.abi.isAndroid() or
-        target.os.tag.isBSD() or
+        target.os.tag == .dragonfly or
+        target.os.tag == .freebsd or
+        target.os.tag == .netbsd or
+        target.os.tag == .openbsd or
         target.os.tag == .fuchsia or
         target.os.tag == .illumos or
         target.os.tag == .haiku or
@@ -1559,15 +1562,15 @@ pub fn ptrBitWidth(target: *const Target) u16 {
 }
 
 pub fn cCharSignedness(target: *const Target) std.builtin.Signedness {
-    return target.toZigTarget().cCharSignedness();
+    return target.toZigTarget().cCharSignedness().?;
 }
 
 pub fn cTypeBitSize(target: *const Target, c_type: std.Target.CType) u16 {
-    return target.toZigTarget().cTypeBitSize(c_type);
+    return target.toZigTarget().cTypeBitSize(c_type).?;
 }
 
 pub fn cTypeAlignment(target: *const Target, c_type: std.Target.CType) u16 {
-    return target.toZigTarget().cTypeAlignment(c_type);
+    return target.toZigTarget().cTypeAlignment(c_type).?;
 }
 
 pub fn standardDynamicLinkerPath(target: *const Target) std.Target.DynamicLinker {

@@ -52,8 +52,8 @@ pub const Level = enum {
 
 /// The default log level is based on build mode.
 pub const default_level: Level = switch (builtin.mode) {
-    .Debug => .debug,
-    .ReleaseSafe, .ReleaseFast, .ReleaseSmall => .info,
+    .debug => .debug,
+    .safe, .fast, .small => .info,
 };
 
 pub const ScopeLevel = struct {

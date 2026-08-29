@@ -41,7 +41,10 @@ const Self = @This();
 const InnerError = codegen.Error || error{OutOfRegisters};
 
 pub fn legalizeFeatures(_: *const std.Target) ?*const Air.Legalize.Features {
-    return null;
+    return comptime &.initMany(&.{
+        .expand_array_splat,
+        .expand_array_to_vector,
+    });
 }
 
 const RegisterView = enum(u1) {
@@ -578,6 +581,7 @@ fn genBody(self: *Self, body: []const Air.Inst.Index) InnerError!void {
             .struct_field_ptr=> try self.airStructFieldPtr(inst),
             .agg_field_val   => try self.airAggFieldVal(inst),
             .array_to_slice  => try self.airArrayToSlice(inst),
+            .array_to_vector => unreachable, // legalize .expand_array_to_vector
             .float_from_int    => try self.airFloatFromInt(inst),
             .int_from_float    => try self.airIntFromFloat(inst),
             .cmpxchg_strong,
@@ -2647,7 +2651,7 @@ fn airWrapErrUnionErr(self: *Self, inst: Air.Inst.Index) !void {
     const zcu = pt.zcu;
     const ty_op = self.air.instructions.items(.data)[@backingInt(inst)].ty_op;
     const result: MCValue = if (self.liveness.isUnused(inst)) .dead else result: {
-        const error_union_ty = ty_op.ty.toType();
+        const error_union_ty = ty_op.ty;
         const payload_ty = error_union_ty.errorUnionPayload(zcu);
         const mcv = try self.resolveInst(ty_op.operand);
         if (!payload_ty.hasRuntimeBits(zcu)) break :result mcv;
@@ -4763,10 +4767,10 @@ fn truncRegister(
 /// TODO support scope overrides. Also note this logic is duplicated with `Zcu.wantSafety`.
 fn wantSafety(self: *Self) bool {
     return switch (self.bin_file.comp.root_mod.optimize_mode) {
-        .Debug => true,
-        .ReleaseSafe => true,
-        .ReleaseFast => false,
-        .ReleaseSmall => false,
+        .debug => true,
+        .safe => true,
+        .fast => false,
+        .small => false,
     };
 }
 
