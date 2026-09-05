@@ -959,7 +959,7 @@ pub fn main(init: process.Init.Minimal) !void {
                 // trigger a rebuild on all steps with modified inputs, as well as their
                 // recursive dependants.
                 var caption_buf: [std.Progress.Node.max_name_len]u8 = undefined;
-                const caption = std.fmt.bufPrint(&caption_buf, "watching {d} directories, {d} processes", .{
+                const caption = std.mem.print(&caption_buf, "watching {d} directories, {d} processes", .{
                     w.dir_count, countSubProcesses(&maker),
                 }) catch &caption_buf;
                 var debouncing_node = main_progress_node.start(caption, 0);
@@ -2730,6 +2730,7 @@ fn makeStep(
                 const candidate_max_rss = candidate_index.ptr(c).max_rss.toBytes();
                 if (maker.available_rss < candidate_max_rss) break;
                 assert(maker.memory_blocked_steps.pop() == candidate_index);
+                maker.available_rss -= candidate_max_rss;
                 dispatch_set.appendAssumeCapacity(candidate_index);
             }
         }

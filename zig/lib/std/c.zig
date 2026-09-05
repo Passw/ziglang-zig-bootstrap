@@ -1366,6 +1366,27 @@ pub const CTL = switch (native_os) {
     },
     else => void,
 };
+pub const CPU = switch (native_os) {
+    .openbsd => switch (native_arch) {
+        .aarch64, .aarch64_be => struct {
+            pub const COMPATIBLE = 1;
+            pub const ID_AA64ISAR0 = 2;
+            pub const ID_AA64ISAR1 = 3;
+            pub const ID_AA64ISAR2 = 4;
+            pub const ID_AA64MMFR0 = 5;
+            pub const ID_AA64MMFR1 = 6;
+            pub const ID_AA64MMFR2 = 7;
+            pub const AA64PFR0 = 8;
+            pub const AA64PFR1 = 9;
+            pub const AA64SMFR0 = 10;
+            pub const AA64ZFR0 = 11;
+            pub const LIDACTION = 12;
+            pub const LED_BLINK = 13;
+        },
+        else => void,
+    },
+    else => void,
+};
 pub const KERN = switch (native_os) {
     .freebsd => struct {
         /// struct: process entries
@@ -5997,8 +6018,14 @@ pub const SOCK = switch (native_os) {
 pub const TCP = switch (native_os) {
     .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => darwin.TCP,
     .linux => linux.TCP,
+    .freebsd => freebsd.TCP,
+    .netbsd => netbsd.TCP,
+    .openbsd => openbsd.TCP,
+    .dragonfly => dragonfly.TCP,
     .emscripten => emscripten.TCP,
     .windows => ws2_32.TCP,
+    .illumos => illumos.TCP,
+    .haiku => haiku.TCP,
     // https://github.com/SerenityOS/serenity/blob/61ac554a3403838f79ca746bd1c65ded6f97d124/Kernel/API/POSIX/netinet/tcp.h#L13-L14
     .serenity => struct {
         pub const NODELAY = 10;
@@ -6614,6 +6641,7 @@ pub const IP = switch (native_os) {
     .illumos => illumos.IP,
     .haiku => haiku.IP,
     .serenity => serenity.IP,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => darwin.IP,
     else => void,
 };
 pub const IPV6 = switch (native_os) {
@@ -6625,6 +6653,7 @@ pub const IPV6 = switch (native_os) {
     .illumos => illumos.IPV6,
     .haiku => haiku.IPV6,
     .serenity => serenity.IPV6,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => darwin.IPV6,
     else => void,
 };
 pub const IPTOS = switch (native_os) {
@@ -6636,6 +6665,7 @@ pub const IPTOS = switch (native_os) {
     .illumos => illumos.IPTOS,
     .haiku => haiku.IPTOS,
     .serenity => serenity.IPTOS,
+    .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => darwin.IPTOS,
     else => void,
 };
 pub const SOL = switch (native_os) {
