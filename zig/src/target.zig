@@ -285,6 +285,17 @@ pub fn hasLldSupport(ofmt: std.Target.ObjectFormat) bool {
     };
 }
 
+pub fn preferNewLinkerOverLld(target: *const std.Target) bool {
+    return switch (target.ofmt) {
+        .elf => switch (target.cpu.arch) {
+            // Elf2 is more complete than LLD on these targets.
+            .sparc64 => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+
 /// Returns `true` if `ofmt` has two linker implementations, so `-fnew-linker` is meaningful.
 pub fn hasNewLinker(ofmt: std.Target.ObjectFormat) bool {
     return switch (ofmt) {
@@ -604,6 +615,7 @@ pub fn defaultAddressSpace(
     // The default address space for functions on AVR is .flash to produce
     // correct fixups into progmem.
     if (context == .function and target.cpu.arch == .avr) return .flash;
+    if (context == .global_mutable and target.os.tag == .vulkan) return .private;
     return .generic;
 }
 
@@ -649,6 +661,7 @@ pub fn shouldBlockPointerOps(target: *const std.Target, as: AddressSpace) bool {
         // Logical pointers that never support operations
         .constant,
         .local,
+        .private,
         .input,
         .output,
         .uniform,

@@ -2834,6 +2834,10 @@ pub fn addModuleTests(b: *std.Build, options: ModuleTestOptions) *Step {
 
         const target = &resolved_target.result;
 
+        if (target.cpu.arch.isAarch64() and target.os.tag == .openbsd and target.ofmt == .c) {
+            continue; // https://codeberg.org/ziglang/zig/issues/36766
+        }
+
         if (std.mem.eql(u8, options.name, "libc")) {
             // The libc API tests obviously need to link libc. So for test
             // target entries where we wouldn't link libc by default, skip the
@@ -3335,7 +3339,7 @@ pub fn addCases(
 
     var cases = @import("src/Cases.zig").init(gpa, arena, io);
 
-    b.dependOnDirectory(b.path("test/cases"));
+    b.dependOnDirectoryContents(b.path("test/cases"));
 
     var dir = try b.root.openDir(io, "test/cases", .{ .iterate = true });
     defer dir.close(io);
@@ -3397,7 +3401,7 @@ pub fn addIncrementalTests(
         }),
     });
 
-    b.dependOnDirectory(b.path("test/incremental"));
+    b.dependOnDirectoryContents(b.path("test/incremental"));
 
     var dir = try b.root.openDir(io, "test/incremental", .{ .iterate = true });
     defer dir.close(io);
@@ -3413,7 +3417,7 @@ pub fn addIncrementalTests(
         switch (entry.kind) {
             .file => {},
             .directory => {
-                b.dependOnDirectory(b.path(b.pathJoin(&.{ "test", "incremental", entry.path })));
+                b.dependOnDirectoryContents(b.path(b.pathJoin(&.{ "test", "incremental", entry.path })));
             },
             else => continue,
         }

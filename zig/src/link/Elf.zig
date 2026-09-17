@@ -722,7 +722,6 @@ pub fn loadInput(self: *Elf, input: link.Input) !void {
         const argv = &self.dump_argv_list;
         switch (input) {
             .res => unreachable,
-            .dso_exact => |dso_exact| try argv.appendSlice(gpa, &.{ "-l", dso_exact.name }),
             .object, .archive => |obj| try argv.append(gpa, try obj.path.toString(comp.arena)),
             .dso => |dso| try argv.append(gpa, try dso.path.toString(comp.arena)),
         }
@@ -730,14 +729,13 @@ pub fn loadInput(self: *Elf, input: link.Input) !void {
 
     switch (input) {
         .res => unreachable,
-        .dso_exact => @panic("TODO"),
         .object => |obj| try parseObject(self, obj),
         .archive => |obj| if (self.base.isStaticLib()) {
             // Ignore static library inputs when generating a static library.
         } else {
             try parseArchive(gpa, io, diags, &self.file_handles, &self.files, target, debug_fmt_strip, default_sym_version, &self.objects, obj);
         },
-        .dso => |dso| try parseDso(gpa, io, diags, dso, &self.shared_objects, &self.files, target),
+        .dso => |dso| try parseDso(gpa, comp.arena, io, diags, dso, &self.shared_objects, &self.files, target),
     }
 }
 
@@ -1108,6 +1106,7 @@ fn parseArchive(
 
 fn parseDso(
     gpa: Allocator,
+    arena: Allocator,
     io: Io,
     diags: *Diags,
     dso: link.Input.Dso,
@@ -1120,11 +1119,16 @@ fn parseDso(
 
     const handle = dso.file;
 
-    const stat = Stat.fromFs(try handle.stat(io));
+    const stat: Stat = .init(try handle.stat(io));
     var header = try SharedObject.parseHeader(gpa, io, diags, dso.path, handle, stat, target);
     defer header.deinit(gpa);
 
-    const soname = header.soname() orelse dso.path.basename();
+    const fallback_soname: []const u8 = switch (dso.fallback_soname) {
+        .full_path => try dso.path.toString(arena),
+        .basename => fs.path.basename(dso.path.sub_path),
+    };
+
+    const soname = header.soname() orelse fallback_soname;
 
     const gop = try shared_objects.getOrPut(gpa, soname);
     if (gop.found_existing) return;
@@ -1156,6 +1160,7 @@ fn parseDso(
             .symbols_extra = .empty,
             .symbols_resolver = .empty,
             .output_symtab_ctx = .{},
+            .fallback_soname = fallback_soname,
         },
     });
     const so = fileLookup(files.*, index, null).?.shared_object;
@@ -4407,7 +4412,7 @@ const mem = std.mem;
 const Allocator = std.mem.Allocator;
 const Hash = std.hash.Wyhash;
 const Path = std.Build.Cache.Path;
-const Stat = std.Build.Cache.File.Stat;
+const Stat = std.Build.Cache.Manifest.Stat;
 
 const codegen = @import("../codegen.zig");
 const eh_frame = @import("Elf/eh_frame.zig");
