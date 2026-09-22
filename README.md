@@ -149,7 +149,7 @@ is more portable across Linux distributions.
 | `s390x-linux-gnu`           | OK     |
 | `s390x-linux-musl`          | OK     |
 | `sparc-linux-gnu`           | [#117](https://codeberg.org/ziglang/zig-bootstrap/issues/117) |
-| `sparc64-linux-gnu`         | [#172](https://codeberg.org/ziglang/zig-bootstrap/issues/172) |
+| `sparc64-linux-gnu`         | OK     |
 | `thumb-linux-musleabi`      | OK     |
 | `thumb-linux-musleabihf`    | OK     |
 | `thumbeb-linux-musleabi`    | OK     |
