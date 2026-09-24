@@ -168,7 +168,7 @@ int main(int argc, char **argv) {
         if (f == NULL)
             panic("unable to open config.zig for writing");
 
-        const char *zig_version = "0.17.0-dev.2289+77d6113cf";
+        const char *zig_version = "0.17.0-dev.2307+392b17125";
 
         int written = fprintf(f,
             "pub const have_llvm = false;\n"

@@ -2926,7 +2926,9 @@ fn updateGlobalDynamic(elf: *Elf, orig_gsi: Symbol.Global.Index, force_apply_rel
             _ = elf.unknown_globals.swapRemove(gsi);
         }
 
-        assert(elf.classifySymbolValue(.global(gsi)) != .dynamic);
+        if (elf.ehdrType() != .REL) {
+            assert(elf.classifySymbolValue(.global(gsi)) != .dynamic);
+        }
         gsi.deleteDynamicTargetRelocs(elf);
         if (maybe_alias_gsi) |alias_gsi| {
             alias_gsi.deleteDynamicTargetRelocs(elf);
@@ -5622,9 +5624,10 @@ fn initHeaders(
                 .name = ".gnu.version",
                 .type = .GNU_VERSYM,
                 .flags = .{ .ALLOC = true },
+                .size = @sizeOf(std.elf.Versym), // "null" dynsym entry
                 .link = elf.shndx.dynsym.toSection().?,
                 .addralign = .@"2",
-                .size = 2, // "null" dynsym entry
+                .entsize = @sizeOf(std.elf.Versym),
                 .manual_size = true,
             });
             elf.targetStore(&elf.versymSlice()[0], .LOCAL); // "null" dynsym entry
@@ -5652,7 +5655,7 @@ fn initHeaders(
                         .cnt = 1,
                         .hash = std.elf.hash.calculate(base_version_name),
                         .aux = @offsetOf(VerdefEntry, "aux"),
-                        .next = @sizeOf(VerdefEntry),
+                        .next = 0,
                     },
                     .aux = .{
                         .name = @backingInt(try elf.string(.dynstr, base_version_name)),
@@ -8298,6 +8301,53 @@ pub fn prelink(elf: *Elf, prog_node: std.Progress.Node) link.Error!void {
 fn prelinkInner(elf: *Elf) Error!void {
     const comp = elf.base.comp;
     const gpa = comp.gpa;
+
+    const addr_align: Alignment = switch (elf.identClass()) {
+        .NONE, _ => unreachable,
+        .@"32" => .@"4",
+        .@"64" => .@"8",
+    };
+    try elf.nodes.ensureUnusedCapacity(gpa, 7 + 5);
+    for ([7]Section.Index{
+        elf.shndx.debug_addr,
+        elf.shndx.eh_frame,
+        elf.shndx.debug_frame,
+        elf.shndx.debug_info,
+        elf.shndx.debug_line,
+        elf.shndx.debug_rnglists,
+        elf.shndx.debug_str_offsets,
+    }) |debug_shndx| {
+        if (debug_shndx == .UNDEF) continue;
+        const debug_ni = debug_shndx.get(elf).ni;
+        const frame_format = debug_shndx.debugFrameFormat(elf);
+        const unit_padding_ni = elf.addNodeAssumeCapacity(
+            try debug_ni.addHeaderChildAfter(gpa, &elf.mf, last_header_oni: {
+                var last_header_oni = debug_ni.last(&elf.mf);
+                while (last_header_oni.unwrap()) |last_header_ni|
+                    switch (last_header_ni.position(&elf.mf)) {
+                        .header => break,
+                        .footer => last_header_oni = last_header_ni.prev(&elf.mf),
+                        .floating => unreachable,
+                    };
+                break :last_header_oni last_header_oni;
+            }, .{
+                .alignment = if (frame_format) |_| addr_align else .@"1",
+                .next_moved = true,
+                .enable_next_moved = true,
+            }),
+            .unit_padding,
+        );
+        var debug_nw: MappedFile.Node.Writer = undefined;
+        unit_padding_ni.writer(gpa, &elf.mf, &debug_nw);
+        defer debug_nw.deinit();
+        (if (frame_format) |format|
+            elf.dwarf.genDebugFrameCie(&debug_nw.interface, null, format)
+        else
+            elf.dwarf.genUnitPadding(&debug_nw.interface)) catch |err| switch (err) {
+            error.WriteFailed => return debug_nw.err.?,
+        };
+    }
+
     if (comp.zcu) |_| self_hosted_codegen: {
         if (comp.config.use_llvm) break :self_hosted_codegen;
 
@@ -8320,51 +8370,6 @@ fn prelinkInner(elf: *Elf) Error!void {
         };
         elf.input_pending_index += 1;
 
-        const addr_align: Alignment = switch (elf.identClass()) {
-            .NONE, _ => unreachable,
-            .@"32" => .@"4",
-            .@"64" => .@"8",
-        };
-        try elf.nodes.ensureUnusedCapacity(gpa, 7 + 5);
-        for ([7]Section.Index{
-            elf.shndx.debug_addr,
-            elf.shndx.eh_frame,
-            elf.shndx.debug_frame,
-            elf.shndx.debug_info,
-            elf.shndx.debug_line,
-            elf.shndx.debug_rnglists,
-            elf.shndx.debug_str_offsets,
-        }) |debug_shndx| {
-            if (debug_shndx == .UNDEF) continue;
-            const debug_ni = debug_shndx.get(elf).ni;
-            const frame_format = debug_shndx.debugFrameFormat(elf);
-            const unit_padding_ni = elf.addNodeAssumeCapacity(
-                try debug_ni.addHeaderChildAfter(gpa, &elf.mf, last_header_oni: {
-                    var last_header_oni = debug_ni.last(&elf.mf);
-                    while (last_header_oni.unwrap()) |last_header_ni|
-                        switch (last_header_ni.position(&elf.mf)) {
-                            .header => break,
-                            .footer => last_header_oni = last_header_ni.prev(&elf.mf),
-                            .floating => unreachable,
-                        };
-                    break :last_header_oni last_header_oni;
-                }, .{
-                    .alignment = if (frame_format) |_| addr_align else .@"1",
-                    .next_moved = true,
-                    .enable_next_moved = true,
-                }),
-                .unit_padding,
-            );
-            var debug_nw: MappedFile.Node.Writer = undefined;
-            unit_padding_ni.writer(gpa, &elf.mf, &debug_nw);
-            defer debug_nw.deinit();
-            (if (frame_format) |format|
-                elf.dwarf.genDebugFrameCie(&debug_nw.interface, null, format)
-            else
-                elf.dwarf.genUnitPadding(&debug_nw.interface)) catch |err| switch (err) {
-                error.WriteFailed => return debug_nw.err.?,
-            };
-        }
         switch (elf.shndx.debug_addr) {
             .UNDEF => {},
             else => |debug_addr_shndx| {
@@ -12568,7 +12573,9 @@ fn verdefId(elf: *Elf, version: String(.dynstr)) Error!u15 {
             elf.targetStore(&shdr.size, old_size + @sizeOf(VerdefEntry));
         },
     }
-    const entry_ptr = &elf.verdefSlice()[gop.index + 1];
+    const verdef_slice = elf.verdefSlice();
+    elf.targetStore(&verdef_slice[gop.index].def.next, @sizeOf(VerdefEntry));
+    const entry_ptr = &verdef_slice[gop.index + 1];
     entry_ptr.* = .{
         .def = .{
             .version = 1,
@@ -12577,7 +12584,7 @@ fn verdefId(elf: *Elf, version: String(.dynstr)) Error!u15 {
             .cnt = 1,
             .hash = std.elf.hash.calculate(version.slice(elf)),
             .aux = @offsetOf(VerdefEntry, "aux"),
-            .next = @sizeOf(VerdefEntry),
+            .next = 0,
         },
         .aux = .{
             .name = @backingInt(version),
