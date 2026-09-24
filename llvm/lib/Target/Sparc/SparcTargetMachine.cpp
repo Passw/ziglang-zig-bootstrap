@@ -35,7 +35,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeSparcTarget() {
 }
 
 static cl::opt<bool>
-    BranchRelaxation("sparc-enable-branch-relax", cl::Hidden, cl::init(true),
+    BranchRelaxation("sparc-enable-branch-relax", cl::Hidden, cl::init(false),
                      cl::desc("Relax out of range conditional branches"));
 
 static Reloc::Model getEffectiveRelocModel(std::optional<Reloc::Model> RM) {

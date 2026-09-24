@@ -21,6 +21,7 @@ For other versions, check the git tags of this repository.
  * LLVM: Support .lib extension for static zstd.
  * LLVM: Don't pass -static when building executables.
  * LLVM: OpenBSD `llvm-config` logic
+ * LLVM: disable branch relaxation pass in SPARC backend
  * Clang: Ignore the examples directory
  * Clang: Disable building of libclang-cpp.so.
  * Clang: remove `nvptx-arch` and `amdgpu-arch` symlinks
