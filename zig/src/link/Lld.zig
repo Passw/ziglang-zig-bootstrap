@@ -309,7 +309,7 @@ fn linkAsArchive(lld: *Lld, arena: Allocator) link.Error!void {
 
     try object_files.ensureUnusedCapacity(arena, comp.link_inputs.len);
     for (comp.link_inputs) |input| switch (input) {
-        .dso, .archive => {}, // static archives should not contain shared libraries or other static archives
+        .dso, .tbd, .archive => {}, // static archives should not contain shared libraries or other static archives
         .res, .object => {
             const path = try input.path().toStringZ(arena);
             object_files.appendAssumeCapacity(path);
@@ -561,6 +561,7 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
                     argv.appendAssumeCapacity(try obj.path.toString(arena));
                 }
             },
+            .tbd => unreachable,
         };
 
         for (comp.c_objects.items) |c_object| {
@@ -1102,6 +1103,7 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
 
         for (base.comp.link_inputs) |link_input| switch (link_input) {
             .res => unreachable, // Windows-only
+            .tbd => unreachable, // Darwin-only
             .dso => continue,
             .object, .archive => |obj| {
                 if (obj.must_link and !whole_archive) {
@@ -1163,6 +1165,7 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
 
             for (base.comp.link_inputs) |link_input| switch (link_input) {
                 .res => unreachable, // Windows-only
+                .tbd => unreachable, // Darwin-only
                 .object, .archive => continue,
                 .dso => |dso| {
                     const lib_as_needed = !dso.needed;
@@ -1596,6 +1599,7 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
             .dso => |dso| {
                 try argv.append(try dso.path.toString(arena));
             },
+            .tbd => unreachable,
             .res => unreachable,
         };
         if (whole_archive) {
@@ -1637,7 +1641,6 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
 
 fn spawnLld(comp: *Compilation, arena: Allocator, argv: []const []const u8) !void {
     const io = comp.io;
-    const gpa = comp.gpa;
 
     if (comp.verbose_link) {
         // Skip over our own name so that the LLD linker name is the first argv item.
@@ -1654,120 +1657,36 @@ fn spawnLld(comp: *Compilation, arena: Allocator, argv: []const []const u8) !voi
         return error.AlreadyReported;
     }
 
-    var stderr: []u8 = &.{};
-    defer gpa.free(stderr);
-
-    // TODO rework this awkward logic to call child.kill() in the failure case
-    const term = (if (comp.clang_passthrough_mode) term: {
-        var child = std.process.spawn(io, .{
-            .argv = argv,
-            .stdin = .inherit,
-            .stdout = .inherit,
-            .stderr = .inherit,
-        }) catch |err| break :term err;
-
-        break :term child.wait(io);
-    } else term: {
-        var child = std.process.spawn(io, .{
-            .argv = argv,
-            .stdin = .ignore,
-            .stdout = .ignore,
-            .stderr = .pipe,
-        }) catch |err| break :term err;
-
-        var stderr_reader = child.stderr.?.readerStreaming(io, &.{});
-        stderr = stderr_reader.interface.allocRemaining(gpa, .unlimited) catch |err| switch (err) {
-            error.StreamTooLong => unreachable, // unlimited
-            error.OutOfMemory => |e| return e,
-            error.ReadFailed => return stderr_reader.err.?,
-        };
-        break :term child.wait(io);
-    }) catch |first_err| term: {
-        const err = switch (first_err) {
-            error.NameTooLong => err: {
-                const s = fs.path.sep_str;
-                const rand_int = r: {
-                    var x: u64 = undefined;
-                    io.random(@ptrCast(&x));
-                    break :r x;
-                };
-                const rsp_path = "tmp" ++ s ++ std.fmt.hex(rand_int) ++ ".rsp";
-
-                const rsp_file = try comp.dirs.local_cache.handle.createFile(io, rsp_path, .{});
-                defer comp.dirs.local_cache.handle.deleteFile(io, rsp_path) catch |err|
-                    log.warn("failed to delete response file {s}: {t}", .{ rsp_path, err });
-                {
-                    defer rsp_file.close(io);
-                    var rsp_file_buffer: [1024]u8 = undefined;
-                    var rsp_file_writer = rsp_file.writer(io, &rsp_file_buffer);
-                    const rsp_writer = &rsp_file_writer.interface;
-                    for (argv[2..]) |arg| {
-                        try rsp_writer.writeByte('"');
-                        for (arg) |c| {
-                            switch (c) {
-                                '\"', '\\' => try rsp_writer.writeByte('\\'),
-                                else => {},
-                            }
-                            try rsp_writer.writeByte(c);
-                        }
-                        try rsp_writer.writeByte('"');
-                        try rsp_writer.writeByte('\n');
-                    }
-                    try rsp_writer.flush();
-                }
-
-                var rsp_child = std.process.spawn(io, .{
-                    .argv = &.{
-                        argv[0],
-                        argv[1],
-                        try arena.print("@{s}", .{
-                            try comp.dirs.local_cache.join(arena, &.{rsp_path}),
-                        }),
-                    },
-                    .stdin = if (comp.clang_passthrough_mode) .inherit else .ignore,
-                    .stdout = if (comp.clang_passthrough_mode) .inherit else .ignore,
-                    .stderr = if (comp.clang_passthrough_mode) .inherit else .pipe,
-                }) catch |err| break :err err;
-                if (comp.clang_passthrough_mode) {
-                    break :term rsp_child.wait(io) catch |err| break :err err;
-                } else {
-                    var stderr_reader = rsp_child.stderr.?.readerStreaming(io, &.{});
-                    stderr = stderr_reader.interface.allocRemaining(gpa, .unlimited) catch |err| switch (err) {
-                        error.StreamTooLong => unreachable, // unlimited
-                        error.OutOfMemory => |e| return e,
-                        error.ReadFailed => return stderr_reader.err.?,
-                    };
-                    break :term rsp_child.wait(io) catch |err| break :err err;
-                }
-            },
-            else => first_err,
-        };
-        log.err("unable to spawn LLD {s}: {t}", .{ argv[0], err });
-        return error.UnableToSpawnSelf;
+    var diags: Compilation.EvalZigLlvmProcessDiagnostics = undefined;
+    const result = comp.evalZigLlvmProcess(arena, &diags, argv) catch |err| switch (err) {
+        else => |e| return e,
+        error.EvalZigLlvmFail => {
+            log.err("failed to evaluate LLD '{s}': {f}", .{ argv[0], diags });
+            return error.UnableToSpawnSelf;
+        },
     };
 
-    const diags = &comp.link_diags;
-    switch (term) {
+    switch (result.term) {
         .exited => |code| if (code != 0) {
             if (comp.clang_passthrough_mode) std.process.exit(code);
-            diags.lockAndParseLldStderr(argv[1], stderr);
+            comp.link_diags.lockAndParseLldStderr(argv[1], result.stderr);
             return error.AlreadyReported;
         },
         .signal => |sig| {
             if (comp.clang_passthrough_mode) std.process.abort();
-            return diags.fail("{s} terminated with signal {t} and stderr:\n{s}", .{ argv[0], sig, stderr });
+            return comp.link_diags.fail("{s} terminated with signal {t} and stderr:\n{s}", .{ argv[0], sig, result.stderr });
         },
         .stopped => |sig| {
             if (comp.clang_passthrough_mode) std.process.abort();
-            return diags.fail("{s} stopped with signal {t} and stderr:\n{s}", .{ argv[0], sig, stderr });
+            return comp.link_diags.fail("{s} stopped with signal {t} and stderr:\n{s}", .{ argv[0], sig, result.stderr });
         },
         .unknown => |code| {
             if (comp.clang_passthrough_mode) std.process.abort();
-            return diags.fail("{s} terminated for unknown reason with code {d} and stderr:\n{s}", .{ argv[0], code, stderr });
+            return comp.link_diags.fail("{s} terminated for unknown reason with code {d} and stderr:\n{s}", .{ argv[0], code, result.stderr });
         },
     }
 
-    if (stderr.len > 0) log.warn("unexpected LLD stderr:\n{s}", .{stderr});
+    if (result.stderr.len > 0) log.warn("unexpected LLD stderr:\n{s}", .{result.stderr});
 }
 
 const builtin = @import("builtin");
