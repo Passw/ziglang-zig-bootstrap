@@ -365,10 +365,6 @@ pub fn clangSupportsStackProtector(target: *const std.Target) bool {
     };
 }
 
-pub fn libcProvidesStackProtector(target: *const std.Target) bool {
-    return !target.isMinGW() and target.os.tag != .wasi and !target.cpu.arch.isSpirV();
-}
-
 /// Returns true if `@returnAddress()` is supported by the target and has a
 /// reasonably performant implementation for the requested optimization mode.
 pub fn supportsReturnAddress(target: *const std.Target, optimize: std.lang.Optimize) bool {
@@ -427,6 +423,9 @@ pub fn hasDebugInfo(target: *const std.Target) bool {
                 .ptx87,
                 .ptx88,
                 .ptx90,
+                .ptx91,
+                .ptx92,
+                .ptx93,
             }),
             .bpfel, .bpfeb => false,
             else => true,
@@ -478,7 +477,7 @@ pub fn canBuildLibUbsanRt(target: *const std.Target) enum { no, yes, llvm_only, 
 /// Whether libzigc can fill-in the gaps of an existing libc
 /// or *is* the libc of the target.
 pub fn wantsZigC(target: *const std.Target, link_mode: std.lang.LinkMode) bool {
-    return (target.isMuslLibC() and link_mode == .static) or target.isWasiLibC() or target.isMinGW();
+    return (target.isMuslLibC() and link_mode == .static) or target.isMinGW();
 }
 
 pub fn hasRedZone(target: *const std.Target) bool {

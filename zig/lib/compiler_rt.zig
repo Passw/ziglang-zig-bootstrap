@@ -162,6 +162,7 @@ comptime {
         symbol(&bcmp, "bcmp");
         _ = @import("compiler_rt/ssp.zig");
         symbol(&strlen, "strlen");
+        symbol(&wcslen, "wcslen");
     }
 
     // Temporarily used for uefi until https://github.com/ziglang/zig/issues/21630 is addressed.
@@ -173,6 +174,10 @@ comptime {
 var _fltused: c_int = 1;
 
 fn strlen(s: [*:0]const c_char) callconv(.c) usize {
+    return std.mem.len(s);
+}
+
+fn wcslen(s: [*:0]const std.c.wchar_t) callconv(.c) usize {
     return std.mem.len(s);
 }
 
@@ -267,7 +272,6 @@ pub const want_float_exceptions = !builtin.cpu.arch.isWasm();
 ///   arm-linux-musleabihf => true
 ///   arm-linux-gnueabihf => true
 ///   arm-linux-eabihf => false
-///   wasm32-wasi-musl => false
 ///   wasm32-freestanding-none => false
 ///   x86_64-windows-gnu => true
 ///   x86_64-windows-msvc => true

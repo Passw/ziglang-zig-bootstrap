@@ -1283,11 +1283,10 @@ pub const Stream = struct {
     /// This is a low-level API that calls the `Io` interface function directly.
     /// For a higher level API, see `reader`.
     pub fn read(s: *const Stream, io: Io, data: [][]u8) Reader.Error!usize {
-        const rc, _ = try (try io.operate(.{ .net_read = .{
+        return (try (try io.operate(.{ .net_read = .{
             .socket_handle = s.socket.handle,
             .data = data,
-        } })).net_read;
-        return rc;
+        } })).net_read).data_len;
     }
 
     /// Read with control data.
@@ -1529,7 +1528,7 @@ pub const cmsg = struct {
         control: []align(cmsg_align) u8,
 
         pub const Message = struct {
-            header: *cmsghdr,
+            header: *align(cmsg_align) cmsghdr,
             data: []align(cmsg_align) u8,
         };
 

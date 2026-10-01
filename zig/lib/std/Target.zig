@@ -466,10 +466,11 @@ pub const Os = struct {
                             .max = .{ .major = 7, .minor = 2, .patch = 0 },
                         },
                         .glibc = blk: {
-                            // For 32-bit targets that traditionally used 32-bit time, we require
-                            // glibc 2.34 for full 64-bit time support. For everything else, we only
-                            // require glibc 2.31.
+                            //
                             const default_min: std.SemanticVersion = switch (arch) {
+                                // For 32-bit targets that traditionally used 32-bit time, we
+                                // require 2.34 for full 64-bit time support. For everything else,
+                                // we only require 2.31.
                                 .arm,
                                 .armeb,
                                 .csky,
@@ -486,6 +487,10 @@ pub const Os = struct {
                                     .{ .major = 2, .minor = 34, .patch = 0 }
                                 else
                                     .{ .major = 2, .minor = 31, .patch = 0 },
+                                // We need 2.32 because it was the first version to fully support
+                                // IEEE 128-bit `long double` (via `-mabi=ieeelongdouble`).
+                                .powerpc64le,
+                                => .{ .major = 2, .minor = 32, .patch = 0 },
                                 else => .{ .major = 2, .minor = 31, .patch = 0 },
                             };
 
@@ -945,7 +950,7 @@ pub const Abi = enum {
             .psx => .eabi,
             .psp => .eabihf,
             .vita => .eabihf,
-            .wasi, .emscripten => .musl,
+            .emscripten => .musl,
 
             .ashetos => .eabi,
 
@@ -976,6 +981,7 @@ pub const Abi = enum {
             .opengl,
             .vulkan,
             .tios,
+            .wasi,
             => .none,
         };
     }
@@ -1241,7 +1247,7 @@ pub const Cpu = struct {
         pub const Set = struct {
             ints: [usize_count]usize,
 
-            pub const needed_bit_count = 347;
+            pub const needed_bit_count = 378;
             pub const byte_count = @divCeil(needed_bit_count, 8);
             pub const usize_count = (byte_count + (@sizeOf(usize) - 1)) / @sizeOf(usize);
             pub const Index = std.math.Log2Int(@Int(.unsigned, usize_count * @bitSizeOf(usize)));
@@ -1955,9 +1961,11 @@ pub const Cpu = struct {
                 => &.{.lanai},
 
                 .loongarch64_lp64,
+                .loongarch64_preserve_none,
                 => &.{.loongarch64},
 
                 .loongarch32_ilp32,
+                .loongarch32_preserve_none,
                 => &.{.loongarch32},
 
                 .m68k_sysv,
@@ -2066,6 +2074,7 @@ pub const Cpu = struct {
                 .propeller => &propeller.cpu.p1,
                 .riscv32, .riscv32be => &riscv.cpu.generic_rv32,
                 .riscv64, .riscv64be => &riscv.cpu.generic_rv64,
+                .sparc => &sparc.cpu.v8,
                 .sparc64 => &sparc.cpu.v9, // SPARC can only be 64-bit from v9 and up.
                 .wasm32, .wasm64 => &wasm.cpu.mvp,
                 .x86_16 => &x86.cpu.i86,
@@ -2284,10 +2293,6 @@ pub inline fn isOpenBSDLibC(target: *const Target) bool {
     };
 }
 
-pub inline fn isWasiLibC(target: *const Target) bool {
-    return target.os.tag == .wasi and target.abi.isMusl();
-}
-
 /// Does this target require linking libc? This may be the case if the target has an unstable
 /// syscall interface, for example.
 pub fn requiresLibC(target: *const Target) bool {
@@ -2398,7 +2403,6 @@ pub fn supportsAddressSpace(
         .param => is_nvptx,
         .input, .output, .uniform, .push_constant, .storage_buffer => is_spirv,
         .physical_storage_buffer => arch == .spirv64,
-        .externref, .funcref => target.cpu.has(.wasm, .reference_types),
     };
 }
 
@@ -2562,6 +2566,9 @@ pub const DynamicLinker = struct {
                 .aarch64,
                 .aarch64_be,
                 => |arch| if (abi == .gnu) initFmt("/lib/ld-{s}.so.1", .{@tagName(arch)}) else none,
+
+                .riscv64,
+                => if (abi == .gnu) init("/lib/ld-riscv64-lp64.so.1") else none,
 
                 .x86 => if (abi == .gnu) init("/lib/ld.so.1") else none,
                 .x86_64 => initFmt("/lib/ld-{s}.so.1", .{switch (abi) {
