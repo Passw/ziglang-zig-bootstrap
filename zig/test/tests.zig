@@ -13,7 +13,6 @@ const link = @import("link.zig");
 // Implementations
 pub const ErrorTracesContext = @import("src/ErrorTrace.zig");
 pub const StackTracesContext = @import("src/StackTrace.zig");
-pub const DebuggerContext = @import("src/Debugger.zig");
 pub const LlvmIrContext = @import("src/LlvmIr.zig");
 pub const LibcContext = @import("src/Libc.zig");
 pub const LinkContext = @import("src/Link.zig");
@@ -1617,14 +1616,6 @@ const module_test_targets = blk: {
                 .abi = .none,
             },
         },
-        .{
-            .target = .{
-                .cpu_arch = .wasm32,
-                .os_tag = .wasi,
-                .abi = .musl,
-            },
-            .link_libc = true,
-        },
 
         // Windows Targets
 
@@ -2051,25 +2042,6 @@ const c_abi_targets = blk: {
             },
         },
 
-        // WASI Targets
-
-        .{
-            .target = .{
-                .cpu_arch = .wasm32,
-                .os_tag = .wasi,
-                .abi = .musl,
-            },
-        },
-        .{
-            .target = .{
-                .cpu_arch = .wasm32,
-                .os_tag = .wasi,
-                .abi = .musl,
-            },
-            .use_llvm = false,
-            .use_lld = false,
-        },
-
         // Windows Targets
 
         .{
@@ -2207,17 +2179,20 @@ const link_targets = blk: {
     };
 };
 
-const IncrementalTarget = struct {
-    target: std.Target.Query,
-    backend: enum { selfhosted, llvm, cbe },
-};
-
-/// These are passed to `incr-check` as `<target>-<backend>` strings.
+/// These are passed to `src/Runner.zig` as `<target>-<cache_mode>-<backend>-<linker>-<pic>` strings.
 ///
 /// If only one specific test is failing on a target, instead of entirely disabling the target here, you
 /// can skip the target for that specific test only by adding a line like this to top of the manifest:
 ///   #skip x86_64-linux-selfhosted
-const incremental_targets = &[_]IncrementalTarget{
+const RunnerTarget = struct {
+    target: std.Target.Query,
+    cache_mode: enum { whole, incremental },
+    backend: enum { selfhosted, llvm, cbe },
+    linker: enum { lld, old, new },
+    pic: enum { nopic, pic, pie },
+};
+
+pub const incremental_matrix: []const RunnerTarget = &.{
     // Avoid adding more CBE or LLVM targets without good reason: they're a lot slower than others
     // to run due to the output (C source code or LLVM IR) being built non-incrementally (by Clang
     // or LLVM). We just have a couple here to make sure that it works.
@@ -2225,49 +2200,71 @@ const incremental_targets = &[_]IncrementalTarget{
         .target = .{
             .cpu_arch = .x86_64,
             .os_tag = .linux,
+            .abi = .musl,
         },
+        .cache_mode = .incremental,
         .backend = .cbe,
+        .linker = .old,
+        .pic = .nopic,
     },
     .{
         .target = .{
             .cpu_arch = .x86_64,
             .os_tag = .linux,
+            .abi = .none,
         },
+        .cache_mode = .incremental,
         .backend = .llvm,
+        .linker = .lld,
+        .pic = .nopic,
     },
 
     .{
         .target = .{
             .cpu_arch = .x86_64,
             .os_tag = .linux,
+            .abi = .none,
         },
+        .cache_mode = .incremental,
         .backend = .selfhosted,
+        .linker = .new,
+        .pic = .nopic,
     },
     .{
         .target = .{
             .cpu_arch = .x86_64,
             .os_tag = .windows,
+            .abi = .none,
         },
+        .cache_mode = .incremental,
         .backend = .selfhosted,
+        .linker = .old,
+        .pic = .pic,
     },
     .{
         .target = .{
             .cpu_arch = .wasm32,
             .os_tag = .wasi,
+            .abi = .none,
         },
+        .cache_mode = .incremental,
         .backend = .selfhosted,
+        .linker = .old,
+        .pic = .nopic,
     },
 };
 
-const debugger_matrix: []const DebuggerContext.TestTarget = &.{
+pub const debugger_matrix: []const RunnerTarget = &.{
     .{
         .target = .{
             .cpu_arch = .x86_64,
             .os_tag = .linux,
             .abi = .none,
         },
-        .pic = false,
+        .cache_mode = .whole,
+        .backend = .selfhosted,
         .linker = .old,
+        .pic = .nopic,
     },
     .{
         .target = .{
@@ -2275,8 +2272,10 @@ const debugger_matrix: []const DebuggerContext.TestTarget = &.{
             .os_tag = .linux,
             .abi = .none,
         },
-        .pic = true,
+        .cache_mode = .whole,
+        .backend = .selfhosted,
         .linker = .old,
+        .pic = .pic,
     },
     .{
         .target = .{
@@ -2284,8 +2283,10 @@ const debugger_matrix: []const DebuggerContext.TestTarget = &.{
             .os_tag = .linux,
             .abi = .none,
         },
-        .pic = false,
+        .cache_mode = .whole,
+        .backend = .selfhosted,
         .linker = .new,
+        .pic = .nopic,
     },
     .{
         .target = .{
@@ -2293,8 +2294,32 @@ const debugger_matrix: []const DebuggerContext.TestTarget = &.{
             .os_tag = .linux,
             .abi = .none,
         },
-        .pic = true,
+        .cache_mode = .whole,
+        .backend = .selfhosted,
         .linker = .new,
+        .pic = .pic,
+    },
+    .{
+        .target = .{
+            .cpu_arch = .x86_64,
+            .os_tag = .linux,
+            .abi = .none,
+        },
+        .cache_mode = .incremental,
+        .backend = .selfhosted,
+        .linker = .new,
+        .pic = .nopic,
+    },
+    .{
+        .target = .{
+            .cpu_arch = .x86_64,
+            .os_tag = .linux,
+            .abi = .none,
+        },
+        .cache_mode = .incremental,
+        .backend = .selfhosted,
+        .linker = .new,
+        .pic = .pic,
     },
 };
 
@@ -2352,13 +2377,17 @@ pub fn isNative(actual_target: *const std.Build.ResolvedTarget, host: *const std
             .@"16bit_mode",
             .@"32bit_mode",
             .@"64bit",
+            .false_deps_bls,
+            .false_deps_compress,
+            .false_deps_expand,
             .false_deps_getmant,
-            .false_deps_lzcnt_tzcnt,
+            .false_deps_lzcnt,
             .false_deps_mulc,
             .false_deps_mullq,
             .false_deps_perm,
             .false_deps_popcnt,
             .false_deps_range,
+            .false_deps_tzcnt,
             .fast_11bytenop,
             .fast_15bytenop,
             .fast_7bytenop,
@@ -2386,10 +2415,12 @@ pub fn isNative(actual_target: *const std.Build.ResolvedTarget, host: *const std
             .prefer_legacy_setcc,
             .prefer_mask_registers,
             .prefer_movmsk_over_vtest,
+            .prefer_ndd_mem,
             .prefer_no_gather,
             .prefer_no_scatter,
             .slow_3ops_lea,
             .slow_incdec,
+            .slow_indirect_call,
             .slow_lea,
             .slow_pmaddwd,
             .slow_pmulld,
@@ -2401,10 +2432,13 @@ pub fn isNative(actual_target: *const std.Build.ResolvedTarget, host: *const std
         }),
         .aarch64, .aarch64_be => std.Target.aarch64.featureSet(&.{
             .addr_lsl_slow_14,
+            .align_cmp_csel_pairs,
             .alu_lsl_fast,
             .avoid_ldapur,
             .disable_fast_inc_vl,
             .exynos_cheap_as_move,
+            .fast_ld1_single,
+            .fixed_load_latency_4,
             .fuse_address,
             .fuse_addsub_2reg_const1,
             .fuse_adrp_add,
@@ -2413,7 +2447,9 @@ pub fn isNative(actual_target: *const std.Build.ResolvedTarget, host: *const std
             .fuse_crypto_eor,
             .fuse_csel,
             .fuse_cset,
+            .fuse_fcsel,
             .fuse_literals,
+            .has_limited_64bit_vector_mul_bandwidth,
             .predictable_select_expensive,
             .slow_misaligned_128store,
             .slow_paired_128,
@@ -2883,14 +2919,6 @@ fn addOneModuleTest(
     });
     these_tests.linkage = test_target.linkage;
     these_tests.use_new_linker = test_target.new_linker;
-    // https://codeberg.org/ziglang/zig/issues/31701
-    if (!(mem.eql(u8, options.name, "compiler-rt") or mem.eql(u8, options.name, "libc"))) {
-        if (options.no_builtin) these_tests.root_module.no_builtin = true;
-    }
-    // https://codeberg.org/ziglang/zig/issues/31702
-    if (mem.eql(u8, options.name, "compiler-rt") or mem.eql(u8, options.name, "libc")) {
-        these_tests.root_module.stack_protector = false;
-    }
     // https://github.com/llvm/llvm-project/issues/195561
     if (target.cpu.arch.isPowerPC()) {
         these_tests.root_module.stack_protector = false;
@@ -3311,24 +3339,7 @@ pub fn addCases(
     );
 }
 
-pub fn addDebuggerTests(b: *std.Build, options: DebuggerContext.Options) ?*Step {
-    const step = b.step("test-debugger", "Run the debugger tests");
-    if (options.gdb == null and options.lldb == null) {
-        step.dependOn(&b.addFail("test-debugger requires -Dgdb and/or -Dlldb").step);
-        return null;
-    }
-
-    var context: DebuggerContext = .{
-        .b = b,
-        .options = options,
-        .root_step = step,
-        .test_matrix = debugger_matrix,
-    };
-    context.addTests();
-    return step;
-}
-
-const IncrementalTestOptions = struct {
+pub const RunnerOptions = struct {
     test_filters: []const []const u8,
     test_target_filters: []const []const u8,
     skip_non_native: bool,
@@ -3340,19 +3351,22 @@ const IncrementalTestOptions = struct {
     skip_darwin: bool,
     skip_linux: bool,
     skip_llvm: bool,
+    gdb: ?[]const u8,
+    lldb: ?[]const u8,
 };
 
-pub fn addIncrementalTests(
+pub fn addRunnerTests(
     b: *std.Build,
     runner: *std.Build.Step.Compile,
-    options: IncrementalTestOptions,
-) !*Step {
-    const tests_step = b.step("test-incremental", "Run the new incremental compilation test cases");
-
-    const tests_path = b.path("test/incremental");
+    tests_step: *Step,
+    tests: []const u8,
+    matrix: []const RunnerTarget,
+    options: RunnerOptions,
+) !void {
+    const tests_path = b.path(tests);
     b.dependOnDirectoryContents(tests_path);
 
-    var tests_dir = try b.root.openDir(b.graph.io, "test/incremental", .{ .iterate = true });
+    var tests_dir = try b.root.openDir(b.graph.io, tests, .{ .iterate = true });
     defer tests_dir.close(b.graph.io);
     var test_it = tests_dir.iterate();
     while (try test_it.next(b.graph.io)) |@"test"| {
@@ -3380,7 +3394,7 @@ pub fn addIncrementalTests(
         run.addPrefixedDirectoryArg("--lib=", .zig_lib);
         _ = run.addPrefixedOutputDirectoryArg("--src=", "src");
 
-        for (incremental_targets) |test_target| {
+        for (matrix) |test_target| {
             const resolved_target = b.resolveTargetQuery(test_target.target);
 
             if (options.skip_non_native and !isNative(&resolved_target, &b.graph.host.result))
@@ -3399,9 +3413,12 @@ pub fn addIncrementalTests(
 
             if (options.skip_llvm and test_target.backend == .llvm) continue;
 
-            const target_str = b.fmt("{s}-incremental-{t}", .{
+            const target_str = b.fmt("{s}-{t}-{t}-{t}-{t}", .{
                 resolved_target.query.zigTriple(b.allocator) catch @panic("OOM"),
+                test_target.cache_mode,
                 test_target.backend,
+                test_target.linker,
+                test_target.pic,
             });
 
             for (options.test_target_filters) |filter| {
@@ -3418,12 +3435,13 @@ pub fn addIncrementalTests(
         run.addThirdPartyEnabledArgWasmtime(.{ .enabled = "-fwasmtime" });
         run.addThirdPartyEnabledArgWine(.{ .enabled = "-fwine" });
 
+        if (options.gdb) |gdb| run.addPrefixedFileArg("--gdb=", b.graph.cwdRelativePath(gdb));
+        if (options.lldb) |lldb| run.addPrefixedFileArg("--lldb=", b.graph.cwdRelativePath(lldb));
+
         run.addArg("--quiet"); // don't fill stderr telling us about skipped tests etc
 
         tests_step.dependOn(&run.step);
     }
-
-    return tests_step;
 }
 
 fn isEditorFileName(name: []const u8) bool {
@@ -3589,11 +3607,6 @@ const libc_test_nsz_targets: []const std.Target.Query = &.{
     .{
         .cpu_arch = .s390x,
         .os_tag = .linux,
-        .abi = .musl,
-    },
-    .{
-        .cpu_arch = .wasm32,
-        .os_tag = .wasi,
         .abi = .musl,
     },
     .{
