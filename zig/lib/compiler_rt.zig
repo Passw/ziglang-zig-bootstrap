@@ -165,6 +165,8 @@ comptime {
         symbol(&wcslen, "wcslen");
     }
 
+    _ = @import("compiler_rt/elf.zig");
+
     // Temporarily used for uefi until https://github.com/ziglang/zig/issues/21630 is addressed.
     if (!builtin.link_libc and (builtin.os.tag == .windows or builtin.os.tag == .uefi) and (builtin.abi == .none or builtin.abi == .msvc)) {
         symbol(&_fltused, "_fltused");

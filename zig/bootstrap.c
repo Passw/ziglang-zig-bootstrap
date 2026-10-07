@@ -168,7 +168,7 @@ int main(int argc, char **argv) {
         if (f == NULL)
             panic("unable to open config.zig for writing");
 
-        const char *zig_version = "0.18.0-dev.92+1e1964473";
+        const char *zig_version = "0.18.0-dev.120+9fe22a29b";
 
         int written = fprintf(f,
             "pub const have_llvm = false;\n"
@@ -212,7 +212,7 @@ int main(int argc, char **argv) {
     {
         const char *child_argv[] = {
             "./zig1", "lib", "build-obj",
-            "-ofmt=c", "-OReleaseSmall",
+            "-ofmt=c", "-lc", "-OReleaseSmall",
             "--name", "compiler_rt", "-femit-bin=compiler_rt.c",
             "-target", host_triple,
             "-Mroot=lib/compiler_rt.zig",
