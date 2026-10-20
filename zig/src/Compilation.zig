@@ -1270,6 +1270,7 @@ pub const cache_helpers = struct {
         hh.add(mod.strip);
         hh.add(mod.omit_frame_pointer);
         hh.add(mod.stack_check);
+        hh.add(mod.stack_protector);
         hh.add(mod.red_zone);
         hh.add(mod.sanitize_c);
         hh.add(mod.sanitize_thread);
@@ -6546,6 +6547,9 @@ fn addCommonCCArgs(
                         .off => {},
                         .trap => {
                             try argv.append("-fsanitize-trap=undefined");
+
+                            // Same reasoning as below.
+                            try argv.append("-fno-sanitize=function");
                         },
                         .full => {
                             // This check requires implementing the Itanium C++ ABI.

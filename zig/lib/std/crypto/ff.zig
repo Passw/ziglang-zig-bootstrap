@@ -638,6 +638,28 @@ pub fn Modulus(comptime max_bits: comptime_int) type {
             return x.eql(mo);
         }
 
+        // Computes -lo^-1 mod 2^t_bits for an odd `lo`.
+        fn computeM0Inv(lo: Limb) Limb {
+            var y = lo;
+            inline for (0..comptime math.log2_int(usize, t_bits)) |_| {
+                y = y *% (2 -% lo *% y);
+            }
+            return (@as(Limb, 1) << t_bits) - (@as(TLimb, @truncate(y)));
+        }
+
+        // Initialize without R2
+        fn initWithoutRR(v: FeUint, leading: usize, m0inv: Limb) Self {
+            var m = Self{
+                .zero = Fe{ .v = FeUint.zero },
+                .v = v,
+                .leading = leading,
+                .m0inv = m0inv,
+                .rr = undefined,
+            };
+            m.shrink(&m.zero) catch unreachable;
+            return m;
+        }
+
         /// Creates a new modulus from a `Uint` value.
         /// The modulus must be odd and larger than 2.
         pub fn fromUint(v_: FeUint) InvalidModulusError!Self {
@@ -651,25 +673,8 @@ pub fn Modulus(comptime max_bits: comptime_int) type {
                 return error.ModulusTooSmall;
             }
 
-            const leading = @clz(hi) - carry_bits;
+            var m = initWithoutRR(v, @clz(hi) - carry_bits, computeM0Inv(lo));
 
-            var y = lo;
-
-            inline for (0..comptime math.log2_int(usize, t_bits)) |_| {
-                y = y *% (2 -% lo *% y);
-            }
-            const m0inv = (@as(Limb, 1) << t_bits) - (@as(TLimb, @truncate(y)));
-
-            const zero = Fe{ .v = FeUint.zero };
-
-            var m = Self{
-                .zero = zero,
-                .v = v,
-                .leading = leading,
-                .m0inv = m0inv,
-                .rr = undefined, // will be computed right after
-            };
-            m.shrink(&m.zero) catch unreachable;
             computeRR(&m);
 
             return m;
@@ -719,15 +724,49 @@ pub fn Modulus(comptime max_bits: comptime_int) type {
             fe.v.limbs_len = new_len;
         }
 
+        // Doubles modulo m without using `rr`, so it can be used for modulus construction.
+        fn double(self: Self, x: *Fe) void {
+            const y = x.v;
+            _ = addAndReduce(&x.v, y, self.v);
+        }
+
         // Computes R^2 for the Montgomery representation.
         fn computeRR(self: *Self) void {
-            self.rr = self.zero;
-            const n = self.rr.limbs_count();
-            self.rr.v.limbs()[n - 1] = 1;
-            for ((n - 1)..(2 * n)) |_| {
-                self.shiftIn(&self.rr, 0);
+            const n = self.limbs_count();
+            var rr = self.zero;
+
+            if (n < 3) {
+                rr.v.limbs()[n - 1] = 1;
+                for ((n - 1)..(2 * n)) |_| {
+                    self.shiftIn(&rr, 0);
+                }
+                self.rr = rr;
+                return;
             }
-            self.shrink(&self.rr) catch unreachable;
+
+            const start = self.bits() - 1; // largest power of two < m.
+            const log_r = n * t_bits;
+            rr.v.limbs()[start / t_bits] = math.shl(Limb, 1, start % t_bits);
+            for (start..log_r) |_| {
+                self.double(&rr);
+            }
+
+            const threshold = n / 4;
+            var i: usize = math.log2_int(usize, log_r);
+            while (i > 0 and math.shr(usize, log_r, i) <= threshold) i -= 1;
+            for (0..math.shr(usize, log_r, i)) |_| {
+                self.double(&rr);
+            }
+            while (i > 0) {
+                rr = self.montgomerySq(rr);
+                i -= 1;
+                if (math.shr(usize, log_r, i) & 1 != 0) {
+                    self.double(&rr);
+                }
+            }
+
+            rr.montgomery = false;
+            self.rr = rr;
         }
 
         /// Computes x << t_bits + y (mod m)
@@ -759,15 +798,21 @@ pub fn Modulus(comptime max_bits: comptime_int) type {
             x.v.cmov(need_sub, d.v);
         }
 
+        // Adds y to x. Returns whether reduction was needed.
+        fn addAndReduce(x: *FeUint, y: FeUint, bound: FeUint) bool {
+            const overflow = x.addWithOverflow(y);
+            const underflow: u1 = @bitCast(ct.limbsCmpLt(x.*, bound));
+            const need_sub = ct.eql(overflow, underflow);
+            _ = x.conditionalSubWithOverflow(need_sub, bound);
+            return need_sub;
+        }
+
         /// Adds two field elements (mod m).
         pub fn add(self: Self, x: Fe, y: Fe) Fe {
             var out = x;
             if (x.montgomery == y.montgomery) {
                 @branchHint(.likely);
-                const overflow = out.v.addWithOverflow(y.v);
-                const underflow: u1 = @bitCast(ct.limbsCmpLt(out.v, self.v));
-                const need_sub = ct.eql(overflow, underflow);
-                _ = out.v.conditionalSubWithOverflow(need_sub, self.v);
+                _ = addAndReduce(&out.v, y.v, self.v);
                 return out;
             } else {
                 var y_ = y;
@@ -776,10 +821,7 @@ pub fn Modulus(comptime max_bits: comptime_int) type {
                 } else {
                     self.toMontgomery(&y_) catch unreachable;
                 }
-                const overflow = out.v.addWithOverflow(y_.v);
-                const underflow: u1 = @bitCast(ct.limbsCmpLt(out.v, self.v));
-                const need_sub = ct.eql(overflow, underflow);
-                _ = out.v.conditionalSubWithOverflow(need_sub, self.v);
+                _ = addAndReduce(&out.v, y_.v, self.v);
                 return out;
             }
         }
@@ -849,23 +891,33 @@ pub fn Modulus(comptime max_bits: comptime_int) type {
             return out;
         }
 
-        fn montgomeryLoop(self: Self, d: *Fe, x: Fe, y: Fe) u1 {
+        fn montgomeryLoop(self: *const Self, noalias d: *Fe, x: *const Fe, y: *const Fe) u1 {
+            if (self.limbs_count() == FeUint.max_limbs_count) {
+                return montgomeryLoopWithWidth(true, self, d, x, y);
+            }
+            return montgomeryLoopWithWidth(false, self, d, x, y);
+        }
+
+        fn montgomeryLoopWithWidth(comptime full_width: bool, self: *const Self, noalias d: *Fe, x: *const Fe, y: *const Fe) u1 {
+            assert(d != x and d != y);
             assert(d.limbs_count() == x.limbs_count());
             assert(d.limbs_count() == y.limbs_count());
             assert(d.limbs_count() == self.limbs_count());
+            assert(self.v.isOdd());
 
-            const a_limbs = x.v.limbsConst();
-            const b_limbs = y.v.limbsConst();
-            const d_limbs = d.v.limbs();
-            const m_limbs = self.v.limbsConst();
+            const n = if (full_width) FeUint.max_limbs_count else self.limbs_count();
+            const a_limbs = x.v.limbs_buffer[0..n];
+            const b_limbs = y.v.limbs_buffer[0..n];
+            const d_limbs = d.v.limbs_buffer[0..n];
+            const m_limbs = self.v.limbs_buffer[0..n];
 
             var overflow: u1 = 0;
-            for (0..self.limbs_count()) |i| {
+            for (0..n) |i| {
                 var carry: Limb = 0;
 
                 var wide = ct.mulWide(a_limbs[i], b_limbs[0]);
                 var z_lo = @addWithOverflow(d_limbs[0], wide.lo);
-                const f = @as(TLimb, @truncate(z_lo[0] *% self.m0inv));
+                const f: TLimb = @truncate(z_lo[0] *% self.m0inv);
                 var z_hi = wide.hi +% z_lo[1];
                 wide = ct.mulWide(f, m_limbs[0]);
                 z_lo = @addWithOverflow(z_lo[0], wide.lo);
@@ -873,7 +925,7 @@ pub fn Modulus(comptime max_bits: comptime_int) type {
                 z_hi +%= wide.hi;
                 carry = (z_hi << 1) | (z_lo[0] >> t_bits);
 
-                for (1..self.limbs_count()) |j| {
+                for (1..n) |j| {
                     wide = ct.mulWide(a_limbs[i], b_limbs[j]);
                     z_lo = @addWithOverflow(d_limbs[j], wide.lo);
                     z_hi = wide.hi +% z_lo[1];
@@ -889,18 +941,17 @@ pub fn Modulus(comptime max_bits: comptime_int) type {
                     carry = (z_hi << 1) | (z_lo[0] >> t_bits);
                 }
                 const z = overflow + carry;
-                d_limbs[self.limbs_count() - 1] = @as(TLimb, @truncate(z));
-                overflow = @as(u1, @truncate(z >> t_bits));
+                d_limbs[n - 1] = @as(TLimb, @truncate(z));
+                overflow = @truncate(z >> t_bits);
             }
             return overflow;
         }
 
-        // Montgomery multiplication.
         fn montgomeryMul(self: Self, x: Fe, y: Fe) Fe {
             var d = self.zero;
             assert(x.limbs_count() == self.limbs_count());
             assert(y.limbs_count() == self.limbs_count());
-            const overflow = self.montgomeryLoop(&d, x, y);
+            const overflow = self.montgomeryLoop(&d, &x, &y);
             const underflow = 1 -% @intFromBool(ct.limbsCmpGeq(d.v, self.v));
             const need_sub = ct.eql(overflow, underflow);
             _ = d.v.conditionalSubWithOverflow(need_sub, self.v);
@@ -908,11 +959,10 @@ pub fn Modulus(comptime max_bits: comptime_int) type {
             return d;
         }
 
-        // Montgomery squaring.
         fn montgomerySq(self: Self, x: Fe) Fe {
             var d = self.zero;
             assert(x.limbs_count() == self.limbs_count());
-            const overflow = self.montgomeryLoop(&d, x, x);
+            const overflow = self.montgomeryLoop(&d, &x, &x);
             const underflow = 1 -% @intFromBool(ct.limbsCmpGeq(d.v, self.v));
             const need_sub = ct.eql(overflow, underflow);
             _ = d.v.conditionalSubWithOverflow(need_sub, self.v);

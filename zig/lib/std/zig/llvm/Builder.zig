@@ -269,7 +269,6 @@ pub fn tripleForTarget(allocator: Allocator, target: *const std.Target) ![]const
         .ps5 => "ps5",
         .mesa3d => "mesa3d",
         .amdpal => "amdpal",
-        .hermit => "hermit",
         .hurd => "hurd",
         .wasi => "wasi",
         .emscripten => "emscripten",
@@ -283,7 +282,6 @@ pub fn tripleForTarget(allocator: Allocator, target: *const std.Target) ![]const
         .vulkan => "vulkan",
         .managarm => "managarm",
 
-        .contiki,
         .freestanding,
         .opencl, // https://llvm.org/docs/SPIRVUsage.html#target-triples
         .opengl,
@@ -544,10 +542,13 @@ pub const DataLayout = struct {
                     "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
             },
             .spirv32 => switch (target.os.tag) {
-                .vulkan, .opengl => "e-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-G1",
-                else => "e-p:32:32-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-G1",
+                .vulkan, .opengl => "e-ve-i64:64-n8:16:32:64-G10",
+                else => "e-p:32:32-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-n8:16:32:64-G1",
             },
-            .spirv64 => "e-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-G1",
+            .spirv64 => if (target.os.tag == .amdhsa)
+                "e-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-n32:64-S32-G1-P4-A0"
+            else
+                "e-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:256-v256:256-v512:512-v1024:1024-n8:16:32:64-G1",
             .wasm32 => if (target.os.tag == .emscripten)
                 "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-f128:64-n32:64-S128-ni:1:10:20"
             else
@@ -674,11 +675,12 @@ pub const DataLayout = struct {
                     },
                 } else first[first.len..];
                 const bit_width = std.fmt.parseInt(PointerSpec.BitWidth, field_it.next().?, 10) catch unreachable;
-                const abi_align: Alignment = .fromByteUnits(std.fmt.parseInt(u64, field_it.next().?, 10) catch unreachable);
-                const pref_align: Alignment = if (field_it.next()) |pref_align|
-                    .fromByteUnits(std.fmt.parseInt(u64, pref_align, 10) catch unreachable)
-                else
-                    abi_align;
+                const abi_align: Alignment = .fromByteUnits(
+                    @divExact(std.fmt.parseInt(u64, field_it.next().?, 10) catch unreachable, 8),
+                );
+                const pref_align: Alignment = if (field_it.next()) |pref_align| .fromByteUnits(
+                    @divExact(std.fmt.parseInt(u64, pref_align, 10) catch unreachable, 8),
+                ) else abi_align;
                 const index_bit_width = if (field_it.next()) |index_bit_width|
                     std.fmt.parseInt(PointerSpec.BitWidth, index_bit_width, 10) catch unreachable
                 else
@@ -708,11 +710,12 @@ pub const DataLayout = struct {
                 }
                 var field_it = std.mem.splitScalar(u8, spec[1..], ':');
                 const bit_width = std.fmt.parseInt(PrimitiveSpec.BitWidth, field_it.first(), 10) catch unreachable;
-                const abi_align: Alignment = .fromByteUnits(std.fmt.parseInt(u64, field_it.next().?, 10) catch unreachable);
-                const pref_align: Alignment = if (field_it.next()) |pref_align|
-                    .fromByteUnits(std.fmt.parseInt(u64, pref_align, 10) catch unreachable)
-                else
-                    abi_align;
+                const abi_align: Alignment = .fromByteUnits(
+                    @divExact(std.fmt.parseInt(u64, field_it.next().?, 10) catch unreachable, 8),
+                );
+                const pref_align: Alignment = if (field_it.next()) |pref_align| .fromByteUnits(
+                    @divExact(std.fmt.parseInt(u64, pref_align, 10) catch unreachable, 8),
+                ) else abi_align;
                 assert(field_it.peek() == null);
                 const specs = switch (kind) {
                     else => unreachable,
@@ -720,7 +723,10 @@ pub const DataLayout = struct {
                     'f' => &float_specs,
                     'v' => &vector_specs,
                 };
-                try specs.put(gpa, .{ .bit_width = bit_width, .abi_align = abi_align, .pref_align = pref_align }, {});
+                const primitive_spec: PrimitiveSpec =
+                    .{ .bit_width = bit_width, .abi_align = abi_align, .pref_align = pref_align };
+                const gop = try specs.getOrPut(gpa, primitive_spec);
+                gop.key_ptr.* = primitive_spec;
             },
             'n' => {
                 var field_it = std.mem.splitScalar(u8, spec[1..], ':');
@@ -784,45 +790,52 @@ pub const DataLayout = struct {
         data_layout.pointer_specs.deinit(gpa);
     }
 
-    pub fn getIntegerSpec(data_layout: *const DataLayout, bit_width: PrimitiveSpec.BitWidth) PrimitiveSpec {
+    pub fn getIntegerSpec(data_layout: *const DataLayout, bit_width: Type.Size) PrimitiveSpec {
         const specs = data_layout.int_specs.keys();
         return specs[
             @min(std.sort.lowerBound(PrimitiveSpec, specs, bit_width, struct {
-                fn order(ctx: PrimitiveSpec.BitWidth, spec: PrimitiveSpec) std.math.Order {
-                    return std.math.order(ctx, spec.bit_width);
+                fn order(ctx: Type.Size, spec: PrimitiveSpec) std.math.Order {
+                    return std.math.order(ctx.fixed, spec.bit_width);
                 }
             }.order), specs.len - 1)
         ];
     }
 
-    pub fn getFloatSpec(data_layout: *const DataLayout, bit_width: PrimitiveSpec.BitWidth) PrimitiveSpec {
+    pub fn getFloatSpec(data_layout: *const DataLayout, bit_width: Type.Size) PrimitiveSpec {
+        const fixed_bit_width: PrimitiveSpec.BitWidth = @intCast(bit_width.fixed);
         if (data_layout.float_specs.getEntry(.{
-            .bit_width = bit_width,
+            .bit_width = fixed_bit_width,
             .abi_align = .default,
             .pref_align = .default,
         })) |entry| return entry.key_ptr.*;
         const default_align: Alignment = .fromByteUnits(
-            std.math.ceilPowerOfTwoAssert(PrimitiveSpec.BitWidth, bit_width / 8),
+            std.math.ceilPowerOfTwoAssert(PrimitiveSpec.BitWidth, @divExact(fixed_bit_width, 8)),
         );
-        return .{ .bit_width = bit_width, .abi_align = default_align, .pref_align = default_align };
+        return .{
+            .bit_width = fixed_bit_width,
+            .abi_align = default_align,
+            .pref_align = default_align,
+        };
     }
 
-    pub fn getVectorSpec(
-        data_layout: *const DataLayout,
-        bit_width: PrimitiveSpec.BitWidth,
-        store_size: Type.Size,
-    ) PrimitiveSpec {
-        if (data_layout.float_specs.getEntry(.{
-            .bit_width = bit_width,
+    pub fn getVectorSpec(data_layout: *const DataLayout, bit_width: Type.Size) PrimitiveSpec {
+        const known_min_bit_width: PrimitiveSpec.BitWidth = @intCast(switch (bit_width) {
+            .fixed, .scalable => |known_min| known_min,
+        });
+        if (data_layout.vector_specs.getEntry(.{
+            .bit_width = known_min_bit_width,
             .abi_align = .default,
             .pref_align = .default,
         })) |entry| return entry.key_ptr.*;
-        const default_align: Alignment = .fromByteUnits(
-            std.math.ceilPowerOfTwoAssert(PrimitiveSpec.BitWidth, switch (store_size) {
-                .fixed, .scalable => |known_min| known_min,
-            }),
-        );
-        return .{ .bit_width = bit_width, .abi_align = default_align, .pref_align = default_align };
+        const default_align: Alignment = .fromByteUnits(std.math.ceilPowerOfTwoAssert(
+            PrimitiveSpec.BitWidth,
+            std.mem.alignForward(PrimitiveSpec.BitWidth, known_min_bit_width, 8),
+        ));
+        return .{
+            .bit_width = known_min_bit_width,
+            .abi_align = default_align,
+            .pref_align = default_align,
+        };
     }
 
     pub fn getPointerSpec(data_layout: *const DataLayout, addr_space: AddrSpace) PointerSpec {
@@ -1417,7 +1430,7 @@ pub const Type = enum(u32) {
     }
 
     pub fn isSized(self: Type, builder: *const Builder) Allocator.Error!bool {
-        var visited: IsSizedVisited = .{};
+        var visited: IsSizedVisited = .empty;
         defer visited.deinit(builder.gpa);
         const result = try self.isSizedVisited(&visited, builder);
         return result;
@@ -1699,6 +1712,22 @@ pub const Type = enum(u32) {
             .pointer => .{
                 .fixed = builder.data_layout.getPointerSpec(@fromBackingInt(@intCast(item.data))).bit_width,
             },
+            .vector, .scalable_vector => {
+                const extra = builder.typeExtraData(Type.Vector, item.data);
+                const min_bits = extra.len * extra.child.bits(builder).fixed;
+                return switch (item.tag) {
+                    else => unreachable,
+                    .vector => .{ .fixed = min_bits },
+                    .scalable_vector => .{ .scalable = min_bits },
+                };
+            },
+        };
+    }
+
+    pub fn storeSize(ty: Type, builder: *const Builder) Size {
+        return switch (ty.bits(builder)) {
+            .fixed => |fixed| .{ .fixed = @divCeil(fixed, 8) },
+            .scalable => |known_min| .{ .scalable = @divCeil(known_min, 8) },
         };
     }
 
@@ -1716,7 +1745,7 @@ pub const Type = enum(u32) {
                     };
                 },
                 .half, .bfloat, .float, .double, .ppc_fp128, .fp128, .x86_fp80 => {
-                    const spec = builder.data_layout.getFloatSpec(@intCast(ty.bits(builder).fixed));
+                    const spec = builder.data_layout.getFloatSpec(ty.bits(builder));
                     return switch (kind) {
                         .abi => spec.abi_align,
                         .pref => spec.pref_align,
@@ -1725,7 +1754,7 @@ pub const Type = enum(u32) {
                 .x86_amx => return comptime .fromByteUnits(64),
             },
             .integer => {
-                const spec = builder.data_layout.getIntegerSpec(@intCast(item.data));
+                const spec = builder.data_layout.getIntegerSpec(.{ .fixed = item.data });
                 return switch (kind) {
                     .abi => spec.abi_align,
                     .pref => spec.pref_align,
@@ -1736,6 +1765,13 @@ pub const Type = enum(u32) {
                 return switch (kind) {
                     .abi => spec.flags.abi_align,
                     .pref => spec.flags.pref_align,
+                };
+            },
+            .vector, .scalable_vector => {
+                const spec = builder.data_layout.getVectorSpec(ty.bits(builder));
+                return switch (kind) {
+                    .abi => spec.abi_align,
+                    .pref => spec.pref_align,
                 };
             },
         }
@@ -3450,7 +3486,7 @@ pub const Global = struct {
             try builder.aliases.ensureUnusedCapacity(builder.gpa, 1);
             errdefer comptime unreachable;
             const alias: Alias.Index = @fromBackingInt(@intCast(builder.aliases.items.len));
-            builder.aliass.appendAssumeCapacity(.{ .global = global, .aliasee = .none });
+            builder.aliases.appendAssumeCapacity(.{ .global = global, .aliasee = .none });
             global.ptr(builder).kind = .{ .alias = alias };
             return alias;
         }
@@ -14675,7 +14711,7 @@ pub fn toBitcode(self: *Builder, allocator: Allocator, producer: Producer) bitco
         var attributes_set: std.array_hash_map.Auto(struct {
             attributes: Attributes,
             index: u32,
-        }, void) = .{};
+        }, void) = .empty;
         defer attributes_set.deinit(self.gpa);
 
         // PARAMATTR_GROUP_BLOCK

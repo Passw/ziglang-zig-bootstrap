@@ -1568,6 +1568,15 @@ const module_test_targets = blk: {
 
         .{
             .target = .{
+                .cpu_arch = .sparc64,
+                .os_tag = .openbsd,
+                .abi = .none,
+            },
+            .link_libc = true,
+        },
+
+        .{
+            .target = .{
                 .cpu_arch = .x86,
                 .os_tag = .openbsd,
                 .abi = .none,
@@ -2323,154 +2332,6 @@ pub const debugger_matrix: []const RunnerTarget = &.{
     },
 };
 
-fn compatible32bitArch(host: *const std.Target) ?std.Target.Cpu.Arch {
-    return switch (host.os.tag) {
-        .freebsd => switch (host.cpu.arch) {
-            .aarch64 => .arm,
-            .powerpc64 => .powerpc,
-            else => null,
-        },
-        .illumos => switch (host.cpu.arch) {
-            .x86_64 => .x86,
-            else => null,
-        },
-        .linux => switch (host.cpu.arch) {
-            .aarch64 => .arm,
-            .aarch64_be => .armeb,
-            .mips64 => .mips,
-            .mips64el => .mipsel,
-            .powerpc64 => .powerpc,
-            .sparc64 => .sparc,
-            .x86_64 => .x86,
-            else => null,
-        },
-        .netbsd => switch (host.cpu.arch) {
-            .riscv64 => .riscv32,
-            .sparc64 => .sparc,
-            .x86_64 => .x86,
-            else => null,
-        },
-        .windows => switch (host.cpu.arch) {
-            .x86_64 => .x86,
-            else => null,
-        },
-        else => null,
-    };
-}
-
-pub fn isNative(actual_target: *const std.Build.ResolvedTarget, host: *const std.Target) bool {
-    if (actual_target.query.isNative()) return true;
-    const actual = &actual_target.result;
-
-    if (actual.cpu.arch != host.cpu.arch and
-        actual.cpu.arch != compatible32bitArch(host))
-    {
-        return false;
-    }
-
-    if (actual.os.tag != host.os.tag)
-        return false;
-
-    // Remove features that don't actually affect compatibility.
-    const irrelevant: std.Target.Cpu.Feature.Set = switch (host.cpu.arch) {
-        .x86_64 => std.Target.x86.featureSet(&.{
-            .@"16bit_mode",
-            .@"32bit_mode",
-            .@"64bit",
-            .false_deps_bls,
-            .false_deps_compress,
-            .false_deps_expand,
-            .false_deps_getmant,
-            .false_deps_lzcnt,
-            .false_deps_mulc,
-            .false_deps_mullq,
-            .false_deps_perm,
-            .false_deps_popcnt,
-            .false_deps_range,
-            .false_deps_tzcnt,
-            .fast_11bytenop,
-            .fast_15bytenop,
-            .fast_7bytenop,
-            .fast_bextr,
-            .fast_dpwssd,
-            .fast_gather,
-            .fast_hops,
-            .fast_imm16,
-            .fast_lzcnt,
-            .fast_movbe,
-            .fast_scalar_fsqrt,
-            .fast_scalar_shift_masks,
-            .fast_shld_rotate,
-            .fast_variable_crosslane_shuffle,
-            .fast_variable_perlane_shuffle,
-            .fast_vector_fsqrt,
-            .fast_vector_shift_masks,
-            .faster_shift_than_shuffle,
-            .no_bypass_delay,
-            .no_bypass_delay_blend,
-            .no_bypass_delay_mov,
-            .no_bypass_delay_shuffle,
-            .prefer_128_bit,
-            .prefer_256_bit,
-            .prefer_legacy_setcc,
-            .prefer_mask_registers,
-            .prefer_movmsk_over_vtest,
-            .prefer_ndd_mem,
-            .prefer_no_gather,
-            .prefer_no_scatter,
-            .slow_3ops_lea,
-            .slow_incdec,
-            .slow_indirect_call,
-            .slow_lea,
-            .slow_pmaddwd,
-            .slow_pmulld,
-            .slow_pmullq,
-            .slow_shld,
-            .slow_two_mem_ops,
-            .slow_unaligned_mem_16,
-            .slow_unaligned_mem_32,
-        }),
-        .aarch64, .aarch64_be => std.Target.aarch64.featureSet(&.{
-            .addr_lsl_slow_14,
-            .align_cmp_csel_pairs,
-            .alu_lsl_fast,
-            .avoid_ldapur,
-            .disable_fast_inc_vl,
-            .exynos_cheap_as_move,
-            .fast_ld1_single,
-            .fixed_load_latency_4,
-            .fuse_address,
-            .fuse_addsub_2reg_const1,
-            .fuse_adrp_add,
-            .fuse_aes,
-            .fuse_arith_logic,
-            .fuse_crypto_eor,
-            .fuse_csel,
-            .fuse_cset,
-            .fuse_fcsel,
-            .fuse_literals,
-            .has_limited_64bit_vector_mul_bandwidth,
-            .predictable_select_expensive,
-            .slow_misaligned_128store,
-            .slow_paired_128,
-            .slow_strqro_store,
-            .use_experimental_zeroing_pseudos,
-            .use_fixed_over_scalable_if_equal_cost,
-            .use_postra_scheduler,
-            .use_reciprocal_square_root,
-            .use_wzr_to_vec_move,
-        }),
-        else => .empty,
-    };
-    var set = actual.cpu.features;
-    set.removeFeatureSet(irrelevant);
-
-    if (!host.cpu.features.isSuperSetOf(set))
-        return false;
-
-    return true;
-}
-
 pub fn addStackTraceTests(b: *std.Build, options: StackTracesContext.Options) *Step {
     const step = b.step("test-stack-traces", "Run the stack trace tests");
 
@@ -2522,6 +2383,7 @@ pub fn addErrorTraceTests(b: *std.Build, options: ErrorTracesContext.Options) *S
 pub fn addStandaloneTests(
     b: *std.Build,
     optimize_modes: []const OptimizeMode,
+    skip_non_native: bool,
     enable_macos_sdk: bool,
     enable_ios_sdk: bool,
     enable_symlinks_windows: bool,
@@ -2536,6 +2398,7 @@ pub fn addStandaloneTests(
         .simple_skip_release_safe = mem.findScalar(OptimizeMode, optimize_modes, .safe) == null,
         .simple_skip_release_fast = mem.findScalar(OptimizeMode, optimize_modes, .fast) == null,
         .simple_skip_release_small = mem.findScalar(OptimizeMode, optimize_modes, .small) == null,
+        .skip_non_native = skip_non_native,
     });
     const test_cases_dep_step = test_cases_dep.builder.default_step;
     test_cases_dep_step.name = test_cases_dep_name;
@@ -2822,7 +2685,7 @@ pub fn addModuleTests(b: *std.Build, options: ModuleTestOptions) *Step {
 
         if (!options.test_extra_targets and test_target.extra_target) continue;
 
-        if (options.skip_non_native and !isNative(&resolved_target, &b.graph.host.result))
+        if (options.skip_non_native and !std.zig.target.isNative(&resolved_target.query, &resolved_target.result, &b.graph.host.result))
             continue;
 
         const target = &resolved_target.result;
@@ -2891,15 +2754,6 @@ fn addOneModuleTest(
     const libc_suffix = if (test_target.link_libc == true) "-libc" else "";
     const model_txt = target.cpu.model.name;
 
-    // These emulated targets need a lot more RAM for unknown reasons.
-    const max_rss = if (mem.eql(u8, options.name, "std") and
-        (target.cpu.arch == .hexagon or
-            (target.cpu.arch.isRISCV() and !resolved_target.query.isNative()) or
-            target.cpu.arch.isWasm()))
-        options.max_rss * 2
-    else
-        options.max_rss;
-
     const these_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path(options.root_src),
@@ -2911,7 +2765,7 @@ fn addOneModuleTest(
             .sanitize_thread = options.sanitize_thread,
             .single_threaded = test_target.single_threaded,
         }),
-        .max_rss = max_rss,
+        .max_rss = options.max_rss,
         .filters = options.test_filters,
         .use_llvm = test_target.use_llvm,
         .use_lld = test_target.use_lld,
@@ -3154,7 +3008,7 @@ pub fn addCAbiTests(b: *std.Build, options: CAbiTestOptions) *Step {
         const triple_txt = resolved_target.query.zigTriple(b.allocator) catch @panic("OOM");
         const target = &resolved_target.result;
 
-        if (options.skip_non_native and !isNative(&resolved_target, &b.graph.host.result))
+        if (options.skip_non_native and !std.zig.target.isNative(&resolved_target.query, &resolved_target.result, &b.graph.host.result))
             continue;
 
         if (options.test_target_filters.len > 0) {
@@ -3247,7 +3101,7 @@ pub fn addLinkTests(b: *std.Build, options: LinkTestOptions) *Step {
     for (link_targets) |link_target| {
         const resolved_target = b.resolveTargetQuery(link_target.target);
 
-        if (options.skip_non_native and !isNative(&resolved_target, &b.graph.host.result))
+        if (options.skip_non_native and !std.zig.target.isNative(&resolved_target.query, &resolved_target.result, &b.graph.host.result))
             continue;
 
         const target = &resolved_target.result;
@@ -3397,7 +3251,7 @@ pub fn addRunnerTests(
         for (matrix) |test_target| {
             const resolved_target = b.resolveTargetQuery(test_target.target);
 
-            if (options.skip_non_native and !isNative(&resolved_target, &b.graph.host.result))
+            if (options.skip_non_native and !std.zig.target.isNative(&resolved_target.query, &resolved_target.result, &b.graph.host.result))
                 continue;
 
             const target = &resolved_target.result;
