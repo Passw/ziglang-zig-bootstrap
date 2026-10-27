@@ -21,12 +21,10 @@ For other versions, check the git tags of this repository.
  * LLVM: Support .lib extension for static zstd.
  * LLVM: Don't pass -static when building executables.
  * LLVM: OpenBSD `llvm-config` logic
- * LLVM: handle private functions correctly in MIPS backend
  * Clang: Ignore the examples directory
  * Clang: Disable building of libclang-cpp.so.
  * Clang: remove `nvptx-arch` and `amdgpu-arch` symlinks
  * Clang: remove broken scan-build manpage install logic
- * Clang: disable tail calls in bytecode interpreter on MIPS
  * LLD: Added additional include directory to Zig's libunwind.
  * LLD: Respect `LLD_BUILD_TOOLS=OFF`
  * LLD: Skip building docs
