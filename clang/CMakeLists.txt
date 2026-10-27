@@ -563,6 +563,9 @@ option(CLANG_BUILD_EXAMPLES "Build CLANG example programs by default." OFF)
 option(CLANG_INCLUDE_EXAMPLES
        "Generate build targets for the Clang examples."
        ${LLVM_INCLUDE_EXAMPLES})
+if (CLANG_INCLUDE_EXAMPLES)
+  add_subdirectory(examples)
+endif()
 
 if(APPLE)
   # this line is needed as a cleanup to ensure that any CMakeCaches with the old
@@ -602,6 +605,8 @@ if( CLANG_INCLUDE_TESTS )
     umbrella_lit_testsuite_end(check-all)
   endif()
 endif()
+
+add_subdirectory(utils/perf-training)
 
 option(CLANG_INCLUDE_DOCS "Generate build targets for the Clang docs."
   ${LLVM_INCLUDE_DOCS})
